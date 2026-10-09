@@ -317,18 +317,6 @@ struct TokenResponse {
     token_type: String,
 }
 
-/// Handles authentication with Google Cloud Platform services.
-///
-/// This struct manages the complete authentication lifecycle including:
-/// - Loading and validating credentials
-/// - Creating and refreshing tokens
-/// - Caching tokens for efficient reuse
-/// - Managing concurrent access through atomic operations
-///
-/// It supports both service account and authorized user authentication methods,
-/// automatically selecting the appropriate method based on available credentials.
-/// ```
-#[derive(Debug)]
 const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
 /// Scopes requested when refreshing authorized-user (gcloud ADC) credentials.
@@ -345,6 +333,18 @@ fn authorized_user_scope() -> String {
         .unwrap_or_else(|| DEFAULT_SCOPE.to_string())
 }
 
+/// Handles authentication with Google Cloud Platform services.
+///
+/// This struct manages the complete authentication lifecycle including:
+/// - Loading and validating credentials
+/// - Creating and refreshing tokens
+/// - Caching tokens for efficient reuse
+/// - Managing concurrent access through atomic operations
+///
+/// It supports both service account and authorized user authentication methods,
+/// automatically selecting the appropriate method based on available credentials.
+/// ```
+#[derive(Debug)]
 pub struct GcpAuth {
     /// The loaded credentials (service account or authorized user)
     credentials: RwLock<AdcCredentials>,
