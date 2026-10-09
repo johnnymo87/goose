@@ -162,6 +162,9 @@ pub struct GcpVertexAIProvider {
     name: String,
     #[serde(skip)]
     request_builder: RequestBuilderDecorator,
+    /// True when GCP_VERTEX_HOST is set: every location then goes to that host.
+    #[serde(skip)]
+    host_overridden: bool,
 }
 
 impl GcpVertexAIProvider {
@@ -178,7 +181,25 @@ impl GcpVertexAIProvider {
         let config = crate::config::Config::global();
         let project_id = config.get_param("GCP_PROJECT_ID")?;
         let location = Self::determine_location(config)?;
-        let host = Self::build_host_url(&location);
+        // GCP_VERTEX_HOST points every request at a proxy that speaks the Vertex paths (for
+        // example a local failover proxy) instead of Google's regional hosts.
+        let host_override: Option<String> = config
+            .get_param("GCP_VERTEX_HOST")
+            .ok()
+            .map(|h: String| h.trim().trim_end_matches('/').to_string())
+            .filter(|h| !h.is_empty());
+        let host_overridden = host_override.is_some();
+        let host = host_override.unwrap_or_else(|| Self::build_host_url(&location));
+        // GCP_VERTEX_SESSION_HEADER renames the session-id header, so a proxy that keys session
+        // stickiness on its own header name (e.g. x-opencode-session) can see goose sessions.
+        let session_header: Option<String> = config
+            .get_param("GCP_VERTEX_SESSION_HEADER")
+            .ok()
+            .filter(|h: &String| !h.trim().is_empty());
+        let request_builder = crate::session_context::session_id_request_builder_with_header_override(
+            session_header.as_deref().map(str::trim),
+        )
+        .map_err(|e| anyhow::anyhow!("invalid GCP_VERTEX_SESSION_HEADER: {e}"))?;
 
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
@@ -198,7 +219,8 @@ impl GcpVertexAIProvider {
             location,
             retry_config,
             name: GCP_VERTEX_AI_PROVIDER_NAME.to_string(),
-            request_builder: crate::session_context::session_id_request_builder(),
+            request_builder,
+            host_overridden,
         })
     }
 
@@ -274,9 +296,16 @@ impl GcpVertexAIProvider {
         location: &str,
         streaming: bool,
     ) -> Result<Url, GcpVertexAIError> {
+        // With a host override, never switch to a Google regional host for another location; the
+        // location stays in the path and the proxy forwards it.
+        let configured_location = if self.host_overridden {
+            location
+        } else {
+            self.location.as_str()
+        };
         build_vertex_url(
             &self.host,
-            &self.location,
+            configured_location,
             &self.project_id,
             &model.model_name,
             provider,
@@ -729,6 +758,26 @@ mod tests {
         assert_eq!(
             ModelProvider::MaaS("qwen".to_string()).as_str(),
             "qwen".to_string()
+        );
+    }
+
+    #[test]
+    fn test_build_vertex_url_proxy_host_keeps_target_location_in_path() {
+        // With GCP_VERTEX_HOST set, build_request_url passes the target location as the
+        // configured one, so the proxy host is kept and the location only appears in the path.
+        let url = build_vertex_url(
+            "http://127.0.0.1:8789",
+            "us-east5",
+            "test-project",
+            "claude-opus-5-5",
+            ModelProvider::Anthropic,
+            "us-east5",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:8789/v1/projects/test-project/locations/us-east5/publishers/anthropic/models/claude-opus-5-5:streamRawPredict"
         );
     }
 
