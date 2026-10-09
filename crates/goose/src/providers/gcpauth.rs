@@ -329,6 +329,22 @@ struct TokenResponse {
 /// automatically selecting the appropriate method based on available credentials.
 /// ```
 #[derive(Debug)]
+const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+
+/// Scopes requested when refreshing authorized-user (gcloud ADC) credentials.
+/// `GCP_AUTH_SCOPES` (space-separated; env or config.yaml) replaces the default cloud-platform scope.
+/// A gateway in front of Vertex that attributes requests by identity needs
+/// `https://www.googleapis.com/auth/userinfo.email` as well; Vertex itself does
+/// not. The scopes must be a subset of what the refresh token was granted.
+fn authorized_user_scope() -> String {
+    crate::config::Config::global()
+        .get_param::<String>("GCP_AUTH_SCOPES")
+        .ok()
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_SCOPE.to_string())
+}
+
 pub struct GcpAuth {
     /// The loaded credentials (service account or authorized user)
     credentials: RwLock<AdcCredentials>,
@@ -532,12 +548,13 @@ impl GcpAuth {
         &self,
         creds: &AuthorizedUserCredentials,
     ) -> Result<TokenResponse, AuthError> {
+        let scope = authorized_user_scope();
         let params = [
             ("client_id", creds.client_id.as_str()),
             ("client_secret", creds.client_secret.as_str()),
             ("refresh_token", creds.refresh_token.as_str()),
             ("grant_type", "refresh_token"),
-            ("scope", "https://www.googleapis.com/auth/cloud-platform"),
+            ("scope", &scope),
         ];
 
         self.exchange_token(&creds.token_uri, &params).await
@@ -587,6 +604,22 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     // Only import what we need
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn authorized_user_scope_defaults_and_overrides() {
+        {
+            let _guard = env_lock::lock_env([("GCP_AUTH_SCOPES", None::<&str>)]);
+            assert_eq!(authorized_user_scope(), DEFAULT_SCOPE);
+        }
+        let _guard = env_lock::lock_env([(
+            "GCP_AUTH_SCOPES",
+            Some("  https://www.googleapis.com/auth/cloud-platform   https://www.googleapis.com/auth/userinfo.email "),
+        )]);
+        assert_eq!(
+            authorized_user_scope(),
+            "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"
+        );
+    }
 
     mockall::mock! {
         #[derive(Debug)]
