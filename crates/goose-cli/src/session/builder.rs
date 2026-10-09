@@ -288,6 +288,20 @@ fn validate_provider_override_context(
     Ok(())
 }
 
+/// `GOOSE_HEADLESS_CACHE_TTL` ("5m" or "1h"): the prompt-cache TTL a non-interactive run uses
+/// instead of the default clamp to 5m. Read from the environment only, so it is a deliberate
+/// per-invocation choice and never inherited from a user's interactive config.
+fn headless_cache_ttl_opt_in() -> Option<String> {
+    let ttl = std::env::var("GOOSE_HEADLESS_CACHE_TTL").ok()?;
+    match ttl.trim().to_lowercase().as_str() {
+        v @ ("5m" | "1h") => Some(v.to_string()),
+        other => {
+            tracing::warn!("ignoring GOOSE_HEADLESS_CACHE_TTL={other:?}: expected '5m' or '1h'");
+            None
+        }
+    }
+}
+
 async fn resolve_provider_and_model(
     session_config: &SessionBuilderConfig,
     config: &Config,
@@ -436,7 +450,13 @@ async fn resolve_provider_and_model(
     };
 
     if !session_config.interactive {
-        model_config = model_config.with_cache_ttl_clamped();
+        model_config = match headless_cache_ttl_opt_in() {
+            // An explicit opt-in for headless runs that are resumed at intervals (e.g. a standing
+            // session woken by a timer): those idle between runs, which is exactly when a 1h TTL
+            // pays for its 2x write. Without the opt-in, burst-only headless runs keep the clamp.
+            Some(ttl) => model_config.with_cache_ttl(&ttl),
+            None => model_config.with_cache_ttl_clamped(),
+        };
     }
 
     ResolvedProviderConfig {
@@ -1516,6 +1536,33 @@ mod tests {
         .await;
 
         assert_eq!(resolved.model_config.cache_ttl().as_deref(), Some("5m"));
+    }
+
+    #[tokio::test]
+    async fn headless_cache_ttl_opt_in_overrides_clamp() {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PROVIDER", None::<&str>),
+            ("GOOSE_MODEL", None::<&str>),
+            ("GOOSE_CACHE_TTL", None::<&str>),
+            ("GOOSE_HEADLESS_CACHE_TTL", Some("1h")),
+        ]);
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(&temp_dir);
+        let saved = goose_providers::model::ModelConfig::new("claude-sonnet-4-6");
+
+        let resolved = resolve_provider_and_model(
+            &SessionBuilderConfig {
+                resume: true,
+                interactive: false,
+                ..SessionBuilderConfig::default()
+            },
+            &config,
+            Some("anthropic".to_string()),
+            Some(saved),
+        )
+        .await;
+
+        assert_eq!(resolved.model_config.cache_ttl().as_deref(), Some("1h"));
     }
 
     #[test]
