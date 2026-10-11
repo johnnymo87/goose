@@ -606,7 +606,7 @@ impl ProcessGroupKiller {
     /// SIGTERM the group, give it `SHELL_TERM_GRACE` to empty (reaping the leader as
     /// soon as it exits), then SIGKILL whatever remains.
     async fn terminate(&mut self, child: &mut tokio::process::Child) {
-        let Some(pgid) = self.pgid.take() else {
+        let Some(pgid) = self.pgid else {
             return;
         };
         signal_group(pgid, libc::SIGTERM);
@@ -618,6 +618,7 @@ impl ProcessGroupKiller {
         if group_alive(pgid) {
             signal_group(pgid, libc::SIGKILL);
         }
+        self.pgid = None;
     }
 }
 
@@ -1514,7 +1515,7 @@ mod tests {
     }
 
     /// Command whose tree is: bash (sh.pid) -> two backgrounded sleeps (a.pid, b.pid).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn process_tree_command(dir: &std::path::Path) -> String {
         let d = dir.display();
         format!(
@@ -1522,7 +1523,7 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn read_pids(dir: &std::path::Path, names: &[&str], within: Duration) -> Vec<i32> {
         let deadline = std::time::Instant::now() + within;
         loop {
@@ -1548,20 +1549,20 @@ mod tests {
     }
 
     /// Fields after the `)` that closes comm: state, ppid, pgrp, ...
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn proc_stat_fields(pid: i32) -> Option<Vec<String>> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let (_, rest) = stat.rsplit_once(')')?;
         Some(rest.split_whitespace().map(str::to_owned).collect())
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn process_group_of(pid: i32) -> Option<i32> {
         proc_stat_fields(pid)?.get(2)?.parse().ok()
     }
 
     /// True once `pid` is gone or a zombie (killed, waiting to be reaped).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn wait_until_dead(pid: i32, within: Duration) -> bool {
         let deadline = std::time::Instant::now() + within;
         loop {
@@ -1580,7 +1581,7 @@ mod tests {
     }
 
     /// Starts `command`, waits for `pid_files`, returns the pinned future and the pids.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     macro_rules! start_and_read_pids {
         ($run:ident, $dir:expr, $files:expr) => {{
             tokio::select! {
@@ -1590,7 +1591,7 @@ mod tests {
         }};
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn process_group_killed_on_cancellation() {
         let tool = ShellTool::new_for_test().unwrap();
@@ -1632,7 +1633,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn process_group_killed_on_timeout() {
         let tool = ShellTool::new_for_test().unwrap();
@@ -1658,7 +1659,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn process_group_killed_when_the_call_is_dropped() {
         let tool = ShellTool::new_for_test().unwrap();
@@ -1680,7 +1681,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn process_group_left_alone_when_the_shell_exits_normally() {
         let tool = ShellTool::new_for_test().unwrap();
@@ -1701,7 +1702,7 @@ mod tests {
         unsafe { libc::kill(bg, libc::SIGKILL) };
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn process_group_gets_sigterm_and_a_grace_period_before_sigkill() {
         let tool = ShellTool::new_for_test().unwrap();
@@ -1734,7 +1735,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn process_group_escalates_to_sigkill_when_sigterm_is_ignored() {
         let tool = ShellTool::new_for_test().unwrap();
@@ -1773,6 +1774,44 @@ mod tests {
             assert!(
                 wait_until_dead(pid, Duration::from_secs(2)).await,
                 "pid {pid} survived SIGKILL"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_group_killed_when_terminate_is_dropped_mid_grace() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let token = CancellationToken::new();
+        // `trap '' TERM` sets SIG_IGN, which the backgrounded sleep inherits too.
+        let pids = {
+            let run = tool.shell_with_cwd(
+                ShellParams {
+                    command: format!(
+                        "trap '' TERM; echo $$ > {d}/sh.pid; sleep 30 & echo $! > {d}/a.pid; wait"
+                    ),
+                    timeout_secs: None,
+                },
+                None,
+                None,
+                token.clone(),
+            );
+            tokio::pin!(run);
+            let pids = start_and_read_pids!(run, dir.path(), &["sh.pid", "a.pid"]);
+            token.cancel();
+            // Give run ~100 ms to enter group.terminate().await
+            tokio::select! {
+                _ = &mut run => panic!("command finished before terminate was dropped"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            pids
+        }; // `run` (and `run_command` with its `ProcessGroupKiller`) is dropped here mid-grace.
+        for pid in pids {
+            assert!(
+                wait_until_dead(pid, Duration::from_secs(3)).await,
+                "pid {pid} survived when terminate was dropped mid-grace"
             );
         }
     }
