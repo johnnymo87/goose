@@ -2,11 +2,11 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(windows))]
 use std::sync::Arc;
 #[cfg(not(windows))]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rmcp::model::{Annotations, CallToolResult, ContentBlock, TextContent};
@@ -17,17 +17,17 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::OnceCell;
 #[cfg(not(windows))]
 use tokio::task::JoinHandle;
-use tokio_stream::{wrappers::SplitStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::SplitStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::tool_execution::ToolCallNotificationEmitter;
 use crate::subprocess::SubprocessExt;
 
 pub use super::shell_output_streaming::{
-    parse_shell_output_notification, ShellOutputNotificationChunk, ShellOutputNotificationParams,
-    ShellOutputStream, DEVELOPER_SHELL_OUTPUT_NOTIFICATION_METHOD,
+    DEVELOPER_SHELL_OUTPUT_NOTIFICATION_METHOD, ShellOutputNotificationChunk,
+    ShellOutputNotificationParams, ShellOutputStream, parse_shell_output_notification,
 };
-use super::shell_output_streaming::{ShellOutputBatcher, SHELL_LIVE_OUTPUT_FLUSH_INTERVAL};
+use super::shell_output_streaming::{SHELL_LIVE_OUTPUT_FLUSH_INTERVAL, ShellOutputBatcher};
 
 /// Check if the current process is running inside a Flatpak sandbox.
 ///
@@ -554,6 +554,101 @@ fn resolve_shell_timeout(timeout_secs: Option<u64>) -> u64 {
     })
 }
 
+/// How long a cancelled or timed-out command's process group gets to exit after
+/// SIGTERM before it is SIGKILLed. Long enough for cleanup handlers (git removes
+/// `.git/index.lock` on SIGTERM; a SIGKILLed git leaves it and every later git command
+/// in that repo fails), short enough to keep cancel responsive.
+#[cfg(unix)]
+const SHELL_TERM_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
+    // SAFETY: killpg only sends a signal; ESRCH (group already empty) is fine.
+    unsafe {
+        libc::killpg(pgid, signal);
+    }
+}
+
+/// Whether any process (a not-yet-reaped zombie included) is still in the group.
+#[cfg(unix)]
+fn group_alive(pgid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs only the existence and permission check.
+    let rc = unsafe { libc::killpg(pgid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Terminates a shell command's whole process group when the command is cancelled,
+/// times out, or its future is dropped mid-run (e.g. the agent task is aborted on WS
+/// close or DELETE). The shell is spawned with `process_group(0)`, so the group id is
+/// the shell's pid and every descendant that does not call `setsid`/`setpgid` is in it.
+///
+/// Group-id reuse: SIGKILL is only sent right after `group_alive` observed a member,
+/// and a pgid with a live member cannot be recycled. The remaining window between
+/// that check and the signal would need `pid_max` pid allocations to bite; accepted.
+#[cfg(unix)]
+struct ProcessGroupKiller {
+    pgid: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupKiller {
+    fn new(child: &tokio::process::Child) -> Self {
+        Self {
+            pgid: child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()),
+        }
+    }
+
+    /// The shell exited on its own: leave anything it backgrounded running.
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+
+    /// SIGTERM the group, give it `SHELL_TERM_GRACE` to empty (reaping the leader as
+    /// soon as it exits), then SIGKILL whatever remains.
+    async fn terminate(&mut self, child: &mut tokio::process::Child) {
+        let Some(pgid) = self.pgid.take() else {
+            return;
+        };
+        signal_group(pgid, libc::SIGTERM);
+        let deadline = tokio::time::Instant::now() + SHELL_TERM_GRACE;
+        let _ = tokio::time::timeout_at(deadline, child.wait()).await;
+        while group_alive(pgid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if group_alive(pgid) {
+            signal_group(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupKiller {
+    fn drop(&mut self) {
+        let Some(pgid) = self.pgid.take() else {
+            return;
+        };
+        // No await is possible here: escalate on a detached thread (not a tokio task,
+        // which could be dropped with a shutting-down runtime).
+        let escalate = move || {
+            signal_group(pgid, libc::SIGTERM);
+            let deadline = std::time::Instant::now() + SHELL_TERM_GRACE;
+            while group_alive(pgid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if group_alive(pgid) {
+                signal_group(pgid, libc::SIGKILL);
+            }
+        };
+        if std::thread::Builder::new()
+            .name("goose-shell-kill".to_owned())
+            .spawn(escalate)
+            .is_err()
+        {
+            signal_group(pgid, libc::SIGKILL);
+        }
+    }
+}
+
 async fn run_command(
     command_line: &str,
     timeout_secs: Option<u64>,
@@ -566,6 +661,8 @@ async fn run_command(
     let timeout_secs = Some(resolve_shell_timeout(timeout_secs));
 
     let mut command = build_shell_command(command_line, working_dir, login_path, session_id);
+    #[cfg(unix)]
+    command.process_group(0);
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -574,6 +671,8 @@ async fn run_command(
     let mut child = command
         .spawn()
         .map_err(|error| format!("Failed to spawn shell command: {}", error))?;
+    #[cfg(unix)]
+    let mut group = ProcessGroupKiller::new(&child);
 
     let child_stdout = child
         .stdout
@@ -602,12 +701,16 @@ async fn run_command(
                     .code(),
                 Err(_) => {
                     timed_out = true;
+                    #[cfg(unix)]
+                    group.terminate(&mut child).await;
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     None
                 }
             },
             _ = cancellation_token.cancelled() => {
+                #[cfg(unix)]
+                group.terminate(&mut child).await;
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 None
@@ -619,12 +722,16 @@ async fn run_command(
                 .map_err(|error| format!("Failed waiting on shell command: {}", error))?
                 .code(),
             _ = cancellation_token.cancelled() => {
+                #[cfg(unix)]
+                group.terminate(&mut child).await;
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 None
             }
         }
     };
+    #[cfg(unix)]
+    group.disarm();
 
     const OUTPUT_DRAIN_TIMEOUT_MILLIS: u64 = 500;
     let mut output_collection_error = None;
@@ -1404,5 +1511,269 @@ mod tests {
             "killed process should have no exit code"
         );
         assert!(extract_text(&result).contains("Command timed out after 1 seconds"));
+    }
+
+    /// Command whose tree is: bash (sh.pid) -> two backgrounded sleeps (a.pid, b.pid).
+    #[cfg(unix)]
+    fn process_tree_command(dir: &std::path::Path) -> String {
+        let d = dir.display();
+        format!(
+            "echo $$ > {d}/sh.pid; sleep 31 & echo $! > {d}/a.pid; sleep 32 & echo $! > {d}/b.pid; wait"
+        )
+    }
+
+    #[cfg(unix)]
+    async fn read_pids(dir: &std::path::Path, names: &[&str], within: Duration) -> Vec<i32> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let pids: Option<Vec<i32>> = names
+                .iter()
+                .map(|name| {
+                    std::fs::read_to_string(dir.join(name))
+                        .ok()?
+                        .trim()
+                        .parse()
+                        .ok()
+                })
+                .collect();
+            if let Some(pids) = pids {
+                return pids;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never wrote its pid files"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Fields after the `)` that closes comm: state, ppid, pgrp, ...
+    #[cfg(unix)]
+    fn proc_stat_fields(pid: i32) -> Option<Vec<String>> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, rest) = stat.rsplit_once(')')?;
+        Some(rest.split_whitespace().map(str::to_owned).collect())
+    }
+
+    #[cfg(unix)]
+    fn process_group_of(pid: i32) -> Option<i32> {
+        proc_stat_fields(pid)?.get(2)?.parse().ok()
+    }
+
+    /// True once `pid` is gone or a zombie (killed, waiting to be reaped).
+    #[cfg(unix)]
+    async fn wait_until_dead(pid: i32, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let dead = match proc_stat_fields(pid) {
+                None => true,
+                Some(fields) => fields.first().is_some_and(|state| state == "Z"),
+            };
+            if dead {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Starts `command`, waits for `pid_files`, returns the pinned future and the pids.
+    #[cfg(unix)]
+    macro_rules! start_and_read_pids {
+        ($run:ident, $dir:expr, $files:expr) => {{
+            tokio::select! {
+                _ = &mut $run => panic!("command finished before the test acted"),
+                pids = read_pids($dir, $files, Duration::from_secs(10)) => pids,
+            }
+        }};
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_killed_on_cancellation() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let run = tool.shell_with_cwd(
+            ShellParams {
+                command: process_tree_command(dir.path()),
+                timeout_secs: None,
+            },
+            None,
+            None,
+            token.clone(),
+        );
+        tokio::pin!(run);
+        let pids = start_and_read_pids!(run, dir.path(), &["sh.pid", "a.pid", "b.pid"]);
+        let (sh, a, b) = (pids[0], pids[1], pids[2]);
+        assert_eq!(
+            process_group_of(sh),
+            Some(sh),
+            "the shell must lead its own process group"
+        );
+        assert_eq!(
+            process_group_of(a),
+            Some(sh),
+            "descendants must be in the shell's group"
+        );
+
+        token.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("cancellation must return promptly");
+        assert!(extract_shell_output(&result).exit_code.is_none());
+        for pid in [sh, a, b] {
+            assert!(
+                wait_until_dead(pid, Duration::from_secs(2)).await,
+                "pid {pid} survived cancellation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_killed_on_timeout() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = tool
+            .shell(ShellParams {
+                command: process_tree_command(dir.path()),
+                timeout_secs: Some(1),
+            })
+            .await;
+        assert!(extract_shell_output(&result).timed_out);
+        let pids = read_pids(
+            dir.path(),
+            &["sh.pid", "a.pid", "b.pid"],
+            Duration::from_secs(1),
+        )
+        .await;
+        for pid in pids {
+            assert!(
+                wait_until_dead(pid, Duration::from_secs(2)).await,
+                "pid {pid} survived the timeout"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_killed_when_the_call_is_dropped() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pids = {
+            let run = tool.shell(ShellParams {
+                command: process_tree_command(dir.path()),
+                timeout_secs: None,
+            });
+            tokio::pin!(run);
+            start_and_read_pids!(run, dir.path(), &["sh.pid", "a.pid", "b.pid"])
+        }; // `run` is dropped here, as when an aborted agent task drops the tool future.
+        for pid in pids {
+            // Escalation runs on a detached thread: TERM now, KILL after the grace if needed.
+            assert!(
+                wait_until_dead(pid, Duration::from_secs(4)).await,
+                "pid {pid} survived the dropped call"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_left_alone_when_the_shell_exits_normally() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = tool
+            .shell(ShellParams {
+                command: format!("sleep 33 & echo $! > {}/bg.pid", dir.path().display()),
+                timeout_secs: None,
+            })
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let bg = read_pids(dir.path(), &["bg.pid"], Duration::from_secs(1)).await[0];
+        assert!(
+            !wait_until_dead(bg, Duration::from_millis(300)).await,
+            "a deliberately backgrounded process must outlive a normal exit"
+        );
+        // SAFETY: plain signal to a pid this test created.
+        unsafe { libc::kill(bg, libc::SIGKILL) };
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_gets_sigterm_and_a_grace_period_before_sigkill() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let token = CancellationToken::new();
+        let run = tool.shell_with_cwd(
+            ShellParams {
+                command: format!(
+                    "trap 'echo cleaned > {d}/trap; exit 0' TERM; echo $$ > {d}/sh.pid; sleep 30 & wait"
+                ),
+                timeout_secs: None,
+            },
+            None,
+            None,
+            token.clone(),
+        );
+        tokio::pin!(run);
+        let _ = start_and_read_pids!(run, dir.path(), &["sh.pid"]);
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("cancellation must return");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("trap"))
+                .unwrap_or_default()
+                .trim(),
+            "cleaned",
+            "the TERM handler must run before any SIGKILL (git removes index.lock here)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let tool = ShellTool::new_for_test().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let token = CancellationToken::new();
+        // `trap '' TERM` sets SIG_IGN, which the backgrounded sleep inherits too.
+        let run = tool.shell_with_cwd(
+            ShellParams {
+                command: format!(
+                    "trap '' TERM; echo $$ > {d}/sh.pid; sleep 30 & echo $! > {d}/a.pid; wait"
+                ),
+                timeout_secs: None,
+            },
+            None,
+            None,
+            token.clone(),
+        );
+        tokio::pin!(run);
+        let pids = start_and_read_pids!(run, dir.path(), &["sh.pid", "a.pid"]);
+        let started = std::time::Instant::now();
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("escalation must finish");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1500),
+            "SIGKILL came before the grace period: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "escalation took too long: {elapsed:?}"
+        );
+        for pid in pids {
+            assert!(
+                wait_until_dead(pid, Duration::from_secs(2)).await,
+                "pid {pid} survived SIGKILL"
+            );
+        }
     }
 }
