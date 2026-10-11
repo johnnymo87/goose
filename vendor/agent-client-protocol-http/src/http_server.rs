@@ -1,4 +1,4 @@
-// Modified for the goose fork (patched/v1.54.0): Acp-Takeover, Acp-Stream-Features (and in patch 3, SSE ids / Last-Event-ID). See ../VENDORED.md.
+// Modified for the goose fork (patched/v1.54.0): Acp-Takeover, Acp-Stream-Features, SSE ids / Last-Event-ID, Acp-Replay. See ../VENDORED.md.
 use std::{convert::Infallible, error::Error as _, sync::Arc, time::Duration};
 
 use agent_client_protocol::{
@@ -15,11 +15,12 @@ use tracing::{error, info, trace};
 
 use crate::{
     connection::{Connection, ConnectionRegistry, ResponseRoute},
+    http_mailbox::Replay,
     protocol::{
-        EVENT_STREAM_MIME_TYPE, HEADER_CONNECTION_ID, HEADER_SESSION_ID, HEADER_STREAM_FEATURES,
-        HEADER_TAKEOVER, JSON_MIME_TYPE, apply_session_header_to_message, is_initialize_request,
-        is_response_only_shape, method_for_message, method_requires_session_header,
-        session_id_from_message,
+        EVENT_STREAM_MIME_TYPE, HEADER_CONNECTION_ID, HEADER_LAST_EVENT_ID, HEADER_REPLAY,
+        HEADER_SESSION_ID, HEADER_STREAM_FEATURES, HEADER_TAKEOVER, JSON_MIME_TYPE,
+        apply_session_header_to_message, is_initialize_request, is_response_only_shape,
+        method_for_message, method_requires_session_header, session_id_from_message,
     },
 };
 
@@ -327,7 +328,7 @@ impl Drop for InitializeCleanup {
 }
 
 /// Advertised on every SSE GET /acp response (200 and 409) so clients can feature-detect.
-pub(crate) const STREAM_FEATURES: &str = "takeover";
+pub(crate) const STREAM_FEATURES: &str = "takeover, replay";
 
 fn with_stream_features(mut response: Response) -> Response {
     response.headers_mut().insert(
@@ -335,6 +336,10 @@ fn with_stream_features(mut response: Response) -> Response {
         HeaderValue::from_static(STREAM_FEATURES),
     );
     response
+}
+
+fn sse_event(seq: u64, msg: String) -> Event {
+    Event::default().id(seq.to_string()).data(msg)
 }
 
 pub(crate) async fn handle_get(
@@ -379,34 +384,48 @@ pub(crate) async fn handle_get(
                 .into_response(),
         );
     };
+
+    let replay = request.headers().get(HEADER_LAST_EVENT_ID).map(|value| {
+        if let Some(last_seen) = value
+            .to_str()
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            receiver.resume_after(last_seen)
+        } else {
+            receiver.resume_after(0);
+            Replay::Gap // unparseable id: send what is retained, but flag it
+        }
+    });
+
     let mut closed = connection.subscribe_closed();
     let stream = async_stream::stream! {
         loop {
-            while let Ok(msg) = receiver.try_recv() {
+            while let Ok((seq, msg)) = receiver.try_recv_frame() {
                 trace!(payload = %msg, "SSE → client");
-                yield Ok::<_, Infallible>(Event::default().data(msg));
+                yield Ok::<_, Infallible>(sse_event(seq, msg));
             }
             if *closed.borrow() {
-                while let Ok(msg) = receiver.try_recv() {
+                while let Ok((seq, msg)) = receiver.try_recv_frame() {
                     trace!(payload = %msg, "SSE → client");
-                    yield Ok(Event::default().data(msg));
+                    yield Ok(sse_event(seq, msg));
                 }
                 break;
             }
             tokio::select! {
                 biased;
-                recv = receiver.recv() => match recv {
-                    Some(msg) => {
+                recv = receiver.recv_frame() => match recv {
+                    Some((seq, msg)) => {
                         trace!(payload = %msg, "SSE → client");
-                        yield Ok(Event::default().data(msg));
+                        yield Ok(sse_event(seq, msg));
                     }
                     None => break,
                 },
                 changed = closed.changed() => {
                     if changed.is_err() || *closed.borrow() {
-                        while let Ok(msg) = receiver.try_recv() {
+                        while let Ok((seq, msg)) = receiver.try_recv_frame() {
                             trace!(payload = %msg, "SSE → client");
-                            yield Ok(Event::default().data(msg));
+                            yield Ok(sse_event(seq, msg));
                         }
                         break;
                     }
@@ -429,6 +448,15 @@ pub(crate) async fn handle_get(
         && let Ok(value) = HeaderValue::from_str(&session_id)
     {
         response.headers_mut().insert(HEADER_SESSION_ID, value);
+    }
+    if let Some(replay) = replay {
+        response.headers_mut().insert(
+            HEADER_REPLAY,
+            HeaderValue::from_static(match replay {
+                Replay::Complete => "complete",
+                Replay::Gap => "gap",
+            }),
+        );
     }
     response
 }
@@ -1424,7 +1452,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(first_event.to_vec()).unwrap(),
-            "data: already-read\n\n"
+            "id: 1\ndata: already-read\n\n"
         );
         drop(connection_body);
 
@@ -1445,9 +1473,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(body.to_vec()).unwrap(),
             concat!(
-                "data: queued-before-drop-1\n\n",
-                "data: queued-before-drop-2\n\n",
-                "data: queued-after-drop\n\n",
+                "id: 2\ndata: queued-before-drop-1\n\n",
+                "id: 3\ndata: queued-before-drop-2\n\n",
+                "id: 4\ndata: queued-after-drop\n\n",
             )
         );
     }
@@ -1516,7 +1544,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(body.to_vec()).unwrap(),
-            "data: queued-before-subscribe\n\n"
+            "id: 1\ndata: queued-before-subscribe\n\n"
         );
     }
 
@@ -1756,5 +1784,185 @@ mod tests {
         .expect("a revoked stream must end, not idle on keepalives")
         .unwrap();
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sse_takeover_on_idle_mailbox_delivers_queued_frames() {
+        let (registry, _forwarded_rx) = capturing_registry();
+        let (connection_id, connection) = registry.create_connection().await;
+        push_tagged(&connection, None, "queued-1").await;
+        push_tagged(&connection, None, "queued-2").await;
+
+        let response = handle_get(
+            registry.clone(),
+            sse_get(&connection_id, None, &[(HEADER_TAKEOVER, "1")]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        connection.shutdown().await;
+        let body = timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), 64 * 1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            data_tags(&String::from_utf8(body.to_vec()).unwrap()),
+            ["queued-1", "queued-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_takeover_rejects_non_one_values() {
+        let (registry, _forwarded_rx) = capturing_registry();
+        let (connection_id, _connection) = registry.create_connection().await;
+
+        let held = handle_get(registry.clone(), sse_get(&connection_id, None, &[])).await;
+        assert_eq!(held.status(), StatusCode::OK);
+
+        for non_one in ["0", "true", "yes", "2", ""] {
+            let refused = handle_get(
+                registry.clone(),
+                sse_get(&connection_id, None, &[(HEADER_TAKEOVER, non_one)]),
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::CONFLICT);
+            assert_eq!(refused.headers()[HEADER_STREAM_FEATURES], STREAM_FEATURES);
+        }
+    }
+
+    fn event_ids(body: &str) -> Vec<u64> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("id: "))
+            .map(|id| id.parse().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sse_frames_carry_ids_and_last_event_id_replays_the_rest() {
+        let (registry, _forwarded_rx) = capturing_registry();
+        let (connection_id, connection) = registry.create_connection().await;
+        for tag in ["one", "two", "three"] {
+            push_tagged(&connection, None, tag).await;
+        }
+        let first = handle_get(registry.clone(), sse_get(&connection_id, None, &[])).await;
+        assert_eq!(first.headers()[HEADER_STREAM_FEATURES], "takeover, replay");
+        assert!(first.headers().get(HEADER_REPLAY).is_none());
+        let mut body = first.into_body().into_data_stream();
+        for _ in 0..3 {
+            timeout(Duration::from_secs(1), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        drop(body); // goose wrote all three; the client only processed id 1
+        push_tagged(&connection, None, "four").await;
+
+        let resumed = handle_get(
+            registry.clone(),
+            sse_get(&connection_id, None, &[(HEADER_LAST_EVENT_ID, "1")]),
+        )
+        .await;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert_eq!(resumed.headers()[HEADER_REPLAY], "complete");
+        connection.shutdown().await;
+        let body = String::from_utf8(
+            axum::body::to_bytes(resumed.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(event_ids(&body), [2, 3, 4]);
+        assert_eq!(data_tags(&body), ["two", "three", "four"]);
+    }
+
+    #[tokio::test]
+    async fn sse_last_event_id_older_than_the_ring_flags_a_gap() {
+        let (registry, _forwarded_rx) = capturing_registry();
+        let (connection_id, connection) = registry.create_connection().await;
+        let total = crate::http_mailbox::REPLAY_RING_MAX_FRAMES + 8;
+        for n in 0..total {
+            connection
+                .push_connection_stream_for_test(format!("m{n}"))
+                .unwrap();
+        }
+        let first = handle_get(registry.clone(), sse_get(&connection_id, None, &[])).await;
+        let mut body = first.into_body().into_data_stream();
+        timeout(Duration::from_secs(5), async {
+            for _ in 0..total {
+                body.next().await.unwrap().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        drop(body);
+
+        let resumed = handle_get(
+            registry.clone(),
+            sse_get(&connection_id, None, &[(HEADER_LAST_EVENT_ID, "0")]),
+        )
+        .await;
+        assert_eq!(resumed.headers()[HEADER_REPLAY], "gap");
+        connection.shutdown().await;
+        let body = String::from_utf8(
+            axum::body::to_bytes(resumed.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let ids = event_ids(&body);
+        assert_eq!(ids.len(), crate::http_mailbox::REPLAY_RING_MAX_FRAMES);
+        assert_eq!(ids.first().copied(), Some(9), "seqs 1..=8 were evicted");
+    }
+
+    #[tokio::test]
+    async fn sse_takeover_with_last_event_id_recovers_frames_a_stuck_stream_dequeued() {
+        for session_id in [None, Some("session-1")] {
+            let (registry, _forwarded_rx) = capturing_registry();
+            let (connection_id, connection) = registry.create_connection().await;
+            push_tagged(&connection, session_id, "one").await;
+            push_tagged(&connection, session_id, "two").await;
+
+            // goose writes both frames into a socket the client never reads.
+            let stuck =
+                handle_get(registry.clone(), sse_get(&connection_id, session_id, &[])).await;
+            let mut stuck_body = stuck.into_body().into_data_stream();
+            for _ in 0..2 {
+                timeout(Duration::from_secs(1), stuck_body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            push_tagged(&connection, session_id, "three").await;
+
+            let taken = handle_get(
+                registry.clone(),
+                sse_get(
+                    &connection_id,
+                    session_id,
+                    &[(HEADER_TAKEOVER, "1"), (HEADER_LAST_EVENT_ID, "0")],
+                ),
+            )
+            .await;
+            assert_eq!(taken.status(), StatusCode::OK);
+            assert_eq!(taken.headers()[HEADER_REPLAY], "complete");
+            connection.shutdown().await;
+            let body = String::from_utf8(
+                axum::body::to_bytes(taken.into_body(), 64 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert_eq!(event_ids(&body), [1, 2, 3]);
+            assert_eq!(data_tags(&body), ["one", "two", "three"]);
+            drop(stuck_body); // the half-open socket lingers; harmless
+        }
     }
 }
