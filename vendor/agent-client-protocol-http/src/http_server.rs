@@ -1,3 +1,4 @@
+// Modified for the goose fork (patched/v1.54.0): Acp-Takeover, Acp-Stream-Features (and in patch 3, SSE ids / Last-Event-ID). See ../VENDORED.md.
 use std::{convert::Infallible, error::Error as _, sync::Arc, time::Duration};
 
 use agent_client_protocol::{
@@ -15,9 +16,10 @@ use tracing::{error, info, trace};
 use crate::{
     connection::{Connection, ConnectionRegistry, ResponseRoute},
     protocol::{
-        EVENT_STREAM_MIME_TYPE, HEADER_CONNECTION_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
-        apply_session_header_to_message, is_initialize_request, is_response_only_shape,
-        method_for_message, method_requires_session_header, session_id_from_message,
+        EVENT_STREAM_MIME_TYPE, HEADER_CONNECTION_ID, HEADER_SESSION_ID, HEADER_STREAM_FEATURES,
+        HEADER_TAKEOVER, JSON_MIME_TYPE, apply_session_header_to_message, is_initialize_request,
+        is_response_only_shape, method_for_message, method_requires_session_header,
+        session_id_from_message,
     },
 };
 
@@ -324,6 +326,17 @@ impl Drop for InitializeCleanup {
     }
 }
 
+/// Advertised on every SSE GET /acp response (200 and 409) so clients can feature-detect.
+pub(crate) const STREAM_FEATURES: &str = "takeover";
+
+fn with_stream_features(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        HEADER_STREAM_FEATURES,
+        HeaderValue::from_static(STREAM_FEATURES),
+    );
+    response
+}
+
 pub(crate) async fn handle_get(
     registry: Arc<ConnectionRegistry>,
     request: Request<Body>,
@@ -349,16 +362,22 @@ pub(crate) async fn handle_get(
     };
 
     let session_id = header_value(request.headers(), HEADER_SESSION_ID);
-    let receiver = match session_id.as_deref() {
-        Some(session_id) => connection.subscribe_session_stream(session_id).await,
-        None => connection.subscribe_connection_stream(),
+    let takeover =
+        header_value(request.headers(), HEADER_TAKEOVER).is_some_and(|v| v.trim() == "1");
+    let receiver = match (session_id.as_deref(), takeover) {
+        (Some(session_id), false) => connection.subscribe_session_stream(session_id).await,
+        (Some(session_id), true) => connection.take_over_session_stream(session_id).await,
+        (None, false) => connection.subscribe_connection_stream(),
+        (None, true) => connection.take_over_connection_stream(),
     };
     let Some(mut receiver) = receiver else {
-        return (
-            StatusCode::CONFLICT,
-            "outbound stream already has a subscriber",
-        )
-            .into_response();
+        return with_stream_features(
+            (
+                StatusCode::CONFLICT,
+                "outbound stream already has a subscriber",
+            )
+                .into_response(),
+        );
     };
     let mut closed = connection.subscribe_closed();
     let stream = async_stream::stream! {
@@ -396,7 +415,7 @@ pub(crate) async fn handle_get(
         }
     };
 
-    let mut response = with_connection_header(
+    let mut response = with_stream_features(with_connection_header(
         Sse::new(stream)
             .keep_alive(
                 axum::response::sse::KeepAlive::new()
@@ -405,7 +424,7 @@ pub(crate) async fn handle_get(
             )
             .into_response(),
         &connection_id,
-    );
+    ));
     if let Some(session_id) = session_id
         && let Ok(value) = HeaderValue::from_str(&session_id)
     {
@@ -526,6 +545,57 @@ mod tests {
 
             (transport, future)
         }
+    }
+
+    fn capturing_registry() -> (
+        Arc<ConnectionRegistry>,
+        mpsc::UnboundedReceiver<RawJsonRpcMessage>,
+    ) {
+        let (forwarded_tx, forwarded_rx) = mpsc::unbounded_channel();
+        let registry = Arc::new(ConnectionRegistry::new(Arc::new(CapturingAgentFactory {
+            forwarded: forwarded_tx,
+        })));
+        (registry, forwarded_rx)
+    }
+
+    fn sse_get(
+        connection_id: &str,
+        session_id: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/acp")
+            .header(header::ACCEPT, EVENT_STREAM_MIME_TYPE)
+            .header(HEADER_CONNECTION_ID, connection_id);
+        if let Some(session_id) = session_id {
+            request = request.header(HEADER_SESSION_ID, session_id);
+        }
+        for (name, value) in extra {
+            request = request.header(*name, *value);
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
+    async fn push_tagged(connection: &Connection, session_id: Option<&str>, tag: &str) {
+        let mut params = json!({ "tag": tag });
+        if let Some(session_id) = session_id {
+            params["sessionId"] = json!(session_id);
+        }
+        connection
+            .route_outbound(TransportFrame::Single(
+                RawJsonRpcMessage::notification("session/update".to_string(), params).unwrap(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    fn data_tags(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .filter_map(|value| value["params"]["tag"].as_str().map(str::to_owned))
+            .collect()
     }
 
     struct RejectingInitializeAgentFactory;
@@ -1597,5 +1667,94 @@ mod tests {
         assert_eq!(body.as_ref(), b"Acp-Session-Id header required");
         assert!(forwarded_rx.try_recv().is_err());
         connection.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sse_takeover_evicts_an_unpolled_subscriber() {
+        for session_id in [None, Some("session-1")] {
+            let (registry, mut forwarded_rx) = capturing_registry();
+            let (connection_id, connection) = registry.create_connection().await;
+
+            // #1 subscribes and its body is never polled: hyper's writer is stuck.
+            let stuck =
+                handle_get(registry.clone(), sse_get(&connection_id, session_id, &[])).await;
+            assert_eq!(stuck.status(), StatusCode::OK);
+            assert_eq!(stuck.headers()[HEADER_STREAM_FEATURES], STREAM_FEATURES);
+            push_tagged(&connection, session_id, "before-takeover").await;
+
+            // Without the header the 409 contract is unchanged.
+            let refused =
+                handle_get(registry.clone(), sse_get(&connection_id, session_id, &[])).await;
+            assert_eq!(refused.status(), StatusCode::CONFLICT);
+            assert_eq!(refused.headers()[HEADER_STREAM_FEATURES], STREAM_FEATURES);
+
+            // With it, the new subscriber wins at once.
+            let taken = timeout(
+                Duration::from_millis(100),
+                handle_get(
+                    registry.clone(),
+                    sse_get(&connection_id, session_id, &[(HEADER_TAKEOVER, "1")]),
+                ),
+            )
+            .await
+            .expect("takeover must not wait for the stuck stream");
+            assert_eq!(taken.status(), StatusCode::OK);
+            push_tagged(&connection, session_id, "after-takeover").await;
+
+            // The new owner keeps the stream, also after the stale body is dropped.
+            let again =
+                handle_get(registry.clone(), sse_get(&connection_id, session_id, &[])).await;
+            assert_eq!(again.status(), StatusCode::CONFLICT);
+            drop(stuck);
+            let again =
+                handle_get(registry.clone(), sse_get(&connection_id, session_id, &[])).await;
+            assert_eq!(again.status(), StatusCode::CONFLICT);
+
+            // The agent task was never aborted.
+            connection
+                .send_frame_to_agent(TransportFrame::Single(
+                    RawJsonRpcMessage::notification("test/ping".to_string(), json!({})).unwrap(),
+                ))
+                .unwrap();
+            let ping = timeout(Duration::from_secs(1), forwarded_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(method_for_message(&ping), Some("test/ping"));
+
+            // Nothing the stuck stream never dequeued is lost.
+            connection.shutdown().await;
+            let body = timeout(
+                Duration::from_secs(1),
+                axum::body::to_bytes(taken.into_body(), 64 * 1024),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                data_tags(&String::from_utf8(body.to_vec()).unwrap()),
+                ["before-takeover", "after-takeover"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_takeover_ends_a_still_polled_subscriber() {
+        let (registry, _forwarded_rx) = capturing_registry();
+        let (connection_id, _connection) = registry.create_connection().await;
+        let old = handle_get(registry.clone(), sse_get(&connection_id, None, &[])).await;
+        let _new = handle_get(
+            registry.clone(),
+            sse_get(&connection_id, None, &[(HEADER_TAKEOVER, "1")]),
+        )
+        .await;
+        let body = timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(old.into_body(), 1024),
+        )
+        .await
+        .expect("a revoked stream must end, not idle on keepalives")
+        .unwrap();
+        assert!(body.is_empty());
     }
 }

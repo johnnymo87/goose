@@ -1,3 +1,4 @@
+// Modified for the goose fork (patched/v1.54.0): HTTP streams use http_mailbox (takeover/replay); WebSocket path unchanged. See ../VENDORED.md.
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex as StdMutex, Weak},
@@ -11,7 +12,10 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tracing::{debug, error, trace};
 
-use crate::protocol::session_id_from_message;
+use crate::{
+    http_mailbox::{HttpLease, HttpMailbox},
+    protocol::session_id_from_message,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResponseRoute {
@@ -25,8 +29,8 @@ enum OutboundTransport {
 }
 
 struct HttpOutbound {
-    connection_stream: OutboundMailbox,
-    session_streams: RwLock<HashMap<String, Arc<OutboundMailbox>>>,
+    connection_stream: HttpMailbox,
+    session_streams: RwLock<HashMap<String, Arc<HttpMailbox>>>,
     pending_routes: Mutex<HashMap<RequestId, VecDeque<ResponseRoute>>>,
 }
 
@@ -129,13 +133,23 @@ impl Connection {
         self.outbound_transport.ensure_session(session_id).await;
     }
 
-    pub(crate) fn subscribe_connection_stream(&self) -> Option<OutboundLease> {
+    pub(crate) fn subscribe_connection_stream(&self) -> Option<HttpLease> {
         self.outbound_transport.subscribe_connection_stream()
     }
 
-    pub(crate) async fn subscribe_session_stream(&self, session_id: &str) -> Option<OutboundLease> {
+    pub(crate) async fn subscribe_session_stream(&self, session_id: &str) -> Option<HttpLease> {
         self.outbound_transport
             .subscribe_session_stream(session_id)
+            .await
+    }
+
+    pub(crate) fn take_over_connection_stream(&self) -> Option<HttpLease> {
+        self.outbound_transport.take_over_connection_stream()
+    }
+
+    pub(crate) async fn take_over_session_stream(&self, session_id: &str) -> Option<HttpLease> {
+        self.outbound_transport
+            .take_over_session_stream(session_id)
             .await
     }
 
@@ -229,16 +243,30 @@ impl OutboundTransport {
         http.ensure_session(session_id).await;
     }
 
-    fn subscribe_connection_stream(&self) -> Option<OutboundLease> {
+    fn subscribe_connection_stream(&self) -> Option<HttpLease> {
         match self {
             Self::Http(http) => http.connection_stream.try_acquire(),
             Self::WebSocket(_) => None,
         }
     }
 
-    async fn subscribe_session_stream(&self, session_id: &str) -> Option<OutboundLease> {
+    async fn subscribe_session_stream(&self, session_id: &str) -> Option<HttpLease> {
         match self {
             Self::Http(http) => http.session_stream(session_id).await.try_acquire(),
+            Self::WebSocket(_) => None,
+        }
+    }
+
+    fn take_over_connection_stream(&self) -> Option<HttpLease> {
+        match self {
+            Self::Http(http) => Some(http.connection_stream.take_over()),
+            Self::WebSocket(_) => None,
+        }
+    }
+
+    async fn take_over_session_stream(&self, session_id: &str) -> Option<HttpLease> {
+        match self {
+            Self::Http(http) => Some(http.session_stream(session_id).await.take_over()),
             Self::WebSocket(_) => None,
         }
     }
@@ -298,7 +326,7 @@ impl OutboundTransport {
 impl HttpOutbound {
     fn new() -> Self {
         Self {
-            connection_stream: OutboundMailbox::new(),
+            connection_stream: HttpMailbox::new(),
             session_streams: RwLock::new(HashMap::new()),
             pending_routes: Mutex::new(HashMap::new()),
         }
@@ -319,7 +347,7 @@ impl HttpOutbound {
         self.session_stream(session_id).await;
     }
 
-    async fn session_stream(&self, session_id: &str) -> Arc<OutboundMailbox> {
+    async fn session_stream(&self, session_id: &str) -> Arc<HttpMailbox> {
         if let Some(stream) = self.session_streams.read().await.get(session_id) {
             return stream.clone();
         }
@@ -328,7 +356,7 @@ impl HttpOutbound {
             .write()
             .await
             .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(OutboundMailbox::new()))
+            .or_insert_with(|| Arc::new(HttpMailbox::new()))
             .clone()
     }
 

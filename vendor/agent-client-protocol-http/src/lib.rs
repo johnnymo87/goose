@@ -1,9 +1,12 @@
+// Modified for the goose fork (patched/v1.54.0): adds mod http_mailbox. See ../VENDORED.md.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "server")]
 mod connection;
+#[cfg(feature = "server")]
+mod http_mailbox;
 #[cfg(feature = "server")]
 mod http_server;
 #[cfg(any(feature = "client", feature = "server"))]

@@ -1,7 +1,12 @@
+// Modified for the goose fork (patched/v1.54.0): SSE takeover/replay header names. See ../VENDORED.md.
 use agent_client_protocol::{RawJsonRpcMessage, RawJsonRpcParams};
 
 pub(crate) const HEADER_CONNECTION_ID: &str = "acp-connection-id";
 pub(crate) const HEADER_SESSION_ID: &str = "acp-session-id";
+#[cfg(feature = "server")]
+pub(crate) const HEADER_TAKEOVER: &str = "acp-takeover";
+#[cfg(feature = "server")]
+pub(crate) const HEADER_STREAM_FEATURES: &str = "acp-stream-features";
 #[cfg(feature = "server")]
 pub(crate) const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
 #[cfg(feature = "server")]
