@@ -22,7 +22,7 @@ jobs:
     with:
       ref: ${{ github.sha }}
 
-  # Unit tests for the patched code paths, on the same toolchain (rust-toolchain.toml).
+  # Unit tests for the patched code paths (including the vendored acp-http crate), on the same toolchain.
   test-patches:
     runs-on: ubuntu-24.04-arm
     steps:
@@ -31,11 +31,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev libdbus-1-dev libxcb1-dev protobuf-compiler cmake clang libclang-dev
+      - name: Vendored acp-http is the one in the build graph
+        # An unused [patch] is only a cargo warning; fail loudly instead. --locked also
+        # fails if Cargo.lock is stale (build-cli-linux.yml does not pass --locked).
+        run: |
+          cargo tree --locked -p goose-cli --features acp-http -i agent-client-protocol-http --depth 0 \
+            | tee /dev/stderr | grep -F 'vendor/agent-client-protocol-http'
       - name: Test patched modules
         run: |
           F=code-mode,tree-sitter,aws-providers,telemetry,otel,rustls-tls,live-voice,system-keyring,platform-apps,chat-recall,scheduler,acp-http,online-model-meta
-          cargo test --release -p goose --features "$F" --lib -- gcpvertexai gcpauth
+          cargo test --release -p goose --features "$F" --lib -- gcpvertexai gcpauth process_group
           cargo test --release -p goose-cli --lib -- cache_ttl
+          cargo test --release -p agent-client-protocol-http --features server --lib
 
   release:
     needs: [build, test-patches]
