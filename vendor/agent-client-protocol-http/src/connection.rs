@@ -1,4 +1,4 @@
-// Modified for the goose fork (patched/v1.54.0): HTTP streams use http_mailbox (takeover/replay); WebSocket path unchanged. See ../VENDORED.md.
+// Modified by Jonathan Mohrbacher, 2026, for the goose fork (patched/v1.54.0): HTTP streams use http_mailbox (takeover/replay); WebSocket path unchanged. See ../VENDORED.md.
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex as StdMutex, Weak},

@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: GCP_VERTEX_HOST overrides the request host; GCP_VERTEX_SESSION_HEADER renames the session id header.
 use std::io;
 use std::time::Duration;
 

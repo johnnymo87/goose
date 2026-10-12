@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: GCP_AUTH_SCOPES sets the scopes requested on authorized-user token refresh.
 use async_trait::async_trait;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::{Deserialize, Serialize};

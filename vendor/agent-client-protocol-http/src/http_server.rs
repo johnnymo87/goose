@@ -1,4 +1,4 @@
-// Modified for the goose fork (patched/v1.54.0): Acp-Takeover, Acp-Stream-Features, SSE ids / Last-Event-ID, Acp-Replay. See ../VENDORED.md.
+// Modified by Jonathan Mohrbacher, 2026, for the goose fork (patched/v1.54.0): Acp-Takeover, Acp-Stream-Features, SSE ids / Last-Event-ID, Acp-Replay. See ../VENDORED.md.
 use std::{convert::Infallible, error::Error as _, sync::Arc, time::Duration};
 
 use agent_client_protocol::{

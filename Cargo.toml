@@ -1,3 +1,4 @@
+# Modified by Jonathan Mohrbacher, 2026: vendored agent-client-protocol-http as workspace member and [patch.crates-io]; gemm-f16 dev opt-level for aarch64-linux.
 [workspace]
 members = [
     "crates/*",
@@ -129,6 +130,13 @@ cudaforge = { git = "https://github.com/jbg/cudaforge", rev = "e7c1967340e40673d
 # full debug info and stay fully debuggable; release builds are unaffected.
 [profile.dev.package."*"]
 debug = false
+
+# gemm-f16's NEON fp16 asm helpers only assemble once inlined into their
+# fp16-enabled callers, so an unoptimized build fails on aarch64-linux
+# ("instruction requires: fullfp16"; sarah-quinones/gemm#31). Apple targets
+# enable fp16 by default and are unaffected.
+[profile.dev.package.gemm-f16]
+opt-level = 1
 
 [profile.lean]
 inherits = "release"

@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: on Unix, cancel, timeout and drop kill the command's whole process group (SIGTERM, 2s grace, SIGKILL).
 #[cfg(windows)]
 use std::path::Path;
 use std::path::PathBuf;
