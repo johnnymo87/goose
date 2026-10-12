@@ -39,9 +39,13 @@
 
         # Pre-fetch rusty_v8 binary to avoid network access during build
         # Map Nix system to rusty_v8 target triple
-        rustyV8Archive = let
+        rustyV8Version = let
           cargoLock = builtins.fromTOML (builtins.readFile ./Cargo.lock);
-          rustyV8Version = (builtins.head (builtins.filter (p: p.name == "v8") cargoLock.package)).version;
+          v8 = builtins.filter (p: p.name == "v8") cargoLock.package;
+        in if v8 == [ ] then null else (builtins.head v8).version;
+        # The hashes below are for this rusty_v8 release only.
+        rustyV8HashedVersion = "145.0.0";
+        rustyV8Archive = let
           rustyV8Target = {
             "x86_64-linux" = "x86_64-unknown-linux-gnu";
             "aarch64-linux" = "aarch64-unknown-linux-gnu";
@@ -115,16 +119,13 @@
           };
         };
 
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell ({
           # goose-cli's default features build llama-cpp-sys-2: bindgenHook exports
           # LIBCLANG_PATH and BINDGEN_EXTRA_CLANG_ARGS, and its build script runs cmake.
           nativeBuildInputs = with pkgs; [
             rustPlatform.bindgenHook
             cmake
           ];
-
-          # Without it v8-goose's build script downloads the archive with python or curl.
-          RUSTY_V8_ARCHIVE = rustyV8Archive;
 
           packages = buildInputs ++ (with pkgs; [
             cargo-watch
@@ -151,7 +152,10 @@
             echo "  cargo build -p goose-cli - Build with cargo"
             echo "  cargo run -p goose-cli   - Run with cargo"
           '';
-        };
+        } // pkgs.lib.optionalAttrs (rustyV8Version == rustyV8HashedVersion) {
+          # Otherwise v8-goose's build script downloads the archive itself (python or curl).
+          RUSTY_V8_ARCHIVE = rustyV8Archive;
+        });
       }
     );
 }
