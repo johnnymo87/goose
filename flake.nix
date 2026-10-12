@@ -1,3 +1,4 @@
+# Modified by Jonathan Mohrbacher, 2026: dev shell adds bindgenHook, cmake and RUSTY_V8_ARCHIVE so `cargo build -p goose-cli` works in it.
 {
   description = "goose - An AI agent CLI";
 

@@ -1,4 +1,4 @@
-// Modified for the goose fork (patched/v1.54.0): SSE takeover/replay header names. See ../VENDORED.md.
+// Modified by Jonathan Mohrbacher, 2026, for the goose fork (patched/v1.54.0): SSE takeover/replay header names. See ../VENDORED.md.
 use agent_client_protocol::{RawJsonRpcMessage, RawJsonRpcParams};
 
 pub(crate) const HEADER_CONNECTION_ID: &str = "acp-connection-id";

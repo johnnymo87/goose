@@ -1,3 +1,4 @@
+# Modified by Jonathan Mohrbacher, 2026: vendored agent-client-protocol-http as workspace member and [patch.crates-io]; gemm-f16 dev opt-level for aarch64-linux.
 [workspace]
 members = [
     "crates/*",

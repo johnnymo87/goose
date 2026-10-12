@@ -1,4 +1,4 @@
-// Modified for the goose fork (patched/v1.54.0): adds mod http_mailbox. See ../VENDORED.md.
+// Modified by Jonathan Mohrbacher, 2026, for the goose fork (patched/v1.54.0): adds mod http_mailbox. See ../VENDORED.md.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "client")]

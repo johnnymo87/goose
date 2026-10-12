@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_HEADLESS_CACHE_TTL (5m|1h) opts a headless run out of the 5m cache TTL clamp.
 use crate::cli::StreamableHttpOptions;
 
 use super::output;
