@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: on_set_session_settings pins session cache TTL and recipe.
 use super::*;
 
 impl GooseAcpAgent {
@@ -78,6 +79,64 @@ impl GooseAcpAgent {
                     agent.extend_system_prompt(key.to_string(), req.text).await;
                 }
             }
+        }
+
+        Ok(EmptyResponse {})
+    }
+
+    pub(super) async fn on_set_session_settings(
+        &self,
+        req: SetSessionSettingsRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        let session_id = req.session_id.trim();
+        if session_id.is_empty() {
+            return Err(
+                agent_client_protocol::Error::invalid_params().data("sessionId cannot be empty")
+            );
+        }
+
+        if let Some(ttl) = &req.cache_ttl {
+            let normalized = ttl.trim().to_lowercase();
+            if normalized != "5m" && normalized != "1h" {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("cacheTtl must be '5m' or '1h'"));
+            }
+        }
+
+        let agent = self.get_session_agent(session_id).await?;
+
+        if let Some(ttl) = req.cache_ttl.as_deref().map(str::trim) {
+            let normalized = ttl.to_lowercase();
+            let current_model_config = agent
+                .model_config_for_session(session_id)
+                .await
+                .internal_err_ctx("Failed to resolve model config")?;
+            let provider = agent
+                .provider()
+                .await
+                .internal_err_ctx("Failed to get provider")?;
+            let new_model_config = current_model_config.with_cache_ttl(&normalized);
+            agent
+                .update_provider(provider, new_model_config, session_id)
+                .await
+                .internal_err_ctx("Failed to update provider model config")?;
+        }
+
+        if let Some(recipe_dto) = req.recipe {
+            let recipe = crate::recipe::Recipe::try_from(recipe_dto)
+                .map_err(|e| agent_client_protocol::Error::invalid_params().data(format!("recipe: {e}")))?;
+
+            // Persist the recipe to the session row.
+            // Note: recipe.extensions is ignored by this call; session extensions are unchanged.
+            self.session_manager
+                .update(session_id)
+                .recipe(Some(recipe.clone()))
+                .apply()
+                .await
+                .internal_err_ctx("Failed to persist recipe to session")?;
+
+            // Re-apply in memory: instructions under "recipe" key and final_output tool from recipe.response.
+            self.apply_recipe(&agent, &recipe).await?;
         }
 
         Ok(EmptyResponse {})

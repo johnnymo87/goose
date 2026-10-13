@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: dispatch _goose/unstable/session/settings/set custom method.
 use super::*;
 use goose_acp_macros::custom_methods;
 
@@ -124,6 +125,14 @@ impl GooseAcpAgent {
         req: SetSessionSystemPromptRequest,
     ) -> Result<EmptyResponse, agent_client_protocol::Error> {
         self.on_set_session_system_prompt(req).await
+    }
+
+    #[custom_method(SetSessionSettingsRequest)]
+    async fn dispatch_set_session_settings(
+        &self,
+        req: SetSessionSettingsRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        self.on_set_session_settings(req).await
     }
 
     #[custom_method(SteerSessionRequest)]

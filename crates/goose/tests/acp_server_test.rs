@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -13,9 +14,10 @@ use common_tests::fixtures::server::{
     assert_session_response_precedes_available_commands, AcpServerConnection,
 };
 use common_tests::fixtures::{
-    run_test, spawn_acp_server_in_process, Connection, OpenAiFixture, PermissionDecision, Session,
+    run_test, send_custom, spawn_acp_server_in_process, Connection, OpenAiFixture, PermissionDecision, Session,
     SessionData, TestConnectionConfig,
 };
+use serial_test::serial;
 #[cfg(feature = "code-mode")]
 use common_tests::run_prompt_codemode;
 use common_tests::{
@@ -39,8 +41,9 @@ use goose::custom_requests::{
 use goose::recipe::{Recipe, Settings};
 use goose::recipe_deeplink;
 use goose::session::{SessionManager, SessionType};
-use goose_test_support::{McpFixture, FAKE_CODE};
+use goose_test_support::{IgnoreSessionId, McpFixture, FAKE_CODE};
 use std::path::Path;
+use std::sync::Arc;
 
 tests_config_option_set_error!(AcpServerConnection);
 tests_mode_set_error!(AcpServerConnection);
@@ -1316,4 +1319,140 @@ fn test_shell_terminal_false() {
 #[test]
 fn test_shell_terminal_true() {
     run_test(async { run_shell_terminal_true::<AcpServerConnection>().await });
+}
+
+#[test]
+#[serial]
+fn test_session_settings_set() {
+    run_test(async move {
+        const FINAL_OUTPUT_RESPONSE: &str = "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_final\",\"type\":\"function\",\"function\":{\"name\":\"recipe__final_output\",\"arguments\":\"{\\\"summary\\\":\\\"done\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(
+            vec![(
+                "Special test recipe instructions".to_string(),
+                FINAL_OUTPUT_RESPONSE,
+            )],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // (iii) invalid cacheTtl -> invalid params
+        let invalid_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "2h",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid_err.code, ErrorCode::InvalidParams);
+
+        // (i) and (ii) Set settings with cacheTtl 1h and recipe, called twice for idempotency
+        let recipe = serde_json::json!({
+            "title": "Settings Test Recipe",
+            "description": "Test recipe description",
+            "instructions": "Special test recipe instructions",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["summary"]
+                }
+            }
+        });
+
+        for _ in 0..2 {
+            let res = send_custom(
+                conn.cx(),
+                "_goose/unstable/session/settings/set",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cacheTtl": "1h",
+                    "recipe": recipe,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(res, serde_json::json!({}));
+        }
+
+        let session_manager = SessionManager::new(temp_data.path().to_path_buf());
+
+        // Verify session.recipe is persisted
+        let stored_recipe = session_manager.get_session(&session_id, false).await.unwrap();
+        assert!(stored_recipe.recipe.is_some());
+        assert_eq!(
+            stored_recipe.recipe.as_ref().unwrap().instructions.as_deref(),
+            Some("Special test recipe instructions")
+        );
+
+        // Verify session.model_config has cache_ttl 1h
+        assert_eq!(
+            stored_recipe.model_config.as_ref().and_then(|mc| mc.cache_ttl()),
+            Some("1h".to_string())
+        );
+
+        // Verify final_output tool exists exactly once
+        let tools_res = send_custom(
+            conn.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools = tools_res.get("tools").and_then(|t| t.as_array()).expect("tools array");
+        let final_output_count = tools
+            .iter()
+            .filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("recipe__final_output"))
+            .count();
+        assert_eq!(final_output_count, 1, "final_output tool should exist exactly once");
+
+        // Verify system prompt contains the new instructions by running prompt
+        let prompt_output = session
+            .prompt(
+                "Hello with recipe",
+                PermissionDecision::AllowOnce,
+            )
+            .await
+            .unwrap();
+        assert!(prompt_output.tool_status.is_some());
+
+        // Survives fresh session/load on a new connection
+        let openai2 = OpenAiFixture::new(
+            vec![],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let mut conn2 = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai2,
+        )
+        .await;
+        let _loaded = conn2.load_session(&session_id, vec![]).await.unwrap();
+
+        let stored_after_load = session_manager.get_session(&session_id, false).await.unwrap();
+        assert_eq!(
+            stored_after_load.model_config.as_ref().and_then(|mc| mc.cache_ttl()),
+            Some("1h".to_string())
+        );
+    });
 }
