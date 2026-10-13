@@ -103,17 +103,26 @@ impl GooseAcpAgent {
             }
         }
 
-        let validated_recipe = if let Some(recipe_dto) = req.recipe {
-            let recipe = crate::recipe::Recipe::try_from(recipe_dto).map_err(|e| {
+        let session = self
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .map_err(|_| {
+                agent_client_protocol::Error::resource_not_found(Some(session_id.to_string()))
+                    .data(format!("Session not found: {}", session_id))
+            })?;
+
+        let (raw_recipe_to_persist, recipe_to_apply) = if let Some(recipe_dto) = req.recipe {
+            let raw_recipe = crate::recipe::Recipe::try_from(recipe_dto).map_err(|e| {
                 agent_client_protocol::Error::invalid_params().data(format!("invalid recipe: {e}"))
             })?;
 
-            if recipe.check_for_security_warnings() {
+            if raw_recipe.check_for_security_warnings() {
                 return Err(agent_client_protocol::Error::invalid_params()
                     .data("invalid recipe: contains hidden characters that could be malicious"));
             }
 
-            let recipe_yaml = recipe.to_yaml().map_err(|e| {
+            let recipe_yaml = raw_recipe.to_yaml().map_err(|e| {
                 agent_client_protocol::Error::invalid_params().data(format!("invalid recipe: {e}"))
             })?;
             crate::recipe::validate_recipe::validate_recipe_template_from_content(
@@ -121,27 +130,19 @@ impl GooseAcpAgent {
                 None,
             )
             .map_err(|e| {
-                agent_client_protocol::Error::invalid_params().data(format!("invalid recipe: {e}"))
+                let err_str = e.to_string();
+                let stripped = err_str.strip_prefix("recipe: ").unwrap_or(&err_str);
+                agent_client_protocol::Error::invalid_params()
+                    .data(format!("invalid recipe: {stripped}"))
             })?;
 
-            if let Some(ref response) = recipe.response {
-                crate::agents::final_output_tool::FinalOutputTool::try_new(response.clone())
-                    .map_err(|e| {
-                        agent_client_protocol::Error::invalid_params()
-                            .data(format!("invalid recipe: {e}"))
-                    })?;
-            }
-
-            let session = self
-                .session_manager
-                .get_session(session_id, false)
-                .await
-                .internal_err_ctx("Failed to get session")?;
-            if session.session_type != SessionType::Scheduled {
+            let recipe_to_apply = if session.session_type == SessionType::Scheduled {
+                raw_recipe.clone()
+            } else {
                 let recipe_dir = crate::recipe::local_recipes::get_recipe_library_dir(true);
                 let user_values = session.user_recipe_values.clone().unwrap_or_default();
-                match self.render_recipe(&recipe, &recipe_dir, user_values) {
-                    Ok(Some(_)) => {}
+                match self.render_recipe(&raw_recipe, &recipe_dir, user_values) {
+                    Ok(Some(rendered)) => rendered,
                     Ok(None) => {
                         return Err(agent_client_protocol::Error::invalid_params()
                             .data("invalid recipe: missing required parameters"));
@@ -152,15 +153,25 @@ impl GooseAcpAgent {
                             .as_ref()
                             .and_then(|v| v.as_str())
                             .unwrap_or(&e.message);
+                        let stripped = msg.strip_prefix("recipe: ").unwrap_or(msg);
                         return Err(agent_client_protocol::Error::invalid_params()
-                            .data(format!("invalid recipe: {msg}")));
+                            .data(format!("invalid recipe: {stripped}")));
                     }
                 }
+            };
+
+            // Run the FinalOutputTool dry run on the version to apply
+            if let Some(ref response) = recipe_to_apply.response {
+                crate::agents::final_output_tool::FinalOutputTool::try_new(response.clone())
+                    .map_err(|e| {
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("invalid recipe: {e}"))
+                    })?;
             }
 
-            Some(recipe)
+            (Some(raw_recipe), Some(recipe_to_apply))
         } else {
-            None
+            (None, None)
         };
 
         let agent = self.get_session_agent(session_id).await?;
@@ -182,27 +193,21 @@ impl GooseAcpAgent {
                 .internal_err_ctx("Failed to update provider model config")?;
         }
 
-        if let Some(recipe) = validated_recipe {
+        if let (Some(raw_recipe), Some(recipe_to_apply)) = (raw_recipe_to_persist, recipe_to_apply)
+        {
             // Note: recipe.extensions is ignored by this call; session extensions are unchanged.
-            // Apply in memory first: instructions under "recipe" key and final_output tool from recipe.response.
-            self.apply_recipe(&agent, &recipe).await?;
+            // Apply the rendered recipe in memory first: instructions under "recipe" key and final_output tool from recipe.response.
+            self.apply_recipe(&agent, &recipe_to_apply).await?;
 
-            // Persist to session row.
+            // Persist the raw recipe to session row.
             self.session_manager
                 .update(session_id)
-                .recipe(Some(recipe))
+                .recipe(Some(raw_recipe))
                 .apply()
                 .await
                 .internal_err_ctx("Failed to persist recipe to session")?;
-        } else {
-            let session = self
-                .session_manager
-                .get_session(session_id, false)
-                .await
-                .internal_err_ctx("Failed to get session")?;
-            if session.recipe.is_some() {
-                self.apply_session_recipe(&agent, &session).await?;
-            }
+        } else if session.recipe.is_some() {
+            self.apply_session_recipe(&agent, &session).await?;
         }
 
         Ok(EmptyResponse {})

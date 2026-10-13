@@ -219,6 +219,10 @@ pub struct SetSessionSystemPromptRequest {
 }
 
 /// Pin a session's cache TTL and recipe.
+///
+/// Note: Recipe `settings`, `extensions`, `prompt`, and `parameters` are
+/// ignored by this call (only `instructions` and `response` are applied;
+/// the model stays the session's).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
 #[request(
     method = "_goose/unstable/session/settings/set",

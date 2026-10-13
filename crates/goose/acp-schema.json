@@ -4267,7 +4267,7 @@
       "required": [
         "sessionId"
       ],
-      "description": "Pin a session's cache TTL and recipe.",
+      "description": "Pin a session's cache TTL and recipe.\n\nNote: Recipe `settings`, `extensions`, `prompt`, and `parameters` are\nignored by this call (only `instructions` and `response` are applied;\nthe model stays the session's).",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/settings/set"
     },

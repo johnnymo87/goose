@@ -1370,6 +1370,22 @@ fn test_session_settings_set() {
             "expected data starting with 'invalid cacheTtl: '"
         );
 
+        // Unknown session returns resource_not_found
+        let unknown_session_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": "unknown-nonexistent-session",
+                "recipe": {
+                    "title": "Some Recipe",
+                    "description": "Description"
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown_session_err.code, ErrorCode::ResourceNotFound);
+
         // (i) and (ii) Set settings with cacheTtl 1h and recipe, called twice for idempotency
         let recipe = serde_json::json!({
             "title": "Settings Test Recipe",
@@ -1836,10 +1852,11 @@ fn test_session_settings_idempotent_prompts_byte_identical() {
         .unwrap();
 
         // Prompt 1
-        let _ = session
+        let out1 = session
             .prompt("what is 1+1", PermissionDecision::AllowOnce)
             .await
             .unwrap();
+        assert!(out1.tool_status.is_some());
 
         // Identical settings/set
         send_custom(
@@ -1855,33 +1872,140 @@ fn test_session_settings_idempotent_prompts_byte_identical() {
         .unwrap();
 
         // Prompt 2
-        let _ = session
+        let out2 = session
             .prompt("what is 2+2", PermissionDecision::AllowOnce)
             .await
             .unwrap();
+        assert!(out2.tool_status.is_some());
 
         let reqs = captured.lock().unwrap().clone();
-        assert!(
-            reqs.len() >= 2,
-            "expected at least 2 captured requests, got {}",
-            reqs.len()
-        );
+        assert_eq!(reqs.len(), 2, "expected exactly 2 captured requests");
 
         let req1: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
         let req2: serde_json::Value = serde_json::from_str(&reqs[1]).unwrap();
 
-        let sys1 = &req1["messages"][0]["content"];
-        let sys2 = &req2["messages"][0]["content"];
         assert_eq!(
-            sys1, sys2,
+            req1["messages"][0]["content"].to_string(),
+            req2["messages"][0]["content"].to_string(),
             "system prompt must be byte-identical across identical settings/set"
         );
 
-        let tools1 = &req1["tools"];
-        let tools2 = &req2["tools"];
         assert_eq!(
-            tools1, tools2,
+            req1["tools"].to_string(),
+            req2["tools"].to_string(),
             "tools array must be byte-identical across identical settings/set"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_session_settings_templated_recipe_renders_consistently() {
+    run_test(async move {
+        const FINAL_OUTPUT_RESPONSE: &str = "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_final\",\"type\":\"function\",\"function\":{\"name\":\"recipe__final_output\",\"arguments\":\"{\\\"summary\\\":\\\"done\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(
+            vec![
+                ("what is 1+1".to_string(), FINAL_OUTPUT_RESPONSE),
+                ("what is 2+2".to_string(), FINAL_OUTPUT_RESPONSE),
+            ],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let captured = openai.captured_requests_handle();
+
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // Recipe with defaulted parameter and recipe_dir template variables
+        let recipe = serde_json::json!({
+            "title": "Templated Recipe",
+            "description": "Recipe with template variables",
+            "parameters": [
+                {
+                    "key": "env",
+                    "description": "Environment",
+                    "input_type": "string",
+                    "requirement": "optional",
+                    "default": "production"
+                }
+            ],
+            "instructions": "Target env: {{ env }}. Recipe dir: {{ recipe_dir }}",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["summary"]
+                }
+            }
+        });
+
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let out1 = session
+            .prompt("what is 1+1", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+        assert!(out1.tool_status.is_some());
+
+        // Later settings/set without recipe
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let out2 = session
+            .prompt("what is 2+2", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+        assert!(out2.tool_status.is_some());
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2);
+
+        let req1: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+        let req2: serde_json::Value = serde_json::from_str(&reqs[1]).unwrap();
+
+        let sys1 = req1["messages"][0]["content"].as_str().unwrap();
+        let sys2 = req2["messages"][0]["content"].as_str().unwrap();
+
+        // Template syntax does not reach model literally
+        assert!(!sys1.contains("{{ env }}"));
+        assert!(!sys1.contains("{{ recipe_dir }}"));
+        assert!(sys1.contains("Target env: production"));
+
+        // System prompt is byte-identical across the settings/set without recipe
+        assert_eq!(
+            sys1, sys2,
+            "rendered recipe must match on subsequent settings/set without recipe"
         );
     });
 }
