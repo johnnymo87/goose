@@ -61,11 +61,6 @@
       "responseType": "EmptyResponse"
     },
     {
-      "method": "_goose/unstable/session/settings/set",
-      "requestType": "SetSessionSettingsRequest_unstable",
-      "responseType": "EmptyResponse"
-    },
-    {
       "method": "_goose/unstable/session/steer",
       "requestType": "SteerSessionRequest_unstable",
       "responseType": "SteerSessionResponse_unstable"
@@ -299,6 +294,11 @@
       "method": "_goose/unstable/recipes/encode",
       "requestType": "EncodeRecipeRequest_unstable",
       "responseType": "EncodeRecipeResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/session/settings/set",
+      "requestType": "SetSessionSettingsRequest_unstable",
+      "responseType": "EmptyResponse"
     },
     {
       "method": "_goose/unstable/recipes/decode",

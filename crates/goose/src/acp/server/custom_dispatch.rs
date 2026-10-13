@@ -127,14 +127,6 @@ impl GooseAcpAgent {
         self.on_set_session_system_prompt(req).await
     }
 
-    #[custom_method(SetSessionSettingsRequest)]
-    async fn dispatch_set_session_settings(
-        &self,
-        req: SetSessionSettingsRequest,
-    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
-        self.on_set_session_settings(req).await
-    }
-
     #[custom_method(SteerSessionRequest)]
     async fn dispatch_steer_session(
         &self,
@@ -509,6 +501,14 @@ impl GooseAcpAgent {
         req: EncodeRecipeRequest,
     ) -> Result<EncodeRecipeResponse, agent_client_protocol::Error> {
         self.on_encode_recipe(req).await
+    }
+
+    #[custom_method(SetSessionSettingsRequest)]
+    async fn dispatch_set_session_settings(
+        &self,
+        req: SetSessionSettingsRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        self.on_set_session_settings(req).await
     }
 
     #[custom_method(DecodeRecipeRequest)]

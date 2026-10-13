@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing.
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1071,6 +1072,12 @@ impl Agent {
         Ok(())
     }
 
+    pub async fn clear_final_output_tool(&self) {
+        let mut final_output_tool = self.final_output_tool.lock().await;
+        *final_output_tool = None;
+        self.remove_system_prompt_extra("final_output").await;
+    }
+
     pub async fn apply_recipe_components(
         &self,
         response: Option<Response>,
@@ -1079,6 +1086,8 @@ impl Agent {
         if include_final_output {
             if let Some(response) = response {
                 self.add_final_output_tool(response).await?;
+            } else {
+                self.clear_final_output_tool().await;
             }
         }
         Ok(())

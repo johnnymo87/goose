@@ -138,6 +138,15 @@ impl GooseAcpAgent {
 
             // Re-apply in memory: instructions under "recipe" key and final_output tool from recipe.response.
             self.apply_recipe(&agent, &recipe).await?;
+        } else {
+            let session = self
+                .session_manager
+                .get_session(session_id, false)
+                .await
+                .internal_err_ctx("Failed to get session")?;
+            if session.recipe.is_some() {
+                self.apply_session_recipe(&agent, &session).await?;
+            }
         }
 
         Ok(EmptyResponse {})
