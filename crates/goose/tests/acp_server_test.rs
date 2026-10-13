@@ -14,10 +14,9 @@ use common_tests::fixtures::server::{
     assert_session_response_precedes_available_commands, AcpServerConnection,
 };
 use common_tests::fixtures::{
-    run_test, send_custom, spawn_acp_server_in_process, Connection, OpenAiFixture, PermissionDecision, Session,
-    SessionData, TestConnectionConfig,
+    run_test, send_custom, spawn_acp_server_in_process, Connection, OpenAiFixture,
+    PermissionDecision, Session, SessionData, TestConnectionConfig,
 };
-use serial_test::serial;
 #[cfg(feature = "code-mode")]
 use common_tests::run_prompt_codemode;
 use common_tests::{
@@ -42,6 +41,7 @@ use goose::recipe::{Recipe, Settings};
 use goose::recipe_deeplink;
 use goose::session::{SessionManager, SessionType};
 use goose_test_support::{IgnoreSessionId, McpFixture, FAKE_CODE};
+use serial_test::serial;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1395,16 +1395,27 @@ fn test_session_settings_set() {
         let session_manager = SessionManager::new(temp_data.path().to_path_buf());
 
         // Verify session.recipe is persisted
-        let stored_recipe = session_manager.get_session(&session_id, false).await.unwrap();
+        let stored_recipe = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
         assert!(stored_recipe.recipe.is_some());
         assert_eq!(
-            stored_recipe.recipe.as_ref().unwrap().instructions.as_deref(),
+            stored_recipe
+                .recipe
+                .as_ref()
+                .unwrap()
+                .instructions
+                .as_deref(),
             Some("Special test recipe instructions")
         );
 
         // Verify session.model_config has cache_ttl 1h
         assert_eq!(
-            stored_recipe.model_config.as_ref().and_then(|mc| mc.cache_ttl()),
+            stored_recipe
+                .model_config
+                .as_ref()
+                .and_then(|mc| mc.cache_ttl()),
             Some("1h".to_string())
         );
 
@@ -1416,29 +1427,28 @@ fn test_session_settings_set() {
         )
         .await
         .unwrap();
-        let tools = tools_res.get("tools").and_then(|t| t.as_array()).expect("tools array");
+        let tools = tools_res
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
         let final_output_count = tools
             .iter()
             .filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("recipe__final_output"))
             .count();
-        assert_eq!(final_output_count, 1, "final_output tool should exist exactly once");
+        assert_eq!(
+            final_output_count, 1,
+            "final_output tool should exist exactly once"
+        );
 
         // Verify system prompt contains the new instructions by running prompt
         let prompt_output = session
-            .prompt(
-                "Hello with recipe",
-                PermissionDecision::AllowOnce,
-            )
+            .prompt("Hello with recipe", PermissionDecision::AllowOnce)
             .await
             .unwrap();
         assert!(prompt_output.tool_status.is_some());
 
         // Survives fresh session/load on a new connection
-        let openai2 = OpenAiFixture::new(
-            vec![],
-            Arc::new(IgnoreSessionId),
-        )
-        .await;
+        let openai2 = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
         let mut conn2 = AcpServerConnection::new(
             TestConnectionConfig {
                 data_root: temp_data.path().to_path_buf(),
@@ -1449,9 +1459,15 @@ fn test_session_settings_set() {
         .await;
         let _loaded = conn2.load_session(&session_id, vec![]).await.unwrap();
 
-        let stored_after_load = session_manager.get_session(&session_id, false).await.unwrap();
+        let stored_after_load = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
         assert_eq!(
-            stored_after_load.model_config.as_ref().and_then(|mc| mc.cache_ttl()),
+            stored_after_load
+                .model_config
+                .as_ref()
+                .and_then(|mc| mc.cache_ttl()),
             Some("1h".to_string())
         );
     });
@@ -1468,17 +1484,16 @@ fn test_prompt_max_turns_bounds_run() {
         let openai = OpenAiFixture::new(
             vec![
                 ("what is 1+1".to_string(), chunk1),
-                ("You MUST call the `final_output` tool NOW".to_string(), chunk2),
+                (
+                    "You MUST call the `final_output` tool NOW".to_string(),
+                    chunk2,
+                ),
             ],
             Arc::new(IgnoreSessionId),
         )
         .await;
 
-        let mut conn = AcpServerConnection::new(
-            TestConnectionConfig::default(),
-            openai,
-        )
-        .await;
+        let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
 
         let SessionData { session, .. } = conn.new_session().await.unwrap();
         let session_id = session.session_id().0.clone();
@@ -1543,7 +1558,10 @@ fn test_prompt_max_turns_bounds_run() {
         )
         .await
         .unwrap();
-        assert_eq!(prompt_res.get("stopReason").and_then(|s| s.as_str()), Some("end_turn"));
+        assert_eq!(
+            prompt_res.get("stopReason").and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
 
         // Check the emitted text contains max turns message
         let updates = session.session_updates();

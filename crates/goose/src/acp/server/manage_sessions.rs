@@ -123,8 +123,9 @@ impl GooseAcpAgent {
         }
 
         if let Some(recipe_dto) = req.recipe {
-            let recipe = crate::recipe::Recipe::try_from(recipe_dto)
-                .map_err(|e| agent_client_protocol::Error::invalid_params().data(format!("recipe: {e}")))?;
+            let recipe = crate::recipe::Recipe::try_from(recipe_dto).map_err(|e| {
+                agent_client_protocol::Error::invalid_params().data(format!("recipe: {e}"))
+            })?;
 
             // Persist the recipe to the session row.
             // Note: recipe.extensions is ignored by this call; session extensions are unchanged.

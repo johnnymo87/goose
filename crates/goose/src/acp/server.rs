@@ -3686,7 +3686,10 @@ print(\"hello, world\")
             "goose": { "maxTurns": null }
         }))
         .unwrap();
-        assert_eq!(max_turns_from_meta(Some(&meta_null_max_turns)).unwrap(), None);
+        assert_eq!(
+            max_turns_from_meta(Some(&meta_null_max_turns)).unwrap(),
+            None
+        );
 
         let meta_valid: Meta = serde_json::from_value(serde_json::json!({
             "goose": { "maxTurns": 4 }
