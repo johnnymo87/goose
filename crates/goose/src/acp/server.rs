@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: session/prompt _meta.goose.maxTurns bounds the run.
 use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 use crate::acp::fs::AcpTools;
@@ -424,6 +425,29 @@ fn use_state_machine_from_meta(meta: Option<&Meta>) -> bool {
         .and_then(|goose| goose.get("unrolledAgentLoop"))
         .and_then(|value| value.as_bool())
         .unwrap_or_else(crate::agents::state_machine::enabled)
+}
+
+/// Resolve the max turns for a prompt run from request metadata.
+/// Accepts an optional positive integer under `_meta.goose.maxTurns`.
+/// Returns `Ok(None)` if absent or null.
+/// Returns `Err(invalid_params)` if present but invalid (0, negative, non-integer).
+fn max_turns_from_meta(meta: Option<&Meta>) -> Result<Option<u32>, agent_client_protocol::Error> {
+    let Some(goose) = meta.and_then(|meta| meta.get("goose")) else {
+        return Ok(None);
+    };
+    let Some(value) = goose.get("maxTurns") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(n) = value.as_u64() {
+        if n > 0 && n <= u32::MAX as u64 {
+            return Ok(Some(n as u32));
+        }
+    }
+    Err(agent_client_protocol::Error::invalid_params()
+        .data("_meta.goose.maxTurns must be a positive integer"))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2273,6 +2297,8 @@ impl GooseAcpAgent {
         cx: &ConnectionTo<Client>,
         args: PromptRequest,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
+        let max_turns = max_turns_from_meta(args.meta.as_ref())?;
+
         // The ACP session_id IS the thread ID.
         let session_id = args.session_id.0.to_string();
 
@@ -2326,7 +2352,7 @@ impl GooseAcpAgent {
         let session_config = SessionConfig {
             id: session_id.clone(),
             schedule_id: None,
-            max_turns: None,
+            max_turns,
             retry_config: None,
         };
 
@@ -3641,6 +3667,68 @@ print(\"hello, world\")
         assert!(!extract_client_supports_goose_custom_notifications(
             goose_client_capabilities.as_ref()
         ));
+    }
+
+    #[test]
+    fn test_max_turns_from_meta() {
+        assert_eq!(max_turns_from_meta(None).unwrap(), None);
+
+        let meta_no_goose: Meta = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(max_turns_from_meta(Some(&meta_no_goose)).unwrap(), None);
+
+        let meta_no_max_turns: Meta = serde_json::from_value(serde_json::json!({
+            "goose": {}
+        }))
+        .unwrap();
+        assert_eq!(max_turns_from_meta(Some(&meta_no_max_turns)).unwrap(), None);
+
+        let meta_null_max_turns: Meta = serde_json::from_value(serde_json::json!({
+            "goose": { "maxTurns": null }
+        }))
+        .unwrap();
+        assert_eq!(max_turns_from_meta(Some(&meta_null_max_turns)).unwrap(), None);
+
+        let meta_valid: Meta = serde_json::from_value(serde_json::json!({
+            "goose": { "maxTurns": 4 }
+        }))
+        .unwrap();
+        assert_eq!(max_turns_from_meta(Some(&meta_valid)).unwrap(), Some(4));
+
+        let meta_zero: Meta = serde_json::from_value(serde_json::json!({
+            "goose": { "maxTurns": 0 }
+        }))
+        .unwrap();
+        assert_eq!(
+            max_turns_from_meta(Some(&meta_zero)).unwrap_err().code,
+            agent_client_protocol::ErrorCode::InvalidParams
+        );
+
+        let meta_neg: Meta = serde_json::from_value(serde_json::json!({
+            "goose": { "maxTurns": -1 }
+        }))
+        .unwrap();
+        assert_eq!(
+            max_turns_from_meta(Some(&meta_neg)).unwrap_err().code,
+            agent_client_protocol::ErrorCode::InvalidParams
+        );
+
+        let meta_float: Meta = serde_json::from_value(serde_json::json!({
+            "goose": { "maxTurns": 2.5 }
+        }))
+        .unwrap();
+        assert_eq!(
+            max_turns_from_meta(Some(&meta_float)).unwrap_err().code,
+            agent_client_protocol::ErrorCode::InvalidParams
+        );
+
+        let meta_str: Meta = serde_json::from_value(serde_json::json!({
+            "goose": { "maxTurns": "two" }
+        }))
+        .unwrap();
+        assert_eq!(
+            max_turns_from_meta(Some(&meta_str)).unwrap_err().code,
+            agent_client_protocol::ErrorCode::InvalidParams
+        );
     }
 
     #[test]

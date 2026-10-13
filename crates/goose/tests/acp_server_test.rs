@@ -1456,3 +1456,111 @@ fn test_session_settings_set() {
         );
     });
 }
+
+#[test]
+#[serial]
+fn test_prompt_max_turns_bounds_run() {
+    run_test(async move {
+        // Mock provider responses: two turns of assistant text without calling final_output
+        let chunk1 = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Turn 1 working\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let chunk2 = "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1766229304,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Turn 2 working\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1766229304,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+        let openai = OpenAiFixture::new(
+            vec![
+                ("what is 1+1".to_string(), chunk1),
+                ("You MUST call the `final_output` tool NOW".to_string(), chunk2),
+            ],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig::default(),
+            openai,
+        )
+        .await;
+
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // Pin a recipe requiring final_output
+        let recipe = serde_json::json!({
+            "title": "Recipe With Output",
+            "description": "Recipe requiring final output",
+            "instructions": "Always produce structured final output",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "ans": { "type": "string" }
+                    },
+                    "required": ["ans"]
+                }
+            }
+        });
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // 1. Invalid maxTurns -> invalid params
+        let invalid_prompt_err = send_custom(
+            conn.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "what is 1+1" }],
+                "_meta": {
+                    "goose": {
+                        "maxTurns": 0
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid_prompt_err.code, ErrorCode::InvalidParams);
+
+        // 2. Valid maxTurns: 2 bounds the run and emits MAX_TURNS_MESSAGE
+        let prompt_res = send_custom(
+            conn.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "what is 1+1" }],
+                "_meta": {
+                    "goose": {
+                        "maxTurns": 2
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(prompt_res.get("stopReason").and_then(|s| s.as_str()), Some("end_turn"));
+
+        // Check the emitted text contains max turns message
+        let updates = session.session_updates();
+        let agent_texts: Vec<String> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let combined_text = agent_texts.join("");
+        assert!(
+            combined_text.contains("maximum number of actions"),
+            "expected max turns message in updates, got: {combined_text}"
+        );
+    });
+}
