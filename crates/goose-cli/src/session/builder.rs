@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: GOOSE_HEADLESS_CACHE_TTL (5m|1h) opts a headless run out of the 5m cache TTL clamp.
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_HEADLESS_CACHE_TTL (5m|1h) opts a headless run out of the 5m cache TTL clamp; interactive session restore preserves saved cache TTL when GOOSE_CACHE_TTL is unset.
 use crate::cli::StreamableHttpOptions;
 
 use super::output;
@@ -1487,7 +1487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_drops_saved_cache_ttl_when_config_absent() {
+    async fn resume_keeps_saved_cache_ttl_when_config_absent() {
         let _guard = env_lock::lock_env([
             ("GOOSE_PROVIDER", None::<&str>),
             ("GOOSE_MODEL", None::<&str>),
@@ -1510,7 +1510,7 @@ mod tests {
         )
         .await;
 
-        assert!(resolved.model_config.cache_ttl().is_none());
+        assert_eq!(resolved.model_config.cache_ttl().as_deref(), Some("1h"));
     }
 
     #[tokio::test]
