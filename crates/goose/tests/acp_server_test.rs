@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method.
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -1459,6 +1459,27 @@ fn test_session_settings_set() {
         .await;
         let _loaded = conn2.load_session(&session_id, vec![]).await.unwrap();
 
+        // Verify final_output tool exists on fresh connection after session/load
+        let tools_res2 = send_custom(
+            conn2.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools2 = tools_res2
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
+        let final_output_count2 = tools2
+            .iter()
+            .filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("recipe__final_output"))
+            .count();
+        assert_eq!(
+            final_output_count2, 1,
+            "final_output tool should exist exactly once on fresh connection after load"
+        );
+
         let stored_after_load = session_manager
             .get_session(&session_id, false)
             .await
@@ -1469,6 +1490,101 @@ fn test_session_settings_set() {
                 .as_ref()
                 .and_then(|mc| mc.cache_ttl()),
             Some("1h".to_string())
+        );
+
+        // Third fresh connection: send settings/set directly to COLD session (no session/load first)
+        let openai3 = OpenAiFixture::new(
+            vec![(
+                "Special test recipe instructions".to_string(),
+                FINAL_OUTPUT_RESPONSE,
+            )],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let conn3 = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai3,
+        )
+        .await;
+
+        let set_res3 = send_custom(
+            conn3.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(set_res3, serde_json::json!({}));
+
+        let stored_cold = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_cold
+                .model_config
+                .as_ref()
+                .and_then(|mc| mc.cache_ttl()),
+            Some("1h".to_string())
+        );
+
+        // Prompt on the cold-activated session: assert recipe instructions are in force
+        let prompt_res3 = send_custom(
+            conn3.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "Testing cold prompt" }],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prompt_res3.get("stopReason").and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
+
+        // Setting a recipe without response clears previously registered final_output tool
+        let recipe_no_response = serde_json::json!({
+            "title": "Recipe Without Response",
+            "description": "Recipe with no output schema",
+            "instructions": "Simple instructions without final output",
+        });
+        send_custom(
+            conn3.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": recipe_no_response,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let tools_cleared = send_custom(
+            conn3.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools_arr = tools_cleared
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
+        let final_output_count3 = tools_arr
+            .iter()
+            .filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("recipe__final_output"))
+            .count();
+        assert_eq!(
+            final_output_count3, 0,
+            "final_output tool should be cleared when recipe has no response"
         );
     });
 }
