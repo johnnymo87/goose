@@ -1063,6 +1063,11 @@ impl Agent {
 
     pub async fn add_final_output_tool(&self, response: Response) -> Result<()> {
         let mut final_output_tool = self.final_output_tool.lock().await;
+        if let Some(existing) = final_output_tool.as_ref() {
+            if existing.response.json_schema == response.json_schema {
+                return Ok(());
+            }
+        }
         let created_final_output_tool =
             FinalOutputTool::try_new(response).map_err(anyhow::Error::msg)?;
         let final_output_system_prompt = created_final_output_tool.system_prompt();
@@ -6205,6 +6210,45 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         let final_output_tool_system_prompt =
             final_output_tool_ref.as_ref().unwrap().system_prompt();
         assert!(system_prompt.contains(&final_output_tool_system_prompt));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_final_output_tool_does_not_reset_collected_output_when_schema_equal(
+    ) -> Result<()> {
+        let agent = Agent::new();
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "result": {"type": "string"}
+            }
+        });
+        let response = Response {
+            json_schema: Some(schema.clone()),
+        };
+
+        agent.add_final_output_tool(response).await?;
+
+        // Simulate collecting output
+        {
+            let mut guard = agent.final_output_tool.lock().await;
+            guard.as_mut().unwrap().final_output = Some("already collected".to_string());
+        }
+
+        // Add with an equal schema
+        agent
+            .add_final_output_tool(Response {
+                json_schema: Some(schema),
+            })
+            .await?;
+
+        let guard = agent.final_output_tool.lock().await;
+        assert_eq!(
+            guard.as_ref().unwrap().final_output.as_deref(),
+            Some("already collected"),
+            "existing collected final output must be preserved when schema is equal"
+        );
         Ok(())
     }
 

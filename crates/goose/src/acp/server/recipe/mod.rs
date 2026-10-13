@@ -290,7 +290,7 @@ impl GooseAcpAgent {
         Ok(RecipeToYamlResponse { yaml })
     }
 
-    fn render_recipe(
+    pub(super) fn render_recipe(
         &self,
         recipe: &Recipe,
         recipe_dir: &Path,

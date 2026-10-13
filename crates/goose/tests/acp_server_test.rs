@@ -1360,6 +1360,15 @@ fn test_session_settings_set() {
         .await
         .unwrap_err();
         assert_eq!(invalid_err.code, ErrorCode::InvalidParams);
+        assert!(
+            invalid_err
+                .data
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("invalid cacheTtl: "),
+            "expected data starting with 'invalid cacheTtl: '"
+        );
 
         // (i) and (ii) Set settings with cacheTtl 1h and recipe, called twice for idempotency
         let recipe = serde_json::json!({
@@ -1394,7 +1403,60 @@ fn test_session_settings_set() {
 
         let session_manager = SessionManager::new(temp_data.path().to_path_buf());
 
-        // Verify session.recipe is persisted
+        // Verify invalid recipes are rejected and do not mutate the row or break loading
+        let bad_schema_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": {
+                    "title": "Bad Schema Recipe",
+                    "description": "Empty schema",
+                    "response": {
+                        "json_schema": {}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bad_schema_err.code, ErrorCode::InvalidParams);
+        assert!(
+            bad_schema_err
+                .data
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("invalid recipe: "),
+            "expected data starting with 'invalid recipe: '"
+        );
+
+        let bad_template_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": {
+                    "title": "Bad Template Recipe",
+                    "description": "Unclosed jinja",
+                    "instructions": "Unclosed {% bad tag"
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bad_template_err.code, ErrorCode::InvalidParams);
+        assert!(
+            bad_template_err
+                .data
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("invalid recipe: "),
+            "expected data starting with 'invalid recipe: '"
+        );
+
+        // Verify session.recipe is persisted and unchanged by rejected recipes
         let stored_recipe = session_manager
             .get_session(&session_id, false)
             .await
@@ -1550,6 +1612,23 @@ fn test_session_settings_set() {
             Some("end_turn")
         );
 
+        let updates3 = session.session_updates();
+        let prompt_text = updates3
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            !prompt_text.contains("Ran into this error"),
+            "prompt should not encounter error: {prompt_text}"
+        );
+
         // Setting a recipe without response clears previously registered final_output tool
         let recipe_no_response = serde_json::json!({
             "title": "Recipe Without Response",
@@ -1695,6 +1774,114 @@ fn test_prompt_max_turns_bounds_run() {
         assert!(
             combined_text.contains("maximum number of actions"),
             "expected max turns message in updates, got: {combined_text}"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_session_settings_idempotent_prompts_byte_identical() {
+    run_test(async move {
+        const FINAL_OUTPUT_RESPONSE: &str = "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_final\",\"type\":\"function\",\"function\":{\"name\":\"recipe__final_output\",\"arguments\":\"{\\\"value\\\":\\\"done\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(
+            vec![
+                ("what is 1+1".to_string(), FINAL_OUTPUT_RESPONSE),
+                ("what is 2+2".to_string(), FINAL_OUTPUT_RESPONSE),
+            ],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let captured = openai.captured_requests_handle();
+
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        let recipe = serde_json::json!({
+            "title": "Cost Critical Recipe",
+            "description": "Recipe testing byte-identical prompts",
+            "instructions": "Deterministic prompt caching instructions",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "value": { "type": "string" }
+                    },
+                    "required": ["value"]
+                }
+            }
+        });
+
+        // First settings/set
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Prompt 1
+        let _ = session
+            .prompt("what is 1+1", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+
+        // Identical settings/set
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Prompt 2
+        let _ = session
+            .prompt("what is 2+2", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+
+        let reqs = captured.lock().unwrap().clone();
+        assert!(
+            reqs.len() >= 2,
+            "expected at least 2 captured requests, got {}",
+            reqs.len()
+        );
+
+        let req1: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+        let req2: serde_json::Value = serde_json::from_str(&reqs[1]).unwrap();
+
+        let sys1 = &req1["messages"][0]["content"];
+        let sys2 = &req2["messages"][0]["content"];
+        assert_eq!(
+            sys1, sys2,
+            "system prompt must be byte-identical across identical settings/set"
+        );
+
+        let tools1 = &req1["tools"];
+        let tools2 = &req2["tools"];
+        assert_eq!(
+            tools1, tools2,
+            "tools array must be byte-identical across identical settings/set"
         );
     });
 }

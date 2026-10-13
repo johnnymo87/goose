@@ -148,6 +148,11 @@ fn base_model_config_from_user_config(
 /// `GOOSE_CACHE_TTL` setting is present, it overrides any stored cache TTL.
 /// If unset, the stored TTL on the model config is preserved so that per-session
 /// opt-ins survive session restoration.
+///
+/// Note: Because a stored TTL persists across restores when `GOOSE_CACHE_TTL` is
+/// unset, a TTL written by a past global opt-in sticks to sessions that were
+/// materialized while it was set. Set `GOOSE_CACHE_TTL` explicitly (e.g. to "5m")
+/// to override past persisted settings.
 pub fn with_rederived_cache_ttl(mut model: ModelConfig) -> Result<ModelConfig> {
     if let Some(ttl) = get_goose_cache_ttl(Config::global())? {
         model = model.with_cache_ttl(&ttl);
