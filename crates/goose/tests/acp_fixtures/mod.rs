@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: OpenAiFixture captures request bodies for prompt caching assertions.
 #![recursion_limit = "256"]
 #![allow(unused_attributes)]
 
@@ -213,6 +214,7 @@ pub struct OpenAiFixture {
     base_url: String,
     exchanges: Vec<(String, &'static str)>,
     queue: Arc<Mutex<VecDeque<(String, &'static str)>>>,
+    captured: Arc<Mutex<Vec<String>>>,
 }
 
 impl OpenAiFixture {
@@ -224,6 +226,7 @@ impl OpenAiFixture {
     ) -> Self {
         let mock_server = MockServer::start().await;
         let queue = Arc::new(Mutex::new(VecDeque::from(exchanges.clone())));
+        let captured = Arc::new(Mutex::new(Vec::new()));
 
         // Always return the models when asked, as there is no POST data to validate
         Mock::given(method("GET"))
@@ -241,8 +244,10 @@ impl OpenAiFixture {
             .respond_with({
                 let queue = queue.clone();
                 let expected_session_id = expected_session_id.clone();
+                let captured = captured.clone();
                 move |req: &wiremock::Request| {
                     let body = std::str::from_utf8(&req.body).unwrap_or("");
+                    captured.lock().unwrap().push(body.to_string());
 
                     // Validate session ID header
                     let actual = req
@@ -290,7 +295,16 @@ impl OpenAiFixture {
             base_url,
             exchanges,
             queue,
+            captured,
         }
+    }
+
+    pub fn captured_requests_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.captured)
+    }
+
+    pub fn captured_requests(&self) -> Vec<String> {
+        self.captured.lock().unwrap().clone()
     }
 
     pub fn uri(&self) -> &str {

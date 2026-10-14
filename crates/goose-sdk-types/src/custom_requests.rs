@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: SetSessionSettingsRequest custom request for session settings pinning.
 use agent_client_protocol::schema::v1::{
     AvailableCommand, ContentBlock, McpServer, Meta, SessionInfo,
 };
@@ -215,6 +216,25 @@ pub struct SetSessionSystemPromptRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub text: String,
+}
+
+/// Pin a session's cache TTL and recipe.
+///
+/// Note: Recipe `settings`, `extensions`, `prompt`, and `parameters` are
+/// ignored by this call (only `instructions` and `response` are applied;
+/// the model stays the session's).
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(
+    method = "_goose/unstable/session/settings/set",
+    response = EmptyResponse
+)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionSettingsRequest {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<RecipeDto>,
 }
 
 /// Add user input to the currently active prompt without starting a new prompt.

@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -13,8 +14,8 @@ use common_tests::fixtures::server::{
     assert_session_response_precedes_available_commands, AcpServerConnection,
 };
 use common_tests::fixtures::{
-    run_test, spawn_acp_server_in_process, Connection, OpenAiFixture, PermissionDecision, Session,
-    SessionData, TestConnectionConfig,
+    run_test, send_custom, spawn_acp_server_in_process, Connection, OpenAiFixture,
+    PermissionDecision, Session, SessionData, TestConnectionConfig,
 };
 #[cfg(feature = "code-mode")]
 use common_tests::run_prompt_codemode;
@@ -39,8 +40,10 @@ use goose::custom_requests::{
 use goose::recipe::{Recipe, Settings};
 use goose::recipe_deeplink;
 use goose::session::{SessionManager, SessionType};
-use goose_test_support::{McpFixture, FAKE_CODE};
+use goose_test_support::{IgnoreSessionId, McpFixture, FAKE_CODE};
+use serial_test::serial;
 use std::path::Path;
+use std::sync::Arc;
 
 tests_config_option_set_error!(AcpServerConnection);
 tests_mode_set_error!(AcpServerConnection);
@@ -1316,4 +1319,693 @@ fn test_shell_terminal_false() {
 #[test]
 fn test_shell_terminal_true() {
     run_test(async { run_shell_terminal_true::<AcpServerConnection>().await });
+}
+
+#[test]
+#[serial]
+fn test_session_settings_set() {
+    run_test(async move {
+        const FINAL_OUTPUT_RESPONSE: &str = "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_final\",\"type\":\"function\",\"function\":{\"name\":\"recipe__final_output\",\"arguments\":\"{\\\"summary\\\":\\\"done\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(
+            vec![(
+                "Special test recipe instructions".to_string(),
+                FINAL_OUTPUT_RESPONSE,
+            )],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // (iii) invalid cacheTtl -> invalid params
+        let invalid_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "2h",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid_err.code, ErrorCode::InvalidParams);
+        assert!(
+            invalid_err
+                .data
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("invalid cacheTtl: "),
+            "expected data starting with 'invalid cacheTtl: '"
+        );
+
+        // Unknown session returns resource_not_found
+        let unknown_session_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": "unknown-nonexistent-session",
+                "recipe": {
+                    "title": "Some Recipe",
+                    "description": "Description"
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown_session_err.code, ErrorCode::ResourceNotFound);
+
+        // (i) and (ii) Set settings with cacheTtl 1h and recipe, called twice for idempotency
+        let recipe = serde_json::json!({
+            "title": "Settings Test Recipe",
+            "description": "Test recipe description",
+            "instructions": "Special test recipe instructions",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["summary"]
+                }
+            }
+        });
+
+        for _ in 0..2 {
+            let res = send_custom(
+                conn.cx(),
+                "_goose/unstable/session/settings/set",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "cacheTtl": "1h",
+                    "recipe": recipe,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(res, serde_json::json!({}));
+        }
+
+        let session_manager = SessionManager::new(temp_data.path().to_path_buf());
+
+        // Verify invalid recipes are rejected and do not mutate the row or break loading
+        let bad_schema_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": {
+                    "title": "Bad Schema Recipe",
+                    "description": "Empty schema",
+                    "response": {
+                        "json_schema": {}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bad_schema_err.code, ErrorCode::InvalidParams);
+        assert!(
+            bad_schema_err
+                .data
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("invalid recipe: "),
+            "expected data starting with 'invalid recipe: '"
+        );
+
+        let bad_template_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": {
+                    "title": "Bad Template Recipe",
+                    "description": "Unclosed jinja",
+                    "instructions": "Unclosed {% bad tag"
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bad_template_err.code, ErrorCode::InvalidParams);
+        assert!(
+            bad_template_err
+                .data
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("invalid recipe: "),
+            "expected data starting with 'invalid recipe: '"
+        );
+
+        // Verify session.recipe is persisted and unchanged by rejected recipes
+        let stored_recipe = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert!(stored_recipe.recipe.is_some());
+        assert_eq!(
+            stored_recipe
+                .recipe
+                .as_ref()
+                .unwrap()
+                .instructions
+                .as_deref(),
+            Some("Special test recipe instructions")
+        );
+
+        // Verify session.model_config has cache_ttl 1h
+        assert_eq!(
+            stored_recipe
+                .model_config
+                .as_ref()
+                .and_then(|mc| mc.cache_ttl()),
+            Some("1h".to_string())
+        );
+
+        // Verify final_output tool exists exactly once
+        let tools_res = send_custom(
+            conn.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools = tools_res
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
+        let final_output_count = tools
+            .iter()
+            .filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("recipe__final_output"))
+            .count();
+        assert_eq!(
+            final_output_count, 1,
+            "final_output tool should exist exactly once"
+        );
+
+        // Verify system prompt contains the new instructions by running prompt
+        let prompt_output = session
+            .prompt("Hello with recipe", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+        assert!(prompt_output.tool_status.is_some());
+
+        // Survives fresh session/load on a new connection
+        let openai2 = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+        let mut conn2 = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai2,
+        )
+        .await;
+        let _loaded = conn2.load_session(&session_id, vec![]).await.unwrap();
+
+        // Verify final_output tool exists on fresh connection after session/load
+        let tools_res2 = send_custom(
+            conn2.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools2 = tools_res2
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
+        let final_output_count2 = tools2
+            .iter()
+            .filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("recipe__final_output"))
+            .count();
+        assert_eq!(
+            final_output_count2, 1,
+            "final_output tool should exist exactly once on fresh connection after load"
+        );
+
+        let stored_after_load = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_after_load
+                .model_config
+                .as_ref()
+                .and_then(|mc| mc.cache_ttl()),
+            Some("1h".to_string())
+        );
+
+        // Third fresh connection: send settings/set directly to COLD session (no session/load first)
+        let openai3 = OpenAiFixture::new(
+            vec![(
+                "Special test recipe instructions".to_string(),
+                FINAL_OUTPUT_RESPONSE,
+            )],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let conn3 = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai3,
+        )
+        .await;
+
+        let set_res3 = send_custom(
+            conn3.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(set_res3, serde_json::json!({}));
+
+        let stored_cold = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_cold
+                .model_config
+                .as_ref()
+                .and_then(|mc| mc.cache_ttl()),
+            Some("1h".to_string())
+        );
+
+        // Prompt on the cold-activated session: assert recipe instructions are in force
+        let prompt_res3 = send_custom(
+            conn3.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "Testing cold prompt" }],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prompt_res3.get("stopReason").and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
+
+        let updates3 = session.session_updates();
+        let prompt_text = updates3
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            !prompt_text.contains("Ran into this error"),
+            "prompt should not encounter error: {prompt_text}"
+        );
+
+        // Setting a recipe without response clears previously registered final_output tool
+        let recipe_no_response = serde_json::json!({
+            "title": "Recipe Without Response",
+            "description": "Recipe with no output schema",
+            "instructions": "Simple instructions without final output",
+        });
+        send_custom(
+            conn3.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": recipe_no_response,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let tools_cleared = send_custom(
+            conn3.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools_arr = tools_cleared
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
+        let final_output_count3 = tools_arr
+            .iter()
+            .filter(|t| t.get("name").and_then(|n| n.as_str()) == Some("recipe__final_output"))
+            .count();
+        assert_eq!(
+            final_output_count3, 0,
+            "final_output tool should be cleared when recipe has no response"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_prompt_max_turns_bounds_run() {
+    run_test(async move {
+        // Mock provider responses: two turns of assistant text without calling final_output
+        let chunk1 = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Turn 1 working\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let chunk2 = "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1766229304,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Turn 2 working\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1766229304,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+        let openai = OpenAiFixture::new(
+            vec![
+                ("what is 1+1".to_string(), chunk1),
+                (
+                    "You MUST call the `final_output` tool NOW".to_string(),
+                    chunk2,
+                ),
+            ],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+
+        let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // Pin a recipe requiring final_output
+        let recipe = serde_json::json!({
+            "title": "Recipe With Output",
+            "description": "Recipe requiring final output",
+            "instructions": "Always produce structured final output",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "ans": { "type": "string" }
+                    },
+                    "required": ["ans"]
+                }
+            }
+        });
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // 1. Invalid maxTurns -> invalid params
+        let invalid_prompt_err = send_custom(
+            conn.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "what is 1+1" }],
+                "_meta": {
+                    "goose": {
+                        "maxTurns": 0
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid_prompt_err.code, ErrorCode::InvalidParams);
+
+        // 2. Valid maxTurns: 2 bounds the run and emits MAX_TURNS_MESSAGE
+        let prompt_res = send_custom(
+            conn.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "what is 1+1" }],
+                "_meta": {
+                    "goose": {
+                        "maxTurns": 2
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prompt_res.get("stopReason").and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
+
+        // Check the emitted text contains max turns message
+        let updates = session.session_updates();
+        let agent_texts: Vec<String> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let combined_text = agent_texts.join("");
+        assert!(
+            combined_text.contains("maximum number of actions"),
+            "expected max turns message in updates, got: {combined_text}"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_session_settings_idempotent_prompts_byte_identical() {
+    run_test(async move {
+        const FINAL_OUTPUT_RESPONSE: &str = "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_final\",\"type\":\"function\",\"function\":{\"name\":\"recipe__final_output\",\"arguments\":\"{\\\"value\\\":\\\"done\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(
+            vec![
+                ("what is 1+1".to_string(), FINAL_OUTPUT_RESPONSE),
+                ("what is 2+2".to_string(), FINAL_OUTPUT_RESPONSE),
+            ],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let captured = openai.captured_requests_handle();
+
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        let recipe = serde_json::json!({
+            "title": "Cost Critical Recipe",
+            "description": "Recipe testing byte-identical prompts",
+            "instructions": "Deterministic prompt caching instructions",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "value": { "type": "string" }
+                    },
+                    "required": ["value"]
+                }
+            }
+        });
+
+        // First settings/set
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Prompt 1
+        let out1 = session
+            .prompt("what is 1+1", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+        assert!(out1.tool_status.is_some());
+
+        // Identical settings/set
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Prompt 2
+        let out2 = session
+            .prompt("what is 2+2", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+        assert!(out2.tool_status.is_some());
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2, "expected exactly 2 captured requests");
+
+        let req1: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+        let req2: serde_json::Value = serde_json::from_str(&reqs[1]).unwrap();
+
+        assert_eq!(
+            req1["messages"][0]["content"].to_string(),
+            req2["messages"][0]["content"].to_string(),
+            "system prompt must be byte-identical across identical settings/set"
+        );
+
+        assert_eq!(
+            req1["tools"].to_string(),
+            req2["tools"].to_string(),
+            "tools array must be byte-identical across identical settings/set"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_session_settings_templated_recipe_renders_consistently() {
+    run_test(async move {
+        const FINAL_OUTPUT_RESPONSE: &str = "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_final\",\"type\":\"function\",\"function\":{\"name\":\"recipe__final_output\",\"arguments\":\"{\\\"summary\\\":\\\"done\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(
+            vec![
+                ("what is 1+1".to_string(), FINAL_OUTPUT_RESPONSE),
+                ("what is 2+2".to_string(), FINAL_OUTPUT_RESPONSE),
+            ],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let captured = openai.captured_requests_handle();
+
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // Recipe with defaulted parameter and recipe_dir template variables
+        let recipe = serde_json::json!({
+            "title": "Templated Recipe",
+            "description": "Recipe with template variables",
+            "parameters": [
+                {
+                    "key": "env",
+                    "description": "Environment",
+                    "input_type": "string",
+                    "requirement": "optional",
+                    "default": "production"
+                }
+            ],
+            "instructions": "Target env: {{ env }}. Recipe dir: {{ recipe_dir }}",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["summary"]
+                }
+            }
+        });
+
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let out1 = session
+            .prompt("what is 1+1", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+        assert!(out1.tool_status.is_some());
+
+        // Later settings/set without recipe
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let out2 = session
+            .prompt("what is 2+2", PermissionDecision::AllowOnce)
+            .await
+            .unwrap();
+        assert!(out2.tool_status.is_some());
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2);
+
+        let req1: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+        let req2: serde_json::Value = serde_json::from_str(&reqs[1]).unwrap();
+
+        let sys1 = req1["messages"][0]["content"].as_str().unwrap();
+        let sys2 = req2["messages"][0]["content"].as_str().unwrap();
+
+        // Template syntax does not reach model literally
+        assert!(!sys1.contains("{{ env }}"));
+        assert!(!sys1.contains("{{ recipe_dir }}"));
+        assert!(sys1.contains("Target env: production"));
+
+        // System prompt is byte-identical across the settings/set without recipe
+        assert_eq!(
+            sys1, sys2,
+            "rendered recipe must match on subsequent settings/set without recipe"
+        );
+    });
 }

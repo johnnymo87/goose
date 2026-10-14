@@ -4241,6 +4241,36 @@
       "x-side": "agent",
       "x-method": "_goose/unstable/recipes/encode"
     },
+    "SetSessionSettingsRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "cacheTtl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recipe": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecipeDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "description": "Pin a session's cache TTL and recipe.\n\nNote: Recipe `settings`, `extensions`, `prompt`, and `parameters` are\nignored by this call (only `instructions` and `response` are applied;\nthe model stays the session's).",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/settings/set"
+    },
     "DecodeRecipeRequest_unstable": {
       "type": "object",
       "properties": {
@@ -7589,6 +7619,15 @@
                   ],
                   "description": "Params for _goose/unstable/recipes/encode",
                   "title": "EncodeRecipeRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/SetSessionSettingsRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/session/settings/set",
+                  "title": "SetSessionSettingsRequest_unstable"
                 },
                 {
                   "allOf": [

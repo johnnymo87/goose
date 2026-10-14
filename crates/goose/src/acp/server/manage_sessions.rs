@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: on_set_session_settings pins session cache TTL and recipe.
 use super::*;
 
 impl GooseAcpAgent {
@@ -78,6 +79,135 @@ impl GooseAcpAgent {
                     agent.extend_system_prompt(key.to_string(), req.text).await;
                 }
             }
+        }
+
+        Ok(EmptyResponse {})
+    }
+
+    pub(super) async fn on_set_session_settings(
+        &self,
+        req: SetSessionSettingsRequest,
+    ) -> Result<EmptyResponse, agent_client_protocol::Error> {
+        let session_id = req.session_id.trim();
+        if session_id.is_empty() {
+            return Err(
+                agent_client_protocol::Error::invalid_params().data("sessionId cannot be empty")
+            );
+        }
+
+        if let Some(ttl) = &req.cache_ttl {
+            let normalized = ttl.trim().to_lowercase();
+            if normalized != "5m" && normalized != "1h" {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("invalid cacheTtl: must be '5m' or '1h'"));
+            }
+        }
+
+        let session = self
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .map_err(|_| {
+                agent_client_protocol::Error::resource_not_found(Some(session_id.to_string()))
+                    .data(format!("Session not found: {}", session_id))
+            })?;
+
+        let (raw_recipe_to_persist, recipe_to_apply) = if let Some(recipe_dto) = req.recipe {
+            let raw_recipe = crate::recipe::Recipe::try_from(recipe_dto).map_err(|e| {
+                agent_client_protocol::Error::invalid_params().data(format!("invalid recipe: {e}"))
+            })?;
+
+            if raw_recipe.check_for_security_warnings() {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("invalid recipe: contains hidden characters that could be malicious"));
+            }
+
+            let recipe_yaml = raw_recipe.to_yaml().map_err(|e| {
+                agent_client_protocol::Error::invalid_params().data(format!("invalid recipe: {e}"))
+            })?;
+            crate::recipe::validate_recipe::validate_recipe_template_from_content(
+                &recipe_yaml,
+                None,
+            )
+            .map_err(|e| {
+                let err_str = e.to_string();
+                let stripped = err_str.strip_prefix("recipe: ").unwrap_or(&err_str);
+                agent_client_protocol::Error::invalid_params()
+                    .data(format!("invalid recipe: {stripped}"))
+            })?;
+
+            let recipe_to_apply = if session.session_type == SessionType::Scheduled {
+                raw_recipe.clone()
+            } else {
+                let recipe_dir = crate::recipe::local_recipes::get_recipe_library_dir(true);
+                let user_values = session.user_recipe_values.clone().unwrap_or_default();
+                match self.render_recipe(&raw_recipe, &recipe_dir, user_values) {
+                    Ok(Some(rendered)) => rendered,
+                    Ok(None) => {
+                        return Err(agent_client_protocol::Error::invalid_params()
+                            .data("invalid recipe: missing required parameters"));
+                    }
+                    Err(e) => {
+                        let msg = e
+                            .data
+                            .as_ref()
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&e.message);
+                        let stripped = msg.strip_prefix("recipe: ").unwrap_or(msg);
+                        return Err(agent_client_protocol::Error::invalid_params()
+                            .data(format!("invalid recipe: {stripped}")));
+                    }
+                }
+            };
+
+            // Run the FinalOutputTool dry run on the version to apply
+            if let Some(ref response) = recipe_to_apply.response {
+                crate::agents::final_output_tool::FinalOutputTool::try_new(response.clone())
+                    .map_err(|e| {
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("invalid recipe: {e}"))
+                    })?;
+            }
+
+            (Some(raw_recipe), Some(recipe_to_apply))
+        } else {
+            (None, None)
+        };
+
+        let agent = self.get_session_agent(session_id).await?;
+
+        if let Some(ttl) = req.cache_ttl.as_deref().map(str::trim) {
+            let normalized = ttl.to_lowercase();
+            let current_model_config = agent
+                .model_config_for_session(session_id)
+                .await
+                .internal_err_ctx("Failed to resolve model config")?;
+            let provider = agent
+                .provider()
+                .await
+                .internal_err_ctx("Failed to get provider")?;
+            let new_model_config = current_model_config.with_cache_ttl(&normalized);
+            agent
+                .update_provider(provider, new_model_config, session_id)
+                .await
+                .internal_err_ctx("Failed to update provider model config")?;
+        }
+
+        if let (Some(raw_recipe), Some(recipe_to_apply)) = (raw_recipe_to_persist, recipe_to_apply)
+        {
+            // Note: recipe.extensions is ignored by this call; session extensions are unchanged.
+            // Apply the rendered recipe in memory first: instructions under "recipe" key and final_output tool from recipe.response.
+            self.apply_recipe(&agent, &recipe_to_apply).await?;
+
+            // Persist the raw recipe to session row.
+            self.session_manager
+                .update(session_id)
+                .recipe(Some(raw_recipe))
+                .apply()
+                .await
+                .internal_err_ctx("Failed to persist recipe to session")?;
+        } else if session.recipe.is_some() {
+            self.apply_session_recipe(&agent, &session).await?;
         }
 
         Ok(EmptyResponse {})

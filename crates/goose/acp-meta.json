@@ -296,6 +296,11 @@
       "responseType": "EncodeRecipeResponse_unstable"
     },
     {
+      "method": "_goose/unstable/session/settings/set",
+      "requestType": "SetSessionSettingsRequest_unstable",
+      "responseType": "EmptyResponse"
+    },
+    {
       "method": "_goose/unstable/recipes/decode",
       "requestType": "DecodeRecipeRequest_unstable",
       "responseType": "DecodeRecipeResponse_unstable"

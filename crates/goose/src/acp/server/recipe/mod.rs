@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: apply_recipe clears recipe instructions extra when none.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -289,7 +290,7 @@ impl GooseAcpAgent {
         Ok(RecipeToYamlResponse { yaml })
     }
 
-    fn render_recipe(
+    pub(super) fn render_recipe(
         &self,
         recipe: &Recipe,
         recipe_dir: &Path,
@@ -326,6 +327,8 @@ impl GooseAcpAgent {
             agent
                 .extend_system_prompt("recipe".to_string(), instructions)
                 .await;
+        } else {
+            agent.remove_system_prompt_extra("recipe").await;
         }
         Ok(())
     }
