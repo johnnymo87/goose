@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: list_sessions_matching sorts and limits on ids before fetching full rows.
 use crate::config::paths::Paths;
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageMetadata, MessageUsage, TokenState};
@@ -2124,6 +2125,11 @@ impl SessionStorage {
                 user_visible_message_sql("m.metadata_json")
             )
         };
+        // Two phases: the inner query groups, filters, sorts and limits on ids and sort keys
+        // only; the outer one fetches full rows for the ids that survive. Selecting every
+        // column in the grouped query makes SQLite carry each candidate's wide columns
+        // (recipe_json, extension_data) through GROUP BY and the ORDER BY sort before LIMIT
+        // discards them, so every page cost as much as listing every session.
         let sql = format!(
             r#"
             SELECT s.id, s.working_dir, s.name, s.description, s.user_set_name, s.session_type, s.created_at, s.updated_at, s.extension_data,
@@ -2135,16 +2141,22 @@ impl SessionStorage {
                    s.schedule_id, s.recipe_json, s.user_recipe_values_json,
                    s.provider_name, s.model_config_json, s.goose_mode,
                    s.archived_at, s.project_id, s.parent_session_id,
-                   {} as message_count,
-                   MAX({}) as last_message_timestamp,
-                   {} as sort_timestamp
-            FROM sessions s
-            {}
-            {}
-            GROUP BY s.id
-            {}
-            {}
-            {}
+                   page.message_count, page.last_message_timestamp, page.sort_timestamp
+            FROM (
+                SELECT s.id as id,
+                       {} as message_count,
+                       MAX({}) as last_message_timestamp,
+                       {} as sort_timestamp
+                FROM sessions s
+                {}
+                {}
+                GROUP BY s.id
+                {}
+                {}
+                {}
+            ) page
+            JOIN sessions s ON s.id = page.id
+            ORDER BY page.sort_timestamp DESC, page.id DESC
             "#,
             message_count_sql,
             normalized_message_timestamp,
