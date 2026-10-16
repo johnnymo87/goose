@@ -1,8 +1,11 @@
-// Modified by Jonathan Mohrbacher, 2026: rolling memory pure planning.
+// Modified by Jonathan Mohrbacher, 2026: rolling memory pure planning; memory call.
 use crate::agents::final_output_tool::FINAL_OUTPUT_CONTINUATION_MESSAGE;
 use crate::conversation::message::{Message, MessageContentBlock};
 use crate::session::ExtensionData;
-use goose_providers::conversation::token_usage::Usage;
+use goose_providers::base::Provider;
+use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+use goose_providers::errors::ProviderError;
+use goose_providers::model::ModelConfig;
 use goose_sdk_types::custom_requests::RollingMemoryDto;
 use rmcp::model::Role;
 use serde::{Deserialize, Serialize};
@@ -517,6 +520,222 @@ pub fn fold_part(msg: &Message) -> Option<&str> {
         .and_then(|ops| ops.get(OPERATION_KEY))
         .and_then(|note| note.get("part"))
         .and_then(|val| val.as_str())
+}
+
+/// One history line: format_message_for_compacting(msg), with ONLY its leading "[user]: " or
+/// "[assistant]: " replaced (strip_prefix, never replace-all: old summaries contain "[user]: "
+/// lines) by "[user 2026-10-13 14:31 UTC]: " from msg.created (unix seconds, rendered in UTC with
+/// chrono). Then neutralize: "</history" -> r"<\/history", "</previous-memory" -> r"<\/previous-memory".
+pub fn render_history_line(msg: &Message) -> String {
+    let formatted = crate::context_mgmt::format_message_for_compacting(msg);
+    let role_str = match msg.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+    let old_prefix = format!("[{}]: ", role_str);
+    let dt = chrono::DateTime::from_timestamp(msg.created, 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+    let stamp = dt.format("%Y-%m-%d %H:%M UTC");
+    let new_prefix = format!("[{} {}]: ", role_str, stamp);
+
+    let stamped = match formatted.strip_prefix(&old_prefix) {
+        Some(rest) => format!("{}{}", new_prefix, rest),
+        None => formatted,
+    };
+
+    stamped
+        .replace("</history", r"<\/history")
+        .replace("</previous-memory", r"<\/previous-memory")
+}
+
+/// Messages to render: folded agent-visible rows, minus turn-context rows, minus the previous
+/// memory pair (which goes in the previous_memory slot instead). With `drop_tool_responses`, drop
+/// ToolResponse content items (and messages left empty) — used for the one refusal retry.
+pub fn history_text(messages: &[Message], plan: &CutPlan, drop_tool_responses: bool) -> String {
+    let mut lines = Vec::new();
+
+    for &idx in &plan.folded {
+        let Some(msg) = messages.get(idx) else {
+            continue;
+        };
+
+        if !msg.is_agent_visible() || msg.is_turn_context() {
+            continue;
+        }
+
+        let is_prev_mem = (msg.role == Role::Assistant && fold_part(msg) == Some("memory"))
+            || plan.previous_memory == Some(idx);
+        let is_prev_recall = fold_part(msg) == Some("recall")
+            || (plan.previous_memory == Some(idx + 1) && msg.role == Role::User);
+
+        if is_prev_mem || is_prev_recall {
+            continue;
+        }
+
+        if drop_tool_responses {
+            let mut filtered_content = msg.content.clone();
+            filtered_content.retain(|c| !matches!(c, MessageContentBlock::ToolResponse(_)));
+            if filtered_content.is_empty() {
+                continue;
+            }
+            let mut filtered_msg = msg.clone();
+            filtered_msg.content = filtered_content;
+            lines.push(render_history_line(&filtered_msg));
+        } else {
+            lines.push(render_history_line(msg));
+        }
+    }
+
+    lines.join("\n")
+}
+
+#[derive(Debug)]
+pub struct Memory {
+    pub text: String,
+    pub usage: ProviderUsage,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryError {
+    #[error("memory call refused: {0}")]
+    Refused(String),
+    #[error("memory hit the output token limit")]
+    OutputLimit(ProviderUsage),
+    #[error("memory call stopped with {0}")]
+    StopReason(String, ProviderUsage),
+    #[error("memory was empty")]
+    Empty(ProviderUsage),
+    #[error(transparent)]
+    Provider(ProviderError),
+    #[error(transparent)]
+    Template(anyhow::Error),
+}
+
+/// Design §4. Renders compaction_rolling.md via crate::prompt_template::render_template with
+/// {previous_memory: Option<String>, messages: String}; one user message MEMORY_REQUEST_TEXT; no tools.
+/// Calls crate::model_config::complete_one_shot with model_config.clone().with_max_tokens(Some(MEMORY_MAX_TOKENS))
+/// (NOT with_default_max_tokens; check one_shot_model_config in model_config.rs keeps max_tokens).
+/// Failure: Err(ProviderError::Refusal) -> Refused; response.metadata.output_token_limit_reached ->
+/// OutputLimit; usage.finish_reasons Some(non-empty) and none == "end_turn" -> StopReason(joined);
+/// text (Text content only, joined, trimmed) empty -> Empty. Absent finish_reasons + text = success.
+/// Success above MEMORY_SIZE_WARN (ratio * o200k of the text) logs tracing::warn with the size; it is
+/// NOT an error.
+pub async fn write_memory(
+    provider: &dyn Provider,
+    model_config: &ModelConfig,
+    session_id: &str,
+    previous_memory: Option<&str>,
+    history: &str,
+    ratio: f64,
+) -> Result<Memory, MemoryError> {
+    #[derive(Serialize)]
+    struct Context<'a> {
+        previous_memory: Option<&'a str>,
+        messages: &'a str,
+    }
+
+    let context = Context {
+        previous_memory,
+        messages: history,
+    };
+
+    let system_prompt = crate::prompt_template::render_template("compaction_rolling.md", &context)
+        .map_err(|e| MemoryError::Template(anyhow::anyhow!(e)))?;
+
+    let memory_model_config = model_config
+        .clone()
+        .with_max_tokens(Some(MEMORY_MAX_TOKENS));
+
+    let user_msg = Message::user().with_text(MEMORY_REQUEST_TEXT);
+    let (response, usage) = match crate::model_config::complete_one_shot(
+        provider,
+        &memory_model_config,
+        session_id,
+        &system_prompt,
+        &[user_msg],
+        &[],
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(ProviderError::Refusal { details, .. }) => {
+            return Err(MemoryError::Refused(details));
+        }
+        Err(e) => {
+            return Err(MemoryError::Provider(e));
+        }
+    };
+
+    if response.metadata.output_token_limit_reached {
+        return Err(MemoryError::OutputLimit(usage));
+    }
+
+    if let Some(ref reasons) = usage.finish_reasons {
+        if !reasons.is_empty() && !reasons.iter().any(|r| r == "end_turn") {
+            return Err(MemoryError::StopReason(reasons.join(", "), usage));
+        }
+    }
+
+    let text = response.as_concat_text().trim().to_string();
+    if text.is_empty() {
+        return Err(MemoryError::Empty(usage));
+    }
+
+    let o200k_tokens = match crate::token_counter::create_token_counter().await {
+        Ok(counter) => counter.count_tokens(&text),
+        Err(_) => text.len() / 4,
+    };
+    let estimated_tokens = ratio * (o200k_tokens as f64);
+    if estimated_tokens > MEMORY_SIZE_WARN {
+        tracing::warn!(
+            estimated_tokens,
+            MEMORY_SIZE_WARN,
+            "rolling memory size above warning threshold"
+        );
+    }
+
+    Ok(Memory { text, usage })
+}
+
+/// Refusal policy (§6): call write_memory; on Refused only, rebuild history with
+/// drop_tool_responses = true and call once more. Returns the last result. OutputLimit, StopReason
+/// and Empty come from a completed call and carry its usage so the caller records it.
+/// ProviderError::Refusal carries no usage (goose-provider-types errors.rs ~57), so a refused call
+/// cannot be accounted for; that is a known gap, not something to work around.
+pub async fn write_memory_with_retry(
+    provider: &dyn Provider,
+    model_config: &ModelConfig,
+    session_id: &str,
+    previous_memory: Option<&str>,
+    messages: &[Message],
+    plan: &CutPlan,
+    ratio: f64,
+) -> Result<Memory, MemoryError> {
+    let history = history_text(messages, plan, false);
+    match write_memory(
+        provider,
+        model_config,
+        session_id,
+        previous_memory,
+        &history,
+        ratio,
+    )
+    .await
+    {
+        Err(MemoryError::Refused(_)) => {
+            let retry_history = history_text(messages, plan, true);
+            write_memory(
+                provider,
+                model_config,
+                session_id,
+                previous_memory,
+                &retry_history,
+                ratio,
+            )
+            .await
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -1197,5 +1416,427 @@ mod tests {
         // Within bounds
         let ratio = calibrated_ratio(1450, 1000).unwrap();
         assert!((ratio - 1.45).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rolling_render_line_stamps_utc_and_strips_only_leading_prefix() {
+        let ts = 1791901860;
+        let mut user_msg = Message::user().with_text("quoted [user]: earlier prompt");
+        user_msg.created = ts;
+
+        let rendered = render_history_line(&user_msg);
+        assert_eq!(
+            rendered,
+            "[user 2026-10-13 14:31 UTC]: quoted [user]: earlier prompt"
+        );
+
+        let mut asst_msg = Message::assistant().with_text("replied [assistant]: earlier answer");
+        asst_msg.created = ts;
+
+        let rendered_asst = render_history_line(&asst_msg);
+        assert_eq!(
+            rendered_asst,
+            "[assistant 2026-10-13 14:31 UTC]: replied [assistant]: earlier answer"
+        );
+    }
+
+    #[test]
+    fn rolling_render_neutralizes_closing_tags() {
+        let msg = Message::user().with_text("attempt </history> and </previous-memory> end");
+        let rendered = render_history_line(&msg);
+        assert!(
+            rendered.contains(r"<\/history>"),
+            "should neutralize </history>"
+        );
+        assert!(
+            rendered.contains(r"<\/previous-memory>"),
+            "should neutralize </previous-memory>"
+        );
+        assert!(
+            !rendered.contains("</history"),
+            "should not contain unescaped </history"
+        );
+        assert!(
+            !rendered.contains("</previous-memory"),
+            "should not contain unescaped </previous-memory"
+        );
+    }
+
+    #[test]
+    fn rolling_history_skips_turn_context_and_previous_memory() {
+        let (recall, memory) = make_memory_pair("remember previous", "earlier memory content");
+        let mut tc_msg = Message::user().with_text("hidden turn context");
+        tc_msg.metadata.turn_context = true;
+        let user_msg = Message::user().with_text("visible user turn prompt");
+        let asst_msg = Message::assistant().with_text("visible assistant turn reply");
+        let tail_msg = Message::user().with_text("tail prompt");
+
+        let messages = vec![recall, memory, tc_msg, user_msg, asst_msg, tail_msg];
+        let plan = CutPlan {
+            cut: 5,
+            folded: vec![0, 1, 2, 3, 4],
+            previous_memory: Some(1),
+            new_material_o200k: 200,
+            tail_o200k: 100,
+        };
+
+        let rendered = history_text(&messages, &plan, false);
+
+        assert!(!rendered.contains("remember previous"));
+        assert!(!rendered.contains("earlier memory content"));
+        assert!(!rendered.contains("hidden turn context"));
+        assert!(rendered.contains("visible user turn prompt"));
+        assert!(rendered.contains("visible assistant turn reply"));
+        assert!(!rendered.contains("tail prompt"));
+    }
+
+    struct MockMemoryProvider {
+        captured_configs: std::sync::Mutex<Vec<ModelConfig>>,
+        captured_systems: std::sync::Mutex<Vec<String>>,
+        captured_messages: std::sync::Mutex<Vec<Vec<Message>>>,
+        captured_tools: std::sync::Mutex<Vec<Vec<rmcp::model::Tool>>>,
+        responses: std::sync::Mutex<std::collections::VecDeque<Result<(Message, ProviderUsage), ProviderError>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockMemoryProvider {
+        fn new(response: Result<(Message, ProviderUsage), ProviderError>) -> Self {
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(response);
+            Self {
+                captured_configs: std::sync::Mutex::new(Vec::new()),
+                captured_systems: std::sync::Mutex::new(Vec::new()),
+                captured_messages: std::sync::Mutex::new(Vec::new()),
+                captured_tools: std::sync::Mutex::new(Vec::new()),
+                responses: std::sync::Mutex::new(queue),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn new_queue(responses: Vec<Result<(Message, ProviderUsage), ProviderError>>) -> Self {
+            Self {
+                captured_configs: std::sync::Mutex::new(Vec::new()),
+                captured_systems: std::sync::Mutex::new(Vec::new()),
+                captured_messages: std::sync::Mutex::new(Vec::new()),
+                captured_tools: std::sync::Mutex::new(Vec::new()),
+                responses: std::sync::Mutex::new(responses.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn last_config(&self) -> ModelConfig {
+            self.captured_configs.lock().unwrap().last().cloned().unwrap()
+        }
+
+        fn last_system(&self) -> String {
+            self.captured_systems.lock().unwrap().last().cloned().unwrap()
+        }
+
+        fn last_messages(&self) -> Vec<Message> {
+            self.captured_messages.lock().unwrap().last().cloned().unwrap()
+        }
+
+        fn last_tools(&self) -> Vec<rmcp::model::Tool> {
+            self.captured_tools.lock().unwrap().last().cloned().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockMemoryProvider {
+        fn get_name(&self) -> &str {
+            "mock-memory-provider"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[rmcp::model::Tool],
+        ) -> Result<goose_providers::base::MessageStream, ProviderError> {
+            Err(ProviderError::NotImplemented("stream not used".to_string()))
+        }
+
+        async fn complete(
+            &self,
+            model_config: &ModelConfig,
+            system: &str,
+            messages: &[Message],
+            tools: &[rmcp::model::Tool],
+        ) -> Result<(Message, ProviderUsage), ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.captured_configs.lock().unwrap().push(model_config.clone());
+            self.captured_systems.lock().unwrap().push(system.to_string());
+            self.captured_messages.lock().unwrap().push(messages.to_vec());
+            self.captured_tools.lock().unwrap().push(tools.to_vec());
+
+            let mut queue = self.responses.lock().unwrap();
+            if let Some(res) = queue.pop_front() {
+                res
+            } else {
+                Err(ProviderError::ExecutionError("no response".to_string()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rolling_memory_request_shape() {
+        let usage = ProviderUsage::new("test-model".to_string(), Usage::default())
+            .with_finish_reasons(vec!["end_turn".to_string()]);
+        let resp = Message::assistant().with_text("memory content");
+        let provider = MockMemoryProvider::new(Ok((resp.clone(), usage.clone())));
+
+        let session_cfg = ModelConfig::new("test-model").with_max_tokens(Some(4096));
+
+        // 1. With previous memory
+        let res = write_memory(
+            &provider,
+            &session_cfg,
+            "session-1",
+            Some("old memory text"),
+            "history text line",
+            1.45,
+        )
+        .await
+        .expect("write_memory should succeed");
+
+        assert_eq!(res.text, "memory content");
+        assert_eq!(provider.call_count(), 1);
+
+        let system = provider.last_system();
+        assert!(system.contains("<previous-memory>"));
+        assert!(system.contains("old memory text"));
+        assert!(system.contains("</previous-memory>"));
+        assert!(system.contains("<history>"));
+        assert!(system.contains("history text line"));
+        assert!(system.contains("</history>"));
+
+        let msgs = provider.last_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[0].as_concat_text(), MEMORY_REQUEST_TEXT);
+
+        assert!(provider.last_tools().is_empty());
+        assert_eq!(provider.last_config().max_tokens, Some(16_000));
+
+        // 2. Without previous memory
+        let provider2 = MockMemoryProvider::new(Ok((resp, usage)));
+        let res2 = write_memory(
+            &provider2,
+            &session_cfg,
+            "session-2",
+            None,
+            "history text line",
+            1.45,
+        )
+        .await
+        .expect("write_memory without previous memory should succeed");
+
+        assert_eq!(res2.text, "memory content");
+        let system2 = provider2.last_system();
+        assert!(!system2.contains("</previous-memory>"));
+        assert!(!system2.contains("**Your previous memory.**"));
+        assert!(system2.contains("<history>"));
+        assert!(system2.contains("history text line"));
+        assert!(system2.contains("</history>"));
+    }
+
+    #[tokio::test]
+    async fn rolling_memory_failures() {
+        let session_cfg = ModelConfig::new("test-model");
+
+        // 1. Output limit reached
+        let mut msg_limit = Message::assistant().with_text("partial text");
+        msg_limit.metadata.output_token_limit_reached = true;
+        let usage = ProviderUsage::new("test-model".to_string(), Usage::default());
+        let provider = MockMemoryProvider::new(Ok((msg_limit, usage.clone())));
+
+        let err = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect_err("should fail on output limit");
+        assert!(matches!(err, MemoryError::OutputLimit(_)));
+
+        // 2. Refusal
+        let provider = MockMemoryProvider::new(Err(ProviderError::Refusal {
+            details: "refused content".to_string(),
+            category: None,
+        }));
+        let err = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect_err("should fail on refusal");
+        match err {
+            MemoryError::Refused(d) => assert_eq!(d, "refused content"),
+            other => panic!("expected Refused, got {:?}", other),
+        }
+
+        // 3. ["max_tokens"] finish reason
+        let msg = Message::assistant().with_text("stopped early");
+        let usage_max = usage.clone().with_finish_reasons(vec!["max_tokens".to_string()]);
+        let provider = MockMemoryProvider::new(Ok((msg, usage_max)));
+        let err = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect_err("should fail on non-end_turn stop reason");
+        match err {
+            MemoryError::StopReason(reason, _) => assert_eq!(reason, "max_tokens"),
+            other => panic!("expected StopReason, got {:?}", other),
+        }
+
+        // 4. Empty text
+        let msg_empty = Message::assistant().with_text("   ");
+        let usage_end = usage.clone().with_finish_reasons(vec!["end_turn".to_string()]);
+        let provider = MockMemoryProvider::new(Ok((msg_empty, usage_end.clone())));
+        let err = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect_err("should fail on empty text");
+        assert!(matches!(err, MemoryError::Empty(_)));
+
+        // 5. Absent finish_reasons + text = Ok
+        let msg_ok = Message::assistant().with_text("valid memory");
+        let usage_none = usage.clone();
+        let provider = MockMemoryProvider::new(Ok((msg_ok, usage_none)));
+        let res = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect("absent finish_reasons + text should succeed");
+        assert_eq!(res.text, "valid memory");
+
+        // 6. ["end_turn"] = Ok
+        let msg_end = Message::assistant().with_text("valid memory 2");
+        let provider = MockMemoryProvider::new(Ok((msg_end, usage_end)));
+        let res = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect("end_turn should succeed");
+        assert_eq!(res.text, "valid memory 2");
+    }
+
+    #[tokio::test]
+    async fn rolling_memory_large_end_turn_is_success() {
+        let session_cfg = ModelConfig::new("test-model");
+        let large_text = "word ".repeat(7_000);
+        let msg = Message::assistant().with_text(&large_text);
+        let usage = ProviderUsage::new("test-model".to_string(), Usage::default())
+            .with_finish_reasons(vec!["end_turn".to_string()]);
+        let provider = MockMemoryProvider::new(Ok((msg, usage)));
+
+        let res = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect("large memory with end_turn should succeed");
+        assert_eq!(res.text, large_text.trim());
+    }
+
+    #[tokio::test]
+    async fn rolling_memory_refusal_retries_once_without_tool_responses() {
+        let session_cfg = ModelConfig::new("test-model");
+        let mut user_prompt = Message::user().with_text("do something");
+        user_prompt.created = 1000;
+        let mut asst_tool = Message::assistant().with_tool_request(
+            "t1",
+            Ok(rmcp::model::CallToolRequestParams::new("read_file")),
+        );
+        asst_tool.created = 1001;
+        let mut user_resp = Message::user().with_tool_response(
+            "t1",
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text("sensitive tool output"),
+            ])),
+        );
+        user_resp.created = 1002;
+        let mut tail = Message::user().with_text("tail");
+        tail.created = 1003;
+
+        let messages = vec![user_prompt, asst_tool, user_resp, tail];
+        let plan = CutPlan {
+            cut: 3,
+            folded: vec![0, 1, 2],
+            previous_memory: None,
+            new_material_o200k: 100,
+            tail_o200k: 50,
+        };
+
+        // Case 1: First call Refused, second call succeeds
+        let usage = ProviderUsage::new("test-model".to_string(), Usage::default())
+            .with_finish_reasons(vec!["end_turn".to_string()]);
+        let ok_msg = Message::assistant().with_text("retried memory");
+        let responses = vec![
+            Err(ProviderError::Refusal {
+                details: "refused tool content".to_string(),
+                category: None,
+            }),
+            Ok((ok_msg, usage.clone())),
+        ];
+        let provider = MockMemoryProvider::new_queue(responses);
+
+        let res = write_memory_with_retry(
+            &provider,
+            &session_cfg,
+            "s1",
+            None,
+            &messages,
+            &plan,
+            1.45,
+        )
+        .await
+        .expect("retry should succeed");
+        assert_eq!(res.text, "retried memory");
+        assert_eq!(provider.call_count(), 2);
+
+        // First call had tool_response:
+        let sys1 = provider.captured_systems.lock().unwrap()[0].clone();
+        assert!(sys1.contains("tool_response:"));
+
+        // Second call had NO tool_response:
+        let sys2 = provider.captured_systems.lock().unwrap()[1].clone();
+        assert!(!sys2.contains("tool_response:"));
+
+        // Case 2: Second call also refused -> returns Refused
+        let responses_both_refused = vec![
+            Err(ProviderError::Refusal {
+                details: "refusal 1".to_string(),
+                category: None,
+            }),
+            Err(ProviderError::Refusal {
+                details: "refusal 2".to_string(),
+                category: None,
+            }),
+        ];
+        let provider2 = MockMemoryProvider::new_queue(responses_both_refused);
+        let err2 = write_memory_with_retry(
+            &provider2,
+            &session_cfg,
+            "s2",
+            None,
+            &messages,
+            &plan,
+            1.45,
+        )
+        .await
+        .expect_err("second refusal should be returned as Refused");
+        match err2 {
+            MemoryError::Refused(d) => assert_eq!(d, "refusal 2"),
+            other => panic!("expected Refused, got {:?}", other),
+        }
+        assert_eq!(provider2.call_count(), 2);
+
+        // Case 3: Non-refusal failure on first call is NOT retried
+        let responses_server_error = vec![
+            Err(ProviderError::ServerError("server down".to_string())),
+        ];
+        let provider3 = MockMemoryProvider::new_queue(responses_server_error);
+        let err3 = write_memory_with_retry(
+            &provider3,
+            &session_cfg,
+            "s3",
+            None,
+            &messages,
+            &plan,
+            1.45,
+        )
+        .await
+        .expect_err("server error should fail without retry");
+        assert!(matches!(err3, MemoryError::Provider(ProviderError::ServerError(_))));
+        assert_eq!(provider3.call_count(), 1);
     }
 }

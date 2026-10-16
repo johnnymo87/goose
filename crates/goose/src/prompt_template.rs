@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: rolling memory compaction template registration.
 use crate::config::paths::Paths;
 use include_dir::{include_dir, Dir};
 use minijinja::{Environment, Error as MiniJinjaError, Value as MJValue};
@@ -42,6 +43,10 @@ static TEMPLATE_REGISTRY: &[(&str, &str)] = &[
     (
         "session_name.md",
         "System prompt for generating short session names from conversation history",
+    ),
+    (
+        "compaction_rolling.md",
+        "Prompt for folding older session history into a first-person memory (rolling memory)",
     ),
 ];
 
@@ -272,5 +277,20 @@ mod tests {
                 "Each template should have content"
             );
         }
+    }
+
+    #[test]
+    fn compaction_rolling_template_is_registered() {
+        let template = get_template("compaction_rolling.md");
+        assert!(template.is_some(), "compaction_rolling.md should be registered");
+
+        let template = template.unwrap();
+        let file_content = include_str!("prompts/compaction_rolling.md");
+        assert_eq!(template.default_content, file_content);
+
+        let mut context = HashMap::new();
+        context.insert("messages", "history line 1");
+        let result = render_template("compaction_rolling.md", &context);
+        assert!(result.is_ok(), "compaction_rolling.md should render: {:?}", result.err());
     }
 }
