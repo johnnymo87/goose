@@ -765,6 +765,10 @@ pub fn fold_rows(
     plan: &CutPlan,
     memory: &str,
 ) -> anyhow::Result<Conversation> {
+    if plan.folded.is_empty() {
+        anyhow::bail!("nothing to fold");
+    }
+
     let cut_msg = messages.get(plan.cut).ok_or_else(|| {
         anyhow::anyhow!(
             "cut index {} out of bounds for {} messages",
@@ -774,6 +778,12 @@ pub fn fold_rows(
     })?;
 
     for &idx in &plan.folded {
+        if idx >= plan.cut {
+            anyhow::bail!(
+                "folded message index {idx} is at or after cut {}",
+                plan.cut
+            );
+        }
         let msg = messages.get(idx).ok_or_else(|| {
             anyhow::anyhow!(
                 "folded message index {idx} out of bounds for {} messages",
@@ -816,7 +826,7 @@ pub fn fold_rows(
         .format("%Y-%m-%d")
         .to_string();
 
-    let pair_created = cut_msg.created - 1;
+    let pair_created = cut_msg.created.saturating_sub(1);
 
     let mut recall_metadata = MessageMetadata::agent_only();
     recall_metadata.set_operation_note(OPERATION_KEY, "part", Value::String("recall".to_string()));
@@ -2300,12 +2310,46 @@ mod tests {
         let messages = vec![msg0];
         let plan = CutPlan {
             cut: 5,
-            folded: vec![],
+            folded: vec![0],
             previous_memory: None,
-            new_material_o200k: 0,
+            new_material_o200k: 10,
             tail_o200k: 0,
         };
         let err = fold_rows(&messages, &plan, "mem").expect_err("should reject out of bounds cut");
         assert!(err.to_string().contains("out of bounds"));
+    }
+
+    #[test]
+    fn rolling_fold_rows_rejects_folded_at_or_after_cut() {
+        let msg0 = Message::user().with_text("msg0").with_generated_id();
+        let msg1 = Message::assistant().with_text("msg1").with_generated_id();
+        let msg2 = Message::user().with_text("msg2").with_generated_id();
+        let messages = vec![msg0, msg1, msg2];
+        let plan = CutPlan {
+            cut: 2,
+            folded: vec![0, 2],
+            previous_memory: None,
+            new_material_o200k: 50,
+            tail_o200k: 50,
+        };
+        let err = fold_rows(&messages, &plan, "mem")
+            .expect_err("should reject folded at or after cut");
+        assert!(err.to_string().contains("at or after cut"));
+    }
+
+    #[test]
+    fn rolling_fold_rows_rejects_empty_folded() {
+        let msg0 = Message::user().with_text("msg0").with_generated_id();
+        let msg1 = Message::user().with_text("msg1").with_generated_id();
+        let messages = vec![msg0, msg1];
+        let plan = CutPlan {
+            cut: 1,
+            folded: vec![],
+            previous_memory: None,
+            new_material_o200k: 0,
+            tail_o200k: 50,
+        };
+        let err = fold_rows(&messages, &plan, "mem").expect_err("should reject empty folded");
+        assert!(err.to_string().contains("nothing to fold"));
     }
 }
