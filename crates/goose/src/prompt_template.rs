@@ -282,10 +282,14 @@ mod tests {
     #[test]
     fn compaction_rolling_template_is_registered() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
 
         let template = get_template("compaction_rolling.md");
-        assert!(template.is_some(), "compaction_rolling.md should be registered");
+        assert!(
+            template.is_some(),
+            "compaction_rolling.md should be registered"
+        );
 
         let template = template.unwrap();
         let file_content = include_str!("prompts/compaction_rolling.md");
@@ -294,6 +298,10 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("messages", "history line 1");
         let result = render_template("compaction_rolling.md", &context);
-        assert!(result.is_ok(), "compaction_rolling.md should render: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "compaction_rolling.md should render: {:?}",
+            result.err()
+        );
     }
 }

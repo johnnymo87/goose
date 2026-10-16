@@ -197,10 +197,11 @@ impl GcpVertexAIProvider {
             .get_param("GCP_VERTEX_SESSION_HEADER")
             .ok()
             .filter(|h: &String| !h.trim().is_empty());
-        let request_builder = crate::session_context::session_id_request_builder_with_header_override(
-            session_header.as_deref().map(str::trim),
-        )
-        .map_err(|e| anyhow::anyhow!("invalid GCP_VERTEX_SESSION_HEADER: {e}"))?;
+        let request_builder =
+            crate::session_context::session_id_request_builder_with_header_override(
+                session_header.as_deref().map(str::trim),
+            )
+            .map_err(|e| anyhow::anyhow!("invalid GCP_VERTEX_SESSION_HEADER: {e}"))?;
 
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))

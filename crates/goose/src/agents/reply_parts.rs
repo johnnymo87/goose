@@ -884,12 +884,7 @@ impl Agent {
         use crate::context_mgmt::rolling::FoldOutcome;
 
         let fold_outcome = self
-            .execute_rolling_fold(
-                &session_config.id,
-                pending,
-                conversation,
-                cancel_token,
-            )
+            .execute_rolling_fold(&session_config.id, pending, conversation, cancel_token)
             .await;
 
         match fold_outcome {

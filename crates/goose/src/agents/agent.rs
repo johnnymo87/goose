@@ -1858,9 +1858,19 @@ impl Agent {
         session_config: SessionConfig,
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
-        let session = self.config.session_manager.get_session(&session_config.id, false).await?;
-        if crate::context_mgmt::rolling::resolve_settings(&session.extension_data, |k| std::env::var(k).ok()).is_some() {
-            return Err(anyhow::anyhow!("rolling memory is on for this session; the unrolled agent loop is not supported"));
+        let session = self
+            .config
+            .session_manager
+            .get_session(&session_config.id, false)
+            .await?;
+        if crate::context_mgmt::rolling::resolve_settings(&session.extension_data, |k| {
+            std::env::var(k).ok()
+        })
+        .is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "rolling memory is on for this session; the unrolled agent loop is not supported"
+            ));
         }
         let session_id = session_config.id.clone();
         let events = crate::session_context::with_session_id(
@@ -2477,10 +2487,10 @@ impl Agent {
             }
         }
 
-        let rolling_settings = crate::context_mgmt::rolling::resolve_settings(
-            &session.extension_data,
-            |k| std::env::var(k).ok(),
-        );
+        let rolling_settings =
+            crate::context_mgmt::rolling::resolve_settings(&session.extension_data, |k| {
+                std::env::var(k).ok()
+            });
 
         let (needs_auto_compact, rolling_pending) = if let Some(settings) = rolling_settings {
             let pending = crate::context_mgmt::rolling::check(&session, &settings, &conversation)
