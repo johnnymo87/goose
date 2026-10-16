@@ -239,8 +239,7 @@ pub fn is_retained(usage: &Usage) -> bool {
 pub fn anchor_index(messages: &[Message], session_usage: &Usage) -> Option<usize> {
     let last_usage_idx = messages
         .iter()
-        .enumerate()
-        .rposition(|(_, m)| m.metadata.usage.is_some())?;
+        .rposition(|m| m.metadata.usage.is_some())?;
 
     let msg_usage = messages[last_usage_idx].metadata.usage.as_ref()?;
     if msg_usage.input_tokens == session_usage.input_tokens
@@ -378,63 +377,7 @@ pub fn plan_cut(
         return Ok(None);
     }
 
-    // Pairing check
-    let mut responses_after = HashSet::new();
-    let mut responses_before = HashSet::new();
-
-    for i in 0..cut {
-        let msg = &messages[i];
-        if !msg.is_agent_visible() {
-            continue;
-        }
-        for content in &msg.content {
-            if let MessageContentBlock::ToolResponse(res) = content {
-                responses_before.insert(res.id.clone());
-            }
-        }
-    }
-
-    for i in cut..messages.len() {
-        let msg = &messages[i];
-        if !msg.is_agent_visible() {
-            continue;
-        }
-        for content in &msg.content {
-            if let MessageContentBlock::ToolResponse(res) = content {
-                responses_after.insert(res.id.clone());
-            }
-        }
-    }
-
-    // If a request id before the cut has its response at/after it
-    for i in 0..cut {
-        let msg = &messages[i];
-        if !msg.is_agent_visible() {
-            continue;
-        }
-        for content in &msg.content {
-            if let MessageContentBlock::ToolRequest(req) = content {
-                if responses_after.contains(&req.id) {
-                    return Err(CutError::SplitToolPair(req.id.clone()));
-                }
-            }
-        }
-    }
-
-    // Or the reverse: request at/after cut has its response before cut
-    for i in cut..messages.len() {
-        let msg = &messages[i];
-        if !msg.is_agent_visible() {
-            continue;
-        }
-        for content in &msg.content {
-            if let MessageContentBlock::ToolRequest(req) = content {
-                if responses_before.contains(&req.id) {
-                    return Err(CutError::SplitToolPair(req.id.clone()));
-                }
-            }
-        }
-    }
+    check_tool_pairing(messages, cut)?;
 
     let tail_o200k: usize = (cut..messages.len())
         .filter(|&i| messages[i].is_agent_visible())
@@ -448,6 +391,48 @@ pub fn plan_cut(
         new_material_o200k,
         tail_o200k,
     }))
+}
+
+/// Covers pairs the cut would split, not pre-existing orphans.
+fn check_tool_pairing(messages: &[Message], cut: usize) -> Result<(), CutError> {
+    let mut responses_before = HashSet::new();
+    let mut responses_after = HashSet::new();
+
+    for msg in &messages[..cut] {
+        if msg.is_agent_visible() {
+            responses_before.extend(msg.get_tool_response_ids());
+        }
+    }
+
+    for msg in &messages[cut..] {
+        if msg.is_agent_visible() {
+            responses_after.extend(msg.get_tool_response_ids());
+        }
+    }
+
+    // If a request id before the cut has its response at/after it
+    for msg in &messages[..cut] {
+        if msg.is_agent_visible() {
+            for req_id in msg.get_tool_request_ids() {
+                if responses_after.contains(req_id) {
+                    return Err(CutError::SplitToolPair(req_id.to_string()));
+                }
+            }
+        }
+    }
+
+    // Or the reverse: request at/after cut has its response before cut
+    for msg in &messages[cut..] {
+        if msg.is_agent_visible() {
+            for req_id in msg.get_tool_request_ids() {
+                if responses_before.contains(req_id) {
+                    return Err(CutError::SplitToolPair(req_id.to_string()));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,7 +491,11 @@ pub fn decide(
 pub fn backed_off(state: &RollingState, estimate: u64, settings: &RollingMemorySettings) -> bool {
     state.consecutive_failures >= BACKOFF_AFTER_FAILURES
         && (estimate as f64) <= HARD_CAP_FACTOR * (settings.budget_tokens as f64)
-        && estimate < state.failed_at_estimate.unwrap_or(0) + (settings.tail_tokens as u64 / 2)
+        && estimate
+            < state
+                .failed_at_estimate
+                .unwrap_or(0)
+                .saturating_add(settings.tail_tokens as u64 / 2)
 }
 
 /// New ratio from a calibration sample: the anchor call's billed INPUT tokens (anchor
