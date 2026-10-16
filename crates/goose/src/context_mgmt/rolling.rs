@@ -616,7 +616,8 @@ pub enum MemoryError {
 /// Calls crate::model_config::complete_one_shot with model_config.clone().with_max_tokens(Some(MEMORY_MAX_TOKENS))
 /// (NOT with_default_max_tokens; check one_shot_model_config in model_config.rs keeps max_tokens).
 /// Failure: Err(ProviderError::Refusal) -> Refused; response.metadata.output_token_limit_reached ->
-/// OutputLimit; usage.finish_reasons Some(non-empty) and none == "end_turn" -> StopReason(joined);
+/// OutputLimit; usage.finish_reasons Some(non-empty) and none == "end_turn" or "stop"
+/// (ASCII case-insensitive; other providers report "stop") -> StopReason(joined);
 /// text (Text content only, joined, trimmed) empty -> Empty. Absent finish_reasons + text = success.
 /// Success above MEMORY_SIZE_WARN (ratio * o200k of the text) logs tracing::warn with the size; it is
 /// NOT an error.
@@ -628,6 +629,11 @@ pub async fn write_memory(
     history: &str,
     ratio: f64,
 ) -> Result<Memory, MemoryError> {
+    let neutralized_previous_memory = previous_memory.map(|prev| {
+        prev.replace("</history", r"<\/history")
+            .replace("</previous-memory", r"<\/previous-memory")
+    });
+
     #[derive(Serialize)]
     struct Context<'a> {
         previous_memory: Option<&'a str>,
@@ -635,7 +641,7 @@ pub async fn write_memory(
     }
 
     let context = Context {
-        previous_memory,
+        previous_memory: neutralized_previous_memory.as_deref(),
         messages: history,
     };
 
@@ -671,7 +677,11 @@ pub async fn write_memory(
     }
 
     if let Some(ref reasons) = usage.finish_reasons {
-        if !reasons.is_empty() && !reasons.iter().any(|r| r == "end_turn") {
+        // "end_turn" (Anthropic) or "stop" (OpenAI and other providers), ASCII case-insensitive.
+        let is_normal_completion = reasons.iter().any(|r| {
+            r.eq_ignore_ascii_case("end_turn") || r.eq_ignore_ascii_case("stop")
+        });
+        if !reasons.is_empty() && !is_normal_completion {
             return Err(MemoryError::StopReason(reasons.join(", "), usage));
         }
     }
@@ -1585,6 +1595,9 @@ mod tests {
 
     #[tokio::test]
     async fn rolling_memory_request_shape() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+
         let usage = ProviderUsage::new("test-model".to_string(), Usage::default())
             .with_finish_reasons(vec!["end_turn".to_string()]);
         let resp = Message::assistant().with_text("memory content");
@@ -1647,18 +1660,30 @@ mod tests {
 
     #[tokio::test]
     async fn rolling_memory_failures() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+
         let session_cfg = ModelConfig::new("test-model");
 
-        // 1. Output limit reached
+        // 1. Output limit reached (carries usage)
         let mut msg_limit = Message::assistant().with_text("partial text");
         msg_limit.metadata.output_token_limit_reached = true;
-        let usage = ProviderUsage::new("test-model".to_string(), Usage::default());
-        let provider = MockMemoryProvider::new(Ok((msg_limit, usage.clone())));
+        let limit_usage = ProviderUsage::new(
+            "test-model".to_string(),
+            Usage::new(Some(120), Some(45), None),
+        );
+        let provider = MockMemoryProvider::new(Ok((msg_limit, limit_usage)));
 
         let err = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
             .await
             .expect_err("should fail on output limit");
-        assert!(matches!(err, MemoryError::OutputLimit(_)));
+        match err {
+            MemoryError::OutputLimit(u) => {
+                assert_eq!(u.usage.input_tokens, Some(120));
+                assert_eq!(u.usage.output_tokens, Some(45));
+            }
+            other => panic!("expected OutputLimit, got {:?}", other),
+        }
 
         // 2. Refusal
         let provider = MockMemoryProvider::new(Err(ProviderError::Refusal {
@@ -1673,30 +1698,48 @@ mod tests {
             other => panic!("expected Refused, got {:?}", other),
         }
 
-        // 3. ["max_tokens"] finish reason
+        // 3. ["max_tokens"] finish reason (carries usage)
         let msg = Message::assistant().with_text("stopped early");
-        let usage_max = usage.clone().with_finish_reasons(vec!["max_tokens".to_string()]);
-        let provider = MockMemoryProvider::new(Ok((msg, usage_max)));
+        let stop_usage = ProviderUsage::new(
+            "test-model".to_string(),
+            Usage::new(Some(230), Some(60), None),
+        )
+        .with_finish_reasons(vec!["max_tokens".to_string()]);
+        let provider = MockMemoryProvider::new(Ok((msg, stop_usage)));
         let err = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
             .await
             .expect_err("should fail on non-end_turn stop reason");
         match err {
-            MemoryError::StopReason(reason, _) => assert_eq!(reason, "max_tokens"),
+            MemoryError::StopReason(reason, u) => {
+                assert_eq!(reason, "max_tokens");
+                assert_eq!(u.usage.input_tokens, Some(230));
+                assert_eq!(u.usage.output_tokens, Some(60));
+            }
             other => panic!("expected StopReason, got {:?}", other),
         }
 
-        // 4. Empty text
+        // 4. Empty text (carries usage)
         let msg_empty = Message::assistant().with_text("   ");
-        let usage_end = usage.clone().with_finish_reasons(vec!["end_turn".to_string()]);
-        let provider = MockMemoryProvider::new(Ok((msg_empty, usage_end.clone())));
+        let empty_usage = ProviderUsage::new(
+            "test-model".to_string(),
+            Usage::new(Some(340), Some(0), None),
+        )
+        .with_finish_reasons(vec!["end_turn".to_string()]);
+        let provider = MockMemoryProvider::new(Ok((msg_empty, empty_usage)));
         let err = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
             .await
             .expect_err("should fail on empty text");
-        assert!(matches!(err, MemoryError::Empty(_)));
+        match err {
+            MemoryError::Empty(u) => {
+                assert_eq!(u.usage.input_tokens, Some(340));
+                assert_eq!(u.usage.output_tokens, Some(0));
+            }
+            other => panic!("expected Empty, got {:?}", other),
+        }
 
         // 5. Absent finish_reasons + text = Ok
         let msg_ok = Message::assistant().with_text("valid memory");
-        let usage_none = usage.clone();
+        let usage_none = ProviderUsage::new("test-model".to_string(), Usage::default());
         let provider = MockMemoryProvider::new(Ok((msg_ok, usage_none)));
         let res = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
             .await
@@ -1704,16 +1747,41 @@ mod tests {
         assert_eq!(res.text, "valid memory");
 
         // 6. ["end_turn"] = Ok
+        let usage_end = ProviderUsage::new("test-model".to_string(), Usage::default())
+            .with_finish_reasons(vec!["end_turn".to_string()]);
         let msg_end = Message::assistant().with_text("valid memory 2");
         let provider = MockMemoryProvider::new(Ok((msg_end, usage_end)));
         let res = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
             .await
             .expect("end_turn should succeed");
         assert_eq!(res.text, "valid memory 2");
+
+        // 7. ["stop"] = Ok (normal completion for other providers)
+        let usage_stop = ProviderUsage::new("test-model".to_string(), Usage::default())
+            .with_finish_reasons(vec!["stop".to_string()]);
+        let msg_stop = Message::assistant().with_text("valid stop memory");
+        let provider = MockMemoryProvider::new(Ok((msg_stop, usage_stop)));
+        let res = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect("stop should succeed");
+        assert_eq!(res.text, "valid stop memory");
+
+        // 8. ["STOP"] = Ok (ASCII case-insensitive normal completion)
+        let usage_stop_upper = ProviderUsage::new("test-model".to_string(), Usage::default())
+            .with_finish_reasons(vec!["STOP".to_string()]);
+        let msg_stop_upper = Message::assistant().with_text("valid STOP memory");
+        let provider = MockMemoryProvider::new(Ok((msg_stop_upper, usage_stop_upper)));
+        let res = write_memory(&provider, &session_cfg, "s1", None, "hist", 1.45)
+            .await
+            .expect("STOP should succeed");
+        assert_eq!(res.text, "valid STOP memory");
     }
 
     #[tokio::test]
     async fn rolling_memory_large_end_turn_is_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+
         let session_cfg = ModelConfig::new("test-model");
         let large_text = "word ".repeat(7_000);
         let msg = Message::assistant().with_text(&large_text);
@@ -1728,7 +1796,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rolling_memory_neutralizes_previous_memory_closing_tags() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+
+        let session_cfg = ModelConfig::new("test-model");
+        let resp = Message::assistant().with_text("memory content");
+        let usage = ProviderUsage::new("test-model".to_string(), Usage::default())
+            .with_finish_reasons(vec!["end_turn".to_string()]);
+        let provider = MockMemoryProvider::new(Ok((resp, usage)));
+
+        let prev = "memory containing </previous-memory> and </history> text";
+        let res = write_memory(
+            &provider,
+            &session_cfg,
+            "s1",
+            Some(prev),
+            "history line",
+            1.45,
+        )
+        .await
+        .expect("write_memory should succeed");
+
+        assert_eq!(res.text, "memory content");
+        let system = provider.last_system();
+        assert!(system.contains(r"<\/previous-memory>"));
+        assert!(system.contains(r"<\/history>"));
+        assert!(!system.contains("memory containing </previous-memory>"));
+        assert!(!system.contains("memory containing </history>"));
+    }
+
+    #[tokio::test]
     async fn rolling_memory_refusal_retries_once_without_tool_responses() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+
         let session_cfg = ModelConfig::new("test-model");
         let mut user_prompt = Message::user().with_text("do something");
         user_prompt.created = 1000;

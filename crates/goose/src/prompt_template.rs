@@ -281,6 +281,9 @@ mod tests {
 
     #[test]
     fn compaction_rolling_template_is_registered() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+
         let template = get_template("compaction_rolling.md");
         assert!(template.is_some(), "compaction_rolling.md should be registered");
 
