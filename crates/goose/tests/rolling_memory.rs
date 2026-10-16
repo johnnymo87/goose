@@ -27,10 +27,12 @@ struct CapturedRequest {
     messages: Vec<Message>,
 }
 
+type ResponseQueue = Arc<Mutex<VecDeque<Result<(Message, ProviderUsage), ProviderError>>>>;
+
 struct MockRollingProvider {
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
-    memory_responses: Arc<Mutex<VecDeque<Result<(Message, ProviderUsage), ProviderError>>>>,
-    main_responses: Arc<Mutex<VecDeque<Result<(Message, ProviderUsage), ProviderError>>>>,
+    memory_responses: ResponseQueue,
+    main_responses: ResponseQueue,
     manages_own_context: bool,
     session_manager: Option<Arc<goose::session::SessionManager>>,
     session_id: Option<String>,
@@ -171,7 +173,11 @@ impl Provider for MockRollingProvider {
                 m.as_concat_text()
                     .contains("Write your memory of the history in the system prompt.")
             });
-        if is_memory && self.block_memory_call.load(std::sync::atomic::Ordering::SeqCst) {
+        if is_memory
+            && self
+                .block_memory_call
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
             self.memory_call_entered.notify_waiters();
             self.memory_call_gate.notified().await;
         }
@@ -200,7 +206,11 @@ impl Provider for MockRollingProvider {
                 m.as_concat_text()
                     .contains("Write your memory of the history in the system prompt.")
             });
-        if is_memory && self.block_memory_call.load(std::sync::atomic::Ordering::SeqCst) {
+        if is_memory
+            && self
+                .block_memory_call
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
             self.memory_call_entered.notify_waiters();
             self.memory_call_gate.notified().await;
         }
@@ -277,7 +287,7 @@ async fn setup_test_session(
         .config
         .session_manager
         .update(&session.id)
-        .usage(usage.clone())
+        .usage(usage)
         .accumulated_usage(usage)
         .apply()
         .await?;
@@ -356,7 +366,11 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
 
     let provider = Arc::new(MockRollingProvider::new());
     agent
-        .update_provider(provider.clone(), ModelConfig::new("mock-model"), &session.id)
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
         .await?;
 
     let new_user_prompt = Message::user().with_text("Turn 4 new user prompt");
@@ -426,7 +440,10 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
         .expect("main provider call must exist");
 
     let main_msgs = &main_call.messages;
-    assert!(main_msgs.len() >= 3, "main call must see memory pair + tail");
+    assert!(
+        main_msgs.len() >= 3,
+        "main call must see memory pair + tail"
+    );
     assert_eq!(
         rolling::fold_part(&main_msgs[0]),
         Some("recall"),
@@ -438,7 +455,11 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
         "second message seen by main call must be memory"
     );
     assert!(
-        main_msgs.last().unwrap().as_concat_text().starts_with("Turn 4 new user prompt"),
+        main_msgs
+            .last()
+            .unwrap()
+            .as_concat_text()
+            .starts_with("Turn 4 new user prompt"),
         "last message seen by main call must be the new prompt"
     );
 
@@ -466,7 +487,11 @@ async fn rolling_off_by_default_no_memory_call() -> Result<()> {
 
     let provider = Arc::new(MockRollingProvider::new());
     agent
-        .update_provider(provider.clone(), ModelConfig::new("mock-model"), &session.id)
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
         .await?;
 
     let user_msg = Message::user().with_text("Hello off by default");
@@ -479,7 +504,7 @@ async fn rolling_off_by_default_no_memory_call() -> Result<()> {
 
     let reply_stream = agent.reply(user_msg, session_config, false, None).await?;
     tokio::pin!(reply_stream);
-    while let Some(_) = reply_stream.next().await {}
+    while reply_stream.next().await.is_some() {}
 
     assert_eq!(
         provider.memory_call_count(),
@@ -533,7 +558,11 @@ async fn rolling_skips_threshold_auto_compaction() -> Result<()> {
 
     let provider = Arc::new(MockRollingProvider::new());
     agent
-        .update_provider(provider.clone(), ModelConfig::new("mock-model"), &session.id)
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
         .await?;
 
     let user_msg = Message::user().with_text("Testing threshold skipped");
@@ -638,7 +667,11 @@ async fn rolling_failure_proceeds_and_counts() -> Result<()> {
     }));
 
     agent
-        .update_provider(provider.clone(), ModelConfig::new("mock-model"), &session.id)
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
         .await?;
 
     let session_config = SessionConfig {
@@ -658,7 +691,7 @@ async fn rolling_failure_proceeds_and_counts() -> Result<()> {
         )
         .await?;
     tokio::pin!(stream1);
-    while let Some(_) = stream1.next().await {}
+    while stream1.next().await.is_some() {}
 
     let s1 = agent
         .config
@@ -690,7 +723,7 @@ async fn rolling_failure_proceeds_and_counts() -> Result<()> {
         )
         .await?;
     tokio::pin!(stream2);
-    while let Some(_) = stream2.next().await {}
+    while stream2.next().await.is_some() {}
 
     let s2 = agent
         .config
@@ -714,7 +747,7 @@ async fn rolling_failure_proceeds_and_counts() -> Result<()> {
         )
         .await?;
     tokio::pin!(stream3);
-    while let Some(_) = stream3.next().await {}
+    while stream3.next().await.is_some() {}
 
     let mem_calls_after = provider.memory_call_count();
     assert_eq!(
@@ -734,7 +767,7 @@ async fn rolling_failure_proceeds_and_counts() -> Result<()> {
         )
         .await?;
     tokio::pin!(stream4);
-    while let Some(_) = stream4.next().await {}
+    while stream4.next().await.is_some() {}
 
     let s4 = agent
         .config
@@ -787,7 +820,11 @@ async fn rolling_refuses_unrolled_agent_loop() -> Result<()> {
 
     let provider = Arc::new(MockRollingProvider::new());
     agent
-        .update_provider(provider.clone(), ModelConfig::new("mock-model"), &session.id)
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
         .await?;
 
     let user_msg = Message::user().with_text("run state machine");
@@ -804,7 +841,9 @@ async fn rolling_refuses_unrolled_agent_loop() -> Result<()> {
         Ok(_) => panic!("unrolled agent loop must be refused"),
     };
     assert!(
-        err_msg.contains("rolling memory is on for this session; the unrolled agent loop is not supported"),
+        err_msg.contains(
+            "rolling memory is on for this session; the unrolled agent loop is not supported"
+        ),
         "error must contain expected message: {err_msg}"
     );
 
@@ -865,7 +904,11 @@ async fn rolling_metrics_use_retained_form() -> Result<()> {
         session.id.clone(),
     ));
     agent
-        .update_provider(provider.clone(), ModelConfig::new("mock-model"), &session.id)
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
         .await?;
 
     let session_config = SessionConfig {
@@ -884,7 +927,7 @@ async fn rolling_metrics_use_retained_form() -> Result<()> {
         )
         .await?;
     tokio::pin!(reply_stream);
-    while let Some(_) = reply_stream.next().await {}
+    while reply_stream.next().await.is_some() {}
 
     let updated_session = agent
         .config
@@ -982,7 +1025,11 @@ async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     agent
-        .update_provider(provider.clone(), ModelConfig::new("mock-model"), &session.id)
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
         .await?;
 
     let cancel_token = tokio_util::sync::CancellationToken::new();

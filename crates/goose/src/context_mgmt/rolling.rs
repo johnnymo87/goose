@@ -71,9 +71,9 @@ impl From<RollingMemorySettings> for RollingMemoryDto {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RollingState {
-    pub ratio: f64,                       // default DEFAULT_RATIO
-    pub consecutive_failures: u32,        // default 0
-    pub failed_at_estimate: Option<u64>,  // default None
+    pub ratio: f64,                      // default DEFAULT_RATIO
+    pub consecutive_failures: u32,       // default 0
+    pub failed_at_estimate: Option<u64>, // default None
 }
 
 impl Default for RollingState {
@@ -241,9 +241,7 @@ pub fn is_retained(usage: &Usage) -> bool {
 /// left an assistant message (~3643); empty responses and retries record usage with no anchor, and
 /// after a fold the newest anchor may predate the session's usage. A mismatch -> None.
 pub fn anchor_index(messages: &[Message], session_usage: &Usage) -> Option<usize> {
-    let last_usage_idx = messages
-        .iter()
-        .rposition(|m| m.metadata.usage.is_some())?;
+    let last_usage_idx = messages.iter().rposition(|m| m.metadata.usage.is_some())?;
 
     let msg_usage = messages[last_usage_idx].metadata.usage.as_ref()?;
     if msg_usage.input_tokens == session_usage.input_tokens
@@ -263,6 +261,7 @@ pub fn anchor_index(messages: &[Message], session_usage: &Usage) -> Option<usize
 ///   unlike a frozen value, keeps growing if no later call overwrites it)
 /// - anchor None               -> ratio * sum(counts)
 /// - otherwise                 -> total + ratio * sum(counts[anchor+1..])
+///
 /// The fallbacks omit system + tools; Task 5 adds ratio * base_o200k to them only on the slow path.
 pub fn estimate(usage: &Usage, messages: &[Message], counts: &[usize], ratio: f64) -> u64 {
     let fallback = || -> u64 {
@@ -452,7 +451,7 @@ pub enum Decision {
 /// - planned = ratio*(base_o200k + tail_o200k) + MEMORY_ALLOWANCE
 ///   planned > GETS_UNDER_FRACTION * budget               -> Skip("would not get under")
 /// - ratio*new_material_o200k < max(MIN_PROGRESS_TOKENS, MIN_PROGRESS_FRACTION*budget)
-///                                                        -> Skip("too little progress")
+///   -> Skip("too little progress")
 /// - else Fold
 pub fn decide(
     estimate: u64,
@@ -534,8 +533,8 @@ pub fn render_history_line(msg: &Message) -> String {
         Role::Assistant => "assistant",
     };
     let old_prefix = format!("[{}]: ", role_str);
-    let dt = chrono::DateTime::from_timestamp(msg.created, 0)
-        .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+    let dt =
+        chrono::DateTime::from_timestamp(msg.created, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
     let stamp = dt.format("%Y-%m-%d %H:%M UTC");
     let new_prefix = format!("[{} {}]: ", role_str, stamp);
 
@@ -601,11 +600,11 @@ pub enum MemoryError {
     #[error("memory call refused: {0}")]
     Refused(String),
     #[error("memory hit the output token limit")]
-    OutputLimit(ProviderUsage),
+    OutputLimit(Box<ProviderUsage>),
     #[error("memory call stopped with {0}")]
-    StopReason(String, ProviderUsage),
+    StopReason(String, Box<ProviderUsage>),
     #[error("memory was empty")]
-    Empty(ProviderUsage),
+    Empty(Box<ProviderUsage>),
     #[error(transparent)]
     Provider(ProviderError),
     #[error(transparent)]
@@ -674,22 +673,22 @@ pub async fn write_memory(
     };
 
     if response.metadata.output_token_limit_reached {
-        return Err(MemoryError::OutputLimit(usage));
+        return Err(MemoryError::OutputLimit(Box::new(usage)));
     }
 
     if let Some(ref reasons) = usage.finish_reasons {
         // "end_turn" (Anthropic) or "stop" (OpenAI and other providers), ASCII case-insensitive.
-        let is_normal_completion = reasons.iter().any(|r| {
-            r.eq_ignore_ascii_case("end_turn") || r.eq_ignore_ascii_case("stop")
-        });
+        let is_normal_completion = reasons
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case("end_turn") || r.eq_ignore_ascii_case("stop"));
         if !reasons.is_empty() && !is_normal_completion {
-            return Err(MemoryError::StopReason(reasons.join(", "), usage));
+            return Err(MemoryError::StopReason(reasons.join(", "), Box::new(usage)));
         }
     }
 
     let text = response.as_concat_text().trim().to_string();
     if text.is_empty() {
-        return Err(MemoryError::Empty(usage));
+        return Err(MemoryError::Empty(Box::new(usage)));
     }
 
     let o200k_tokens = match crate::token_counter::create_token_counter().await {
@@ -756,9 +755,11 @@ pub async fn write_memory_with_retry(
 /// - a memory row: Message::assistant().with_text(memory) with agent_only(), generated id,
 ///   operations note part "memory";
 /// - both rows created = messages[plan.cut].created - 1, recall pushed before memory.
+///
 /// `from`: the previous memory row's note "from" if plan.previous_memory is Some, else the UTC date of
-///   the oldest message before the cut (agent-visible or not). `to`: UTC date of the newest folded row.
-/// Err if any folded row has no id (save_compacted_conversation would reject it anyway; fail early
+/// the oldest message before the cut (agent-visible or not). `to`: UTC date of the newest folded row.
+///
+/// Returns Err if any folded row has no id (save_compacted_conversation would reject it anyway; fail early
 /// with a clear message).
 pub fn fold_rows(
     messages: &[Message],
@@ -779,10 +780,7 @@ pub fn fold_rows(
 
     for &idx in &plan.folded {
         if idx >= plan.cut {
-            anyhow::bail!(
-                "folded message index {idx} is at or after cut {}",
-                plan.cut
-            );
+            anyhow::bail!("folded message index {idx} is at or after cut {}", plan.cut);
         }
         let msg = messages.get(idx).ok_or_else(|| {
             anyhow::anyhow!(
@@ -877,7 +875,7 @@ pub enum FoldOutcome {
     BackedOff,
     Folded {
         conversation: Conversation,
-        usage: ProviderUsage,
+        usage: Box<ProviderUsage>,
         retained: i32,
         memory_tokens: u64,
     },
@@ -986,6 +984,7 @@ async fn persist_state(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_fold(
     session_manager: &SessionManager,
     provider: &dyn Provider,
@@ -1113,7 +1112,7 @@ pub async fn execute_fold(
             let usage = match err {
                 MemoryError::OutputLimit(u)
                 | MemoryError::StopReason(_, u)
-                | MemoryError::Empty(u) => vec![u],
+                | MemoryError::Empty(u) => vec![*u],
                 _ => vec![],
             };
             state.consecutive_failures += 1;
@@ -1189,7 +1188,7 @@ pub async fn execute_fold(
 
     FoldOutcome::Folded {
         conversation: reloaded_conversation,
-        usage: memory.usage,
+        usage: Box::new(memory.usage),
         retained,
         memory_tokens,
     }
@@ -1259,7 +1258,7 @@ mod tests {
         data.set_extension_state(
             SETTINGS_KEY.0,
             SETTINGS_KEY.1,
-            serde_json::to_value(&settings).unwrap(),
+            serde_json::to_value(settings).unwrap(),
         );
         let env = make_env(&[]);
         assert_eq!(resolve_settings(&data, env), Some(settings));
@@ -1379,12 +1378,10 @@ mod tests {
         assert!(!is_genuine_prompt(&user_only_msg));
 
         // User message with text + tool response is not genuine
-        let user_tool_res = Message::user()
-            .with_text("Some text")
-            .with_tool_response(
-                "call_1",
-                Ok(CallToolResult::success(vec![ContentBlock::text("ok")])),
-            );
+        let user_tool_res = Message::user().with_text("Some text").with_tool_response(
+            "call_1",
+            Ok(CallToolResult::success(vec![ContentBlock::text("ok")])),
+        );
         assert!(!is_genuine_prompt(&user_tool_res));
 
         // Steer is not genuine
@@ -1498,9 +1495,9 @@ mod tests {
     fn rolling_cut_tail_starts_at_genuine_prompt() {
         // Walk lands on a tool response; cut snaps back to user prompt that started that turn.
         let messages = vec![
-            Message::user().with_text("turn 1 prompt"),    // 0
+            Message::user().with_text("turn 1 prompt"),     // 0
             Message::assistant().with_text("turn 1 reply"), // 1
-            Message::user().with_text("turn 2 prompt"),    // 2 (genuine prompt)
+            Message::user().with_text("turn 2 prompt"),     // 2 (genuine prompt)
             Message::assistant().with_tool_request("t1", Ok(CallToolRequestParams::new("tool"))), // 3
             Message::user().with_tool_response(
                 "t1",
@@ -1531,12 +1528,12 @@ mod tests {
         let nudge_msg = Message::user().with_text(FINAL_OUTPUT_CONTINUATION_MESSAGE);
 
         let messages = vec![
-            Message::user().with_text("turn 1 prompt"), // 0
+            Message::user().with_text("turn 1 prompt"),     // 0
             Message::assistant().with_text("turn 1 reply"), // 1
-            Message::user().with_text("turn 2 prompt"), // 2: genuine
-            tc_msg,                                     // 3
-            steer_msg,                                  // 4
-            nudge_msg,                                  // 5
+            Message::user().with_text("turn 2 prompt"),     // 2: genuine
+            tc_msg,                                         // 3
+            steer_msg,                                      // 4
+            nudge_msg,                                      // 5
             Message::assistant().with_text("turn 2 reply"), // 6
         ];
         let counts = vec![100, 100, 50, 20, 20, 20, 100];
@@ -1550,7 +1547,7 @@ mod tests {
     #[test]
     fn rolling_cut_ignores_agent_invisible_history() {
         let mut messages = vec![
-            Message::user().with_text("turn 1 prompt"),    // 0
+            Message::user().with_text("turn 1 prompt"),     // 0
             Message::assistant().with_text("turn 1 reply"), // 1
         ];
         let mut counts = vec![100, 100];
@@ -1585,9 +1582,9 @@ mod tests {
     fn rolling_cut_single_turn_bigger_than_tail() {
         // One prompt + huge tool-heavy turn after earlier turns -> cut is that prompt; everything before folds.
         let messages = vec![
-            Message::user().with_text("turn 1 prompt"),    // 0
+            Message::user().with_text("turn 1 prompt"),     // 0
             Message::assistant().with_text("turn 1 reply"), // 1
-            Message::user().with_text("turn 2 prompt"),    // 2
+            Message::user().with_text("turn 2 prompt"),     // 2
             Message::assistant().with_tool_request("t1", Ok(CallToolRequestParams::new("tool"))), // 3
             Message::user().with_tool_response(
                 "t1",
@@ -1706,7 +1703,7 @@ mod tests {
         // Parallel-call message (two requests in one message) where only one response crosses -> Err
         let messages_parallel = vec![
             Message::user().with_text("turn 1 prompt"), // 0
-            Message::assistant()                        // 1
+            Message::assistant() // 1
                 .with_tool_request("t_a", Ok(CallToolRequestParams::new("tool_a")))
                 .with_tool_request("t_b", Ok(CallToolRequestParams::new("tool_b"))),
             Message::user().with_tool_response(
@@ -1729,11 +1726,11 @@ mod tests {
     fn rolling_cut_ratio_scales_tail() {
         // ratio 1.45 moves the cut later than ratio 1.0 for the same tail_tokens
         let messages = vec![
-            Message::user().with_text("prompt 0"),    // 0
+            Message::user().with_text("prompt 0"),     // 0
             Message::assistant().with_text("reply 0"), // 1
-            Message::user().with_text("prompt 1"),    // 2
+            Message::user().with_text("prompt 1"),     // 2
             Message::assistant().with_text("reply 1"), // 3
-            Message::user().with_text("prompt 2"),    // 4
+            Message::user().with_text("prompt 2"),     // 4
             Message::assistant().with_text("reply 2"), // 5
         ];
         let counts = vec![50, 50, 50, 50, 50, 50];
@@ -1954,7 +1951,9 @@ mod tests {
         captured_systems: std::sync::Mutex<Vec<String>>,
         captured_messages: std::sync::Mutex<Vec<Vec<Message>>>,
         captured_tools: std::sync::Mutex<Vec<Vec<rmcp::model::Tool>>>,
-        responses: std::sync::Mutex<std::collections::VecDeque<Result<(Message, ProviderUsage), ProviderError>>>,
+        responses: std::sync::Mutex<
+            std::collections::VecDeque<Result<(Message, ProviderUsage), ProviderError>>,
+        >,
         calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -1988,15 +1987,30 @@ mod tests {
         }
 
         fn last_config(&self) -> ModelConfig {
-            self.captured_configs.lock().unwrap().last().cloned().unwrap()
+            self.captured_configs
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap()
         }
 
         fn last_system(&self) -> String {
-            self.captured_systems.lock().unwrap().last().cloned().unwrap()
+            self.captured_systems
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap()
         }
 
         fn last_messages(&self) -> Vec<Message> {
-            self.captured_messages.lock().unwrap().last().cloned().unwrap()
+            self.captured_messages
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap()
         }
 
         fn last_tools(&self) -> Vec<rmcp::model::Tool> {
@@ -2027,10 +2041,20 @@ mod tests {
             messages: &[Message],
             tools: &[rmcp::model::Tool],
         ) -> Result<(Message, ProviderUsage), ProviderError> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.captured_configs.lock().unwrap().push(model_config.clone());
-            self.captured_systems.lock().unwrap().push(system.to_string());
-            self.captured_messages.lock().unwrap().push(messages.to_vec());
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.captured_configs
+                .lock()
+                .unwrap()
+                .push(model_config.clone());
+            self.captured_systems
+                .lock()
+                .unwrap()
+                .push(system.to_string());
+            self.captured_messages
+                .lock()
+                .unwrap()
+                .push(messages.to_vec());
             self.captured_tools.lock().unwrap().push(tools.to_vec());
 
             let mut queue = self.responses.lock().unwrap();
@@ -2045,7 +2069,8 @@ mod tests {
     #[tokio::test]
     async fn rolling_memory_request_shape() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
 
         let usage = ProviderUsage::new("test-model".to_string(), Usage::default())
             .with_finish_reasons(vec!["end_turn".to_string()]);
@@ -2110,7 +2135,8 @@ mod tests {
     #[tokio::test]
     async fn rolling_memory_failures() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
 
         let session_cfg = ModelConfig::new("test-model");
 
@@ -2229,7 +2255,8 @@ mod tests {
     #[tokio::test]
     async fn rolling_memory_large_end_turn_is_success() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
 
         let session_cfg = ModelConfig::new("test-model");
         let large_text = "word ".repeat(7_000);
@@ -2247,7 +2274,8 @@ mod tests {
     #[tokio::test]
     async fn rolling_memory_neutralizes_previous_memory_closing_tags() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
 
         let session_cfg = ModelConfig::new("test-model");
         let resp = Message::assistant().with_text("memory content");
@@ -2278,7 +2306,8 @@ mod tests {
     #[tokio::test]
     async fn rolling_memory_refusal_retries_once_without_tool_responses() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
 
         let session_cfg = ModelConfig::new("test-model");
         let mut user_prompt = Message::user().with_text("do something");
@@ -2320,17 +2349,10 @@ mod tests {
         ];
         let provider = MockMemoryProvider::new_queue(responses);
 
-        let res = write_memory_with_retry(
-            &provider,
-            &session_cfg,
-            "s1",
-            None,
-            &messages,
-            &plan,
-            1.45,
-        )
-        .await
-        .expect("retry should succeed");
+        let res =
+            write_memory_with_retry(&provider, &session_cfg, "s1", None, &messages, &plan, 1.45)
+                .await
+                .expect("retry should succeed");
         assert_eq!(res.text, "retried memory");
         assert_eq!(provider.call_count(), 2);
 
@@ -2354,17 +2376,10 @@ mod tests {
             }),
         ];
         let provider2 = MockMemoryProvider::new_queue(responses_both_refused);
-        let err2 = write_memory_with_retry(
-            &provider2,
-            &session_cfg,
-            "s2",
-            None,
-            &messages,
-            &plan,
-            1.45,
-        )
-        .await
-        .expect_err("second refusal should be returned as Refused");
+        let err2 =
+            write_memory_with_retry(&provider2, &session_cfg, "s2", None, &messages, &plan, 1.45)
+                .await
+                .expect_err("second refusal should be returned as Refused");
         match err2 {
             MemoryError::Refused(d) => assert_eq!(d, "refusal 2"),
             other => panic!("expected Refused, got {:?}", other),
@@ -2372,22 +2387,17 @@ mod tests {
         assert_eq!(provider2.call_count(), 2);
 
         // Case 3: Non-refusal failure on first call is NOT retried
-        let responses_server_error = vec![
-            Err(ProviderError::ServerError("server down".to_string())),
-        ];
+        let responses_server_error =
+            vec![Err(ProviderError::ServerError("server down".to_string()))];
         let provider3 = MockMemoryProvider::new_queue(responses_server_error);
-        let err3 = write_memory_with_retry(
-            &provider3,
-            &session_cfg,
-            "s3",
-            None,
-            &messages,
-            &plan,
-            1.45,
-        )
-        .await
-        .expect_err("server error should fail without retry");
-        assert!(matches!(err3, MemoryError::Provider(ProviderError::ServerError(_))));
+        let err3 =
+            write_memory_with_retry(&provider3, &session_cfg, "s3", None, &messages, &plan, 1.45)
+                .await
+                .expect_err("server error should fail without retry");
+        assert!(matches!(
+            err3,
+            MemoryError::Provider(ProviderError::ServerError(_))
+        ));
         assert_eq!(provider3.call_count(), 1);
     }
 
@@ -2423,7 +2433,10 @@ mod tests {
         for (i, &folded_idx) in plan.folded.iter().enumerate() {
             assert_eq!(rows[i].id, messages[folded_idx].id);
             assert!(!rows[i].is_agent_visible());
-            assert_eq!(rows[i].is_user_visible(), messages[folded_idx].is_user_visible());
+            assert_eq!(
+                rows[i].is_user_visible(),
+                messages[folded_idx].is_user_visible()
+            );
         }
 
         // Two new rows: recall first, then memory
@@ -2438,11 +2451,17 @@ mod tests {
         assert_eq!(recall.created, msg3.created - 1);
         assert_eq!(fold_part(recall), Some("recall"));
         assert_eq!(
-            recall.metadata.operation_note(OPERATION_KEY, "from").and_then(|v| v.as_str()),
+            recall
+                .metadata
+                .operation_note(OPERATION_KEY, "from")
+                .and_then(|v| v.as_str()),
             Some("2026-10-10")
         );
         assert_eq!(
-            recall.metadata.operation_note(OPERATION_KEY, "to").and_then(|v| v.as_str()),
+            recall
+                .metadata
+                .operation_note(OPERATION_KEY, "to")
+                .and_then(|v| v.as_str()),
             Some("2026-10-12")
         );
         assert_eq!(
@@ -2458,11 +2477,17 @@ mod tests {
         assert_eq!(memory.created, msg3.created - 1);
         assert_eq!(fold_part(memory), Some("memory"));
         assert_eq!(
-            memory.metadata.operation_note(OPERATION_KEY, "from").and_then(|v| v.as_str()),
+            memory
+                .metadata
+                .operation_note(OPERATION_KEY, "from")
+                .and_then(|v| v.as_str()),
             Some("2026-10-10")
         );
         assert_eq!(
-            memory.metadata.operation_note(OPERATION_KEY, "to").and_then(|v| v.as_str()),
+            memory
+                .metadata
+                .operation_note(OPERATION_KEY, "to")
+                .and_then(|v| v.as_str()),
             Some("2026-10-12")
         );
         assert_eq!(memory.as_concat_text(), "first fold memory");
@@ -2493,11 +2518,17 @@ mod tests {
         assert_eq!(recall2.created, msg5_tail.created - 1);
         assert_eq!(memory2.created, msg5_tail.created - 1);
         assert_eq!(
-            recall2.metadata.operation_note(OPERATION_KEY, "from").and_then(|v| v.as_str()),
+            recall2
+                .metadata
+                .operation_note(OPERATION_KEY, "from")
+                .and_then(|v| v.as_str()),
             Some("2026-10-10")
         );
         assert_eq!(
-            recall2.metadata.operation_note(OPERATION_KEY, "to").and_then(|v| v.as_str()),
+            recall2
+                .metadata
+                .operation_note(OPERATION_KEY, "to")
+                .and_then(|v| v.as_str()),
             Some("2026-10-16")
         );
         assert_eq!(
@@ -2505,11 +2536,17 @@ mod tests {
             "What do you remember from 2026-10-10 to 2026-10-16?"
         );
         assert_eq!(
-            memory2.metadata.operation_note(OPERATION_KEY, "from").and_then(|v| v.as_str()),
+            memory2
+                .metadata
+                .operation_note(OPERATION_KEY, "from")
+                .and_then(|v| v.as_str()),
             Some("2026-10-10")
         );
         assert_eq!(
-            memory2.metadata.operation_note(OPERATION_KEY, "to").and_then(|v| v.as_str()),
+            memory2
+                .metadata
+                .operation_note(OPERATION_KEY, "to")
+                .and_then(|v| v.as_str()),
             Some("2026-10-16")
         );
         assert_eq!(memory2.as_concat_text(), "second fold memory");
@@ -2568,7 +2605,9 @@ mod tests {
         };
 
         let compacted = fold_rows(initial_messages, &plan, "summary of folded history").unwrap();
-        sm.save_compacted_conversation(&session.id, &compacted).await.unwrap();
+        sm.save_compacted_conversation(&session.id, &compacted)
+            .await
+            .unwrap();
 
         let reloaded = sm.get_session(&session.id, true).await.unwrap();
         let reloaded_conv = reloaded.conversation.unwrap();
@@ -2590,22 +2629,34 @@ mod tests {
         // assert only that the pair comes after every row with created <= T-1
         // and before the tail's first message; pre-cut rows with created == T sort after the pair.
         let raw = reloaded_conv.messages();
-        let recall_pos = raw.iter().position(|m| fold_part(m) == Some("recall")).unwrap();
-        let memory_pos = raw.iter().position(|m| fold_part(m) == Some("memory")).unwrap();
+        let recall_pos = raw
+            .iter()
+            .position(|m| fold_part(m) == Some("recall"))
+            .unwrap();
+        let memory_pos = raw
+            .iter()
+            .position(|m| fold_part(m) == Some("memory"))
+            .unwrap();
         assert_eq!(recall_pos + 1, memory_pos);
 
-        let tail_first_pos = raw.iter().position(|m| m.id == initial_messages[4].id).unwrap();
+        let tail_first_pos = raw
+            .iter()
+            .position(|m| m.id == initial_messages[4].id)
+            .unwrap();
         assert!(memory_pos < tail_first_pos);
 
         // Every row with created <= T-1 must come before recall_pos
         for (idx, m) in raw.iter().enumerate() {
-            if m.created <= t - 1 && fold_part(m).is_none() {
+            if m.created < t && fold_part(m).is_none() {
                 assert!(idx < recall_pos);
             }
         }
 
         // Pre-cut row with created == T (initial_messages[3]) sorts after the pair
-        let m3_pos = raw.iter().position(|m| m.id == initial_messages[3].id).unwrap();
+        let m3_pos = raw
+            .iter()
+            .position(|m| m.id == initial_messages[3].id)
+            .unwrap();
         assert!(m3_pos > memory_pos);
 
         // 4. user-visible messages unchanged in count and order (the pair is user-invisible)
@@ -2664,8 +2715,8 @@ mod tests {
             new_material_o200k: 50,
             tail_o200k: 50,
         };
-        let err = fold_rows(&messages, &plan, "mem")
-            .expect_err("should reject folded at or after cut");
+        let err =
+            fold_rows(&messages, &plan, "mem").expect_err("should reject folded at or after cut");
         assert!(err.to_string().contains("at or after cut"));
     }
 
@@ -2688,7 +2739,8 @@ mod tests {
     #[tokio::test]
     async fn rolling_check_under_budget_returns_none() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
         let sm = SessionManager::new(temp_dir.path().to_path_buf());
         let session = sm
             .create_session(
@@ -2714,7 +2766,8 @@ mod tests {
     #[tokio::test]
     async fn rolling_check_backed_off_returns_none() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
         let sm = SessionManager::new(temp_dir.path().to_path_buf());
         let mut session = sm
             .create_session(
@@ -2749,7 +2802,8 @@ mod tests {
     #[tokio::test]
     async fn rolling_check_cheap_path_matches_full_estimate() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let _guard =
+            env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
         let sm = SessionManager::new(temp_dir.path().to_path_buf());
         let mut session = sm
             .create_session(
@@ -2792,8 +2846,17 @@ mod tests {
             tail_tokens: 2_000,
         };
 
-        let pending = check(&session, &settings, &conv).await.unwrap().expect("should return pending");
-        assert_eq!(pending.est, full_est, "cheap path est must match full estimate exactly");
-        assert_eq!(pending.counts, full_counts, "pending counts must match full message counts");
+        let pending = check(&session, &settings, &conv)
+            .await
+            .unwrap()
+            .expect("should return pending");
+        assert_eq!(
+            pending.est, full_est,
+            "cheap path est must match full estimate exactly"
+        );
+        assert_eq!(
+            pending.counts, full_counts,
+            "pending counts must match full message counts"
+        );
     }
 }
