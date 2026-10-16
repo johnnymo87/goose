@@ -36,13 +36,7 @@ pub struct RollingMemorySettings {
 impl RollingMemorySettings {
     /// 0 < tail < budget. Returns a message for invalid_params otherwise.
     pub fn validate(&self) -> Result<(), String> {
-        if self.tail_tokens == 0 {
-            return Err("tailTokens must be greater than 0".to_string());
-        }
-        if self.tail_tokens >= self.budget_tokens {
-            return Err("tailTokens must be less than budgetTokens".to_string());
-        }
-        Ok(())
+        RollingMemoryDto::from(*self).validate()
     }
 }
 
@@ -64,7 +58,7 @@ impl From<RollingMemorySettings> for RollingMemoryDto {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RollingState {
     pub ratio: f64,                       // default DEFAULT_RATIO
@@ -163,7 +157,15 @@ fn settings_from_env(env: impl Fn(&str) -> Option<String>) -> Option<RollingMemo
 
 pub fn read_state(data: &ExtensionData) -> RollingState {
     match data.get_extension_state(STATE_KEY.0, STATE_KEY.1) {
-        Some(val) => serde_json::from_value(val.clone()).unwrap_or_default(),
+        Some(val) => match serde_json::from_value(val.clone()) {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to deserialize rolling memory state from extension_data: {err}"
+                );
+                RollingState::default()
+            }
+        },
         None => RollingState::default(),
     }
 }
@@ -186,7 +188,6 @@ pub fn write_settings(data: &mut ExtensionData, settings: Option<RollingMemorySe
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use goose_sdk_types::custom_requests::SetSessionSettingsRequest;
 
     fn make_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = vars
@@ -292,31 +293,32 @@ mod tests {
     }
 
     #[test]
-    fn settings_request_rolling_memory_absent() {
-        let req: SetSessionSettingsRequest =
-            serde_json::from_str(r#"{"sessionId":"abc"}"#).unwrap();
-        assert_eq!(req.rolling_memory, None);
+    fn rolling_settings_validate_zero_tail_invalid() {
+        let settings = RollingMemorySettings {
+            budget_tokens: 100_000,
+            tail_tokens: 0,
+        };
+        assert!(settings.validate().is_err());
     }
 
     #[test]
-    fn settings_request_rolling_memory_null() {
-        let req: SetSessionSettingsRequest =
-            serde_json::from_str(r#"{"sessionId":"abc","rollingMemory":null}"#).unwrap();
-        assert_eq!(req.rolling_memory, Some(None));
+    fn rolling_resolve_unparsable_env() {
+        let data = ExtensionData::default();
+        let env_bad_budget = make_env(&[(ENV_BUDGET, "not-a-number"), (ENV_TAIL, "60000")]);
+        assert_eq!(resolve_settings(&data, env_bad_budget), None);
+
+        let env_bad_tail = make_env(&[(ENV_BUDGET, "150000"), (ENV_TAIL, "invalid")]);
+        assert_eq!(resolve_settings(&data, env_bad_tail), None);
     }
 
     #[test]
-    fn settings_request_rolling_memory_object() {
-        let req: SetSessionSettingsRequest = serde_json::from_str(
-            r#"{"sessionId":"abc","rollingMemory":{"budgetTokens":1000,"tailTokens":500}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            req.rolling_memory,
-            Some(Some(RollingMemoryDto {
-                budget_tokens: 1000,
-                tail_tokens: 500,
-            }))
+    fn rolling_state_invalid_defaults() {
+        let mut data = ExtensionData::default();
+        data.set_extension_state(
+            STATE_KEY.0,
+            STATE_KEY.1,
+            serde_json::json!({"ratio": "not-a-float"}),
         );
+        assert_eq!(read_state(&data), RollingState::default());
     }
 }
