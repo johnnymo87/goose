@@ -1,6 +1,7 @@
-// Modified by Jonathan Mohrbacher, 2026: rolling memory pure planning; memory call.
+// Modified by Jonathan Mohrbacher, 2026: rolling memory pure planning; memory call; materialize fold.
 use crate::agents::final_output_tool::FINAL_OUTPUT_CONTINUATION_MESSAGE;
-use crate::conversation::message::{Message, MessageContentBlock};
+use crate::conversation::message::{Message, MessageContentBlock, MessageMetadata};
+use crate::conversation::Conversation;
 use crate::session::ExtensionData;
 use goose_providers::base::Provider;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
@@ -748,9 +749,115 @@ pub async fn write_memory_with_retry(
     }
 }
 
+/// Design §5. Returns the conversation to hand to SessionManager::save_compacted_conversation:
+/// - every index in plan.folded, cloned with metadata.with_agent_invisible() (ids unchanged);
+/// - a recall row: Message::user().with_text(format!("What do you remember from {from} to {to}?"))
+///   with MessageMetadata::agent_only(), a generated id, operations note part "recall";
+/// - a memory row: Message::assistant().with_text(memory) with agent_only(), generated id,
+///   operations note part "memory";
+/// - both rows created = messages[plan.cut].created - 1, recall pushed before memory.
+/// `from`: the previous memory row's note "from" if plan.previous_memory is Some, else the UTC date of
+///   the oldest message before the cut (agent-visible or not). `to`: UTC date of the newest folded row.
+/// Err if any folded row has no id (save_compacted_conversation would reject it anyway; fail early
+/// with a clear message).
+pub fn fold_rows(
+    messages: &[Message],
+    plan: &CutPlan,
+    memory: &str,
+) -> anyhow::Result<Conversation> {
+    let cut_msg = messages.get(plan.cut).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cut index {} out of bounds for {} messages",
+            plan.cut,
+            messages.len()
+        )
+    })?;
+
+    for &idx in &plan.folded {
+        let msg = messages.get(idx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "folded message index {idx} out of bounds for {} messages",
+                messages.len()
+            )
+        })?;
+        if msg.id.is_none() {
+            anyhow::bail!("folded message at index {idx} has no id");
+        }
+    }
+
+    let from = match plan
+        .previous_memory
+        .and_then(|idx| messages.get(idx))
+        .and_then(|m| m.metadata.operation_note(OPERATION_KEY, "from"))
+        .and_then(|v| v.as_str())
+    {
+        Some(prev_from) => prev_from.to_string(),
+        None => {
+            let oldest = messages[..plan.cut]
+                .iter()
+                .min_by_key(|m| m.created)
+                .unwrap_or(cut_msg);
+            chrono::DateTime::from_timestamp(oldest.created, 0)
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .format("%Y-%m-%d")
+                .to_string()
+        }
+    };
+
+    let newest_folded = plan
+        .folded
+        .iter()
+        .filter_map(|&idx| messages.get(idx))
+        .max_by_key(|m| m.created)
+        .unwrap_or(cut_msg);
+
+    let to = chrono::DateTime::from_timestamp(newest_folded.created, 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let pair_created = cut_msg.created - 1;
+
+    let mut recall_metadata = MessageMetadata::agent_only();
+    recall_metadata.set_operation_note(OPERATION_KEY, "part", Value::String("recall".to_string()));
+    recall_metadata.set_operation_note(OPERATION_KEY, "from", Value::String(from.clone()));
+    recall_metadata.set_operation_note(OPERATION_KEY, "to", Value::String(to.clone()));
+
+    let mut recall_msg = Message::user()
+        .with_text(format!("What do you remember from {from} to {to}?"))
+        .with_metadata(recall_metadata)
+        .with_generated_id();
+    recall_msg.created = pair_created;
+
+    let mut memory_metadata = MessageMetadata::agent_only();
+    memory_metadata.set_operation_note(OPERATION_KEY, "part", Value::String("memory".to_string()));
+    memory_metadata.set_operation_note(OPERATION_KEY, "from", Value::String(from));
+    memory_metadata.set_operation_note(OPERATION_KEY, "to", Value::String(to));
+
+    let mut memory_msg = Message::assistant()
+        .with_text(memory)
+        .with_metadata(memory_metadata)
+        .with_generated_id();
+    memory_msg.created = pair_created;
+
+    let mut out_messages = Vec::with_capacity(plan.folded.len() + 2);
+    for &idx in &plan.folded {
+        let msg = &messages[idx];
+        let mut cloned = msg.clone();
+        cloned.metadata = cloned.metadata.with_agent_invisible();
+        out_messages.push(cloned);
+    }
+    out_messages.push(recall_msg);
+    out_messages.push(memory_msg);
+
+    Ok(Conversation::new_unvalidated(out_messages))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GooseMode;
+    use crate::session::{SessionManager, SessionType};
     use std::collections::HashMap;
 
     fn make_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -1940,5 +2047,265 @@ mod tests {
         .expect_err("server error should fail without retry");
         assert!(matches!(err3, MemoryError::Provider(ProviderError::ServerError(_))));
         assert_eq!(provider3.call_count(), 1);
+    }
+
+    #[test]
+    fn rolling_fold_rows_shape() {
+        // Message 0: 2026-10-10 10:00:00 UTC (1791636000)
+        let mut msg0 = Message::user().with_text("msg0").with_generated_id();
+        msg0.created = 1791636000;
+        // Message 1: 2026-10-11 10:00:00 UTC (1791722400)
+        let mut msg1 = Message::assistant().with_text("msg1").with_generated_id();
+        msg1.created = 1791722400;
+        // Message 2: 2026-10-12 10:00:00 UTC (1791808800)
+        let mut msg2 = Message::user().with_text("msg2").with_generated_id();
+        msg2.created = 1791808800;
+        // Tail: Message 3 at 2026-10-15 10:00:00 UTC (1792068000)
+        let mut msg3 = Message::user().with_text("msg3").with_generated_id();
+        msg3.created = 1792068000;
+
+        let messages = vec![msg0.clone(), msg1.clone(), msg2.clone(), msg3.clone()];
+        let plan = CutPlan {
+            cut: 3,
+            folded: vec![0, 1, 2],
+            previous_memory: None,
+            new_material_o200k: 100,
+            tail_o200k: 100,
+        };
+
+        let conv = fold_rows(&messages, &plan, "first fold memory").unwrap();
+        let rows = conv.messages();
+        assert_eq!(rows.len(), 5); // 3 folded + recall + memory
+
+        // Folded rows have agent_visible = false, IDs kept
+        for (i, &folded_idx) in plan.folded.iter().enumerate() {
+            assert_eq!(rows[i].id, messages[folded_idx].id);
+            assert!(!rows[i].is_agent_visible());
+            assert_eq!(rows[i].is_user_visible(), messages[folded_idx].is_user_visible());
+        }
+
+        // Two new rows: recall first, then memory
+        let recall = &rows[3];
+        let memory = &rows[4];
+
+        assert_eq!(recall.role, Role::User);
+        assert!(!recall.is_user_visible());
+        assert!(recall.is_agent_visible());
+        assert!(recall.id.is_some());
+        assert_ne!(recall.id, msg3.id);
+        assert_eq!(recall.created, msg3.created - 1);
+        assert_eq!(fold_part(recall), Some("recall"));
+        assert_eq!(
+            recall.metadata.operation_note(OPERATION_KEY, "from").and_then(|v| v.as_str()),
+            Some("2026-10-10")
+        );
+        assert_eq!(
+            recall.metadata.operation_note(OPERATION_KEY, "to").and_then(|v| v.as_str()),
+            Some("2026-10-12")
+        );
+        assert_eq!(
+            recall.as_concat_text(),
+            "What do you remember from 2026-10-10 to 2026-10-12?"
+        );
+
+        assert_eq!(memory.role, Role::Assistant);
+        assert!(!memory.is_user_visible());
+        assert!(memory.is_agent_visible());
+        assert!(memory.id.is_some());
+        assert_ne!(memory.id, recall.id);
+        assert_eq!(memory.created, msg3.created - 1);
+        assert_eq!(fold_part(memory), Some("memory"));
+        assert_eq!(
+            memory.metadata.operation_note(OPERATION_KEY, "from").and_then(|v| v.as_str()),
+            Some("2026-10-10")
+        );
+        assert_eq!(
+            memory.metadata.operation_note(OPERATION_KEY, "to").and_then(|v| v.as_str()),
+            Some("2026-10-12")
+        );
+        assert_eq!(memory.as_concat_text(), "first fold memory");
+
+        // Now test second fold: previous_memory note is inherited
+        let mut prev_mem = memory.clone();
+        prev_mem.created = 1792000000;
+        let mut msg4 = Message::user().with_text("msg4").with_generated_id();
+        msg4.created = 1792154400; // 2026-10-16
+        let mut msg5_tail = Message::user().with_text("msg5").with_generated_id();
+        msg5_tail.created = 1792240800; // 2026-10-17
+
+        let messages2 = vec![prev_mem, msg4, msg5_tail.clone()];
+        let plan2 = CutPlan {
+            cut: 2,
+            folded: vec![0, 1],
+            previous_memory: Some(0),
+            new_material_o200k: 50,
+            tail_o200k: 50,
+        };
+
+        let conv2 = fold_rows(&messages2, &plan2, "second fold memory").unwrap();
+        let rows2 = conv2.messages();
+        assert_eq!(rows2.len(), 4);
+
+        let recall2 = &rows2[2];
+        let memory2 = &rows2[3];
+        assert_eq!(recall2.created, msg5_tail.created - 1);
+        assert_eq!(memory2.created, msg5_tail.created - 1);
+        assert_eq!(
+            recall2.metadata.operation_note(OPERATION_KEY, "from").and_then(|v| v.as_str()),
+            Some("2026-10-10")
+        );
+        assert_eq!(
+            recall2.metadata.operation_note(OPERATION_KEY, "to").and_then(|v| v.as_str()),
+            Some("2026-10-16")
+        );
+        assert_eq!(
+            recall2.as_concat_text(),
+            "What do you remember from 2026-10-10 to 2026-10-16?"
+        );
+        assert_eq!(
+            memory2.metadata.operation_note(OPERATION_KEY, "from").and_then(|v| v.as_str()),
+            Some("2026-10-10")
+        );
+        assert_eq!(
+            memory2.metadata.operation_note(OPERATION_KEY, "to").and_then(|v| v.as_str()),
+            Some("2026-10-16")
+        );
+        assert_eq!(memory2.as_concat_text(), "second fold memory");
+    }
+
+    #[tokio::test]
+    async fn rolling_fold_round_trip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = sm
+            .create_session(
+                std::path::PathBuf::from("/tmp/test"),
+                "test-round-trip".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+
+        // Add 8 messages
+        // Let T = 1000.
+        // Pre-cut:
+        // m0: created = 900
+        // m1: created = 950
+        // m2: created = 999 (T-1)
+        // m3: created = 1000 (T) - pre-cut sharing same second as tail first message!
+        // Tail:
+        // m4: created = 1000 (T) - tail first message
+        // m5: created = 1005
+        // m6: created = 1010
+        // m7: created = 1015
+        let t: i64 = 1000;
+        let timestamps = [900, 950, t - 1, t, t, 1005, 1010, 1015];
+        for (i, &ts) in timestamps.iter().enumerate() {
+            let mut msg = if i % 2 == 0 {
+                Message::user().with_text(format!("msg_{i}"))
+            } else {
+                Message::assistant().with_text(format!("msg_{i}"))
+            };
+            msg.created = ts;
+            sm.add_message(&session.id, &msg).await.unwrap();
+        }
+
+        let loaded = sm.get_session(&session.id, true).await.unwrap();
+        let initial_conv = loaded.conversation.unwrap();
+        let initial_messages = initial_conv.messages();
+        assert_eq!(initial_messages.len(), 8);
+
+        // Plan cut by hand: cut at 4, folded = [0, 1, 2, 3]
+        let plan = CutPlan {
+            cut: 4,
+            folded: vec![0, 1, 2, 3],
+            previous_memory: None,
+            new_material_o200k: 200,
+            tail_o200k: 200,
+        };
+
+        let compacted = fold_rows(initial_messages, &plan, "summary of folded history").unwrap();
+        sm.save_compacted_conversation(&session.id, &compacted).await.unwrap();
+
+        let reloaded = sm.get_session(&session.id, true).await.unwrap();
+        let reloaded_conv = reloaded.conversation.unwrap();
+
+        // 1. Row count = old + 2 (nothing deleted)
+        assert_eq!(reloaded_conv.messages().len(), 10);
+
+        // 2. agent_visible_messages() == [recall, memory, tail...] (recall then memory)
+        let agent_vis = reloaded_conv.agent_visible_messages();
+        assert_eq!(agent_vis.len(), 6); // recall + memory + 4 tail messages
+        assert_eq!(fold_part(&agent_vis[0]), Some("recall"));
+        assert_eq!(fold_part(&agent_vis[1]), Some("memory"));
+        assert_eq!(agent_vis[2].id, initial_messages[4].id);
+        assert_eq!(agent_vis[3].id, initial_messages[5].id);
+        assert_eq!(agent_vis[4].id, initial_messages[6].id);
+        assert_eq!(agent_vis[5].id, initial_messages[7].id);
+
+        // 3. In RAW row order:
+        // assert only that the pair comes after every row with created <= T-1
+        // and before the tail's first message; pre-cut rows with created == T sort after the pair.
+        let raw = reloaded_conv.messages();
+        let recall_pos = raw.iter().position(|m| fold_part(m) == Some("recall")).unwrap();
+        let memory_pos = raw.iter().position(|m| fold_part(m) == Some("memory")).unwrap();
+        assert_eq!(recall_pos + 1, memory_pos);
+
+        let tail_first_pos = raw.iter().position(|m| m.id == initial_messages[4].id).unwrap();
+        assert!(memory_pos < tail_first_pos);
+
+        // Every row with created <= T-1 must come before recall_pos
+        for (idx, m) in raw.iter().enumerate() {
+            if m.created <= t - 1 && fold_part(m).is_none() {
+                assert!(idx < recall_pos);
+            }
+        }
+
+        // Pre-cut row with created == T (initial_messages[3]) sorts after the pair
+        let m3_pos = raw.iter().position(|m| m.id == initial_messages[3].id).unwrap();
+        assert!(m3_pos > memory_pos);
+
+        // 4. user-visible messages unchanged in count and order (the pair is user-invisible)
+        let user_vis = reloaded_conv.user_visible_messages();
+        assert_eq!(user_vis.len(), 8);
+        for i in 0..8 {
+            assert_eq!(user_vis[i].id, initial_messages[i].id);
+        }
+    }
+
+    #[test]
+    fn rolling_fold_rows_rejects_missing_id() {
+        let mut msg0 = Message::user().with_text("msg0");
+        msg0.id = None; // Missing id!
+        let msg1 = Message::assistant().with_text("msg1").with_generated_id();
+        let msg2 = Message::user().with_text("msg2").with_generated_id();
+
+        let messages = vec![msg0, msg1, msg2];
+        let plan = CutPlan {
+            cut: 2,
+            folded: vec![0, 1],
+            previous_memory: None,
+            new_material_o200k: 50,
+            tail_o200k: 50,
+        };
+
+        let err = fold_rows(&messages, &plan, "mem").expect_err("should reject missing id");
+        assert!(err.to_string().contains("has no id"));
+    }
+
+    #[test]
+    fn rolling_fold_rows_cut_out_of_bounds() {
+        let msg0 = Message::user().with_text("msg0").with_generated_id();
+        let messages = vec![msg0];
+        let plan = CutPlan {
+            cut: 5,
+            folded: vec![],
+            previous_memory: None,
+            new_material_o200k: 0,
+            tail_o200k: 0,
+        };
+        let err = fold_rows(&messages, &plan, "mem").expect_err("should reject out of bounds cut");
+        assert!(err.to_string().contains("out of bounds"));
     }
 }
