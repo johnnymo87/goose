@@ -20,7 +20,7 @@ below:
 
 How to write it:
 - Fold the previous memory in; do not just append to it. Rewrite it as one memory.
-- Keep the concrete details future you will reach for: ticket, issue, PR and session ids (copied
+- Keep the concrete details future you will reach for: ticket, bead, PR and session ids (copied
   exactly and in full), file paths, exact values, decisions and why they were made, promises you
   made, open questions and what each is waiting on.
 - Record what was superseded, withdrawn or finished as such, so it is not mistaken for current.
