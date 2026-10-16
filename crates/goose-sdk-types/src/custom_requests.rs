@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: SetSessionSettingsRequest custom request for session settings pinning.
+// Modified by Jonathan Mohrbacher, 2026: SetSessionSettingsRequest custom request for session settings pinning; rolling memory setting in settings/set.
 use agent_client_protocol::schema::v1::{
     AvailableCommand, ContentBlock, McpServer, Meta, SessionInfo,
 };
@@ -218,7 +218,36 @@ pub struct SetSessionSystemPromptRequest {
     pub text: String,
 }
 
-/// Pin a session's cache TTL and recipe.
+/// Distinguishes an absent field (None) from an explicit null (Some(None)).
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RollingMemoryDto {
+    pub budget_tokens: u32,
+    pub tail_tokens: u32,
+}
+
+impl RollingMemoryDto {
+    /// 0 < tail < budget. Returns a message for invalid_params otherwise.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tail_tokens == 0 {
+            return Err("tailTokens must be greater than 0".to_string());
+        }
+        if self.tail_tokens >= self.budget_tokens {
+            return Err("tailTokens must be less than budgetTokens".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Pin a session's cache TTL, recipe and rolling memory.
 ///
 /// Note: Recipe `settings`, `extensions`, `prompt`, and `parameters` are
 /// ignored by this call (only `instructions` and `response` are applied;
@@ -235,6 +264,14 @@ pub struct SetSessionSettingsRequest {
     pub cache_ttl: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe: Option<RecipeDto>,
+    /// Rolling memory for this session. Absent: unchanged. null: off.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<RollingMemoryDto>")]
+    pub rolling_memory: Option<Option<RollingMemoryDto>>,
 }
 
 /// Add user input to the currently active prompt without starting a new prompt.
@@ -2359,5 +2396,34 @@ mod tests {
             serde_json::from_str(r#"{"sessionId":"abc","format":"markdown"}"#).unwrap();
 
         assert_eq!(req.format, SessionExportFormat::Markdown);
+    }
+
+    #[test]
+    fn settings_request_rolling_memory_absent() {
+        let req: SetSessionSettingsRequest =
+            serde_json::from_str(r#"{"sessionId":"abc"}"#).unwrap();
+        assert_eq!(req.rolling_memory, None);
+    }
+
+    #[test]
+    fn settings_request_rolling_memory_null() {
+        let req: SetSessionSettingsRequest =
+            serde_json::from_str(r#"{"sessionId":"abc","rollingMemory":null}"#).unwrap();
+        assert_eq!(req.rolling_memory, Some(None));
+    }
+
+    #[test]
+    fn settings_request_rolling_memory_object() {
+        let req: SetSessionSettingsRequest = serde_json::from_str(
+            r#"{"sessionId":"abc","rollingMemory":{"budgetTokens":1000,"tailTokens":500}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.rolling_memory,
+            Some(Some(RollingMemoryDto {
+                budget_tokens: 1000,
+                tail_tokens: 500,
+            }))
+        );
     }
 }
