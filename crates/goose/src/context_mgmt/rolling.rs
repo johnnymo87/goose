@@ -1,8 +1,8 @@
-// Modified by Jonathan Mohrbacher, 2026: rolling memory pure planning; memory call; materialize fold.
+// Modified by Jonathan Mohrbacher, 2026: rolling memory pure planning; memory call; materialize fold; orchestrator.
 use crate::agents::final_output_tool::FINAL_OUTPUT_CONTINUATION_MESSAGE;
 use crate::conversation::message::{Message, MessageContentBlock, MessageMetadata};
 use crate::conversation::Conversation;
-use crate::session::ExtensionData;
+use crate::session::{ExtensionData, Session, SessionManager};
 use goose_providers::base::Provider;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use goose_providers::errors::ProviderError;
@@ -861,6 +861,284 @@ pub fn fold_rows(
     out_messages.push(memory_msg);
 
     Ok(Conversation::new_unvalidated(out_messages))
+}
+
+#[derive(Debug, Clone)]
+pub struct Pending {
+    pub est: u64,
+    pub counts: Vec<usize>,
+    pub state: RollingState,
+    pub settings: RollingMemorySettings,
+}
+
+#[derive(Debug)]
+pub enum FoldOutcome {
+    NotNeeded,
+    BackedOff,
+    Folded {
+        conversation: Conversation,
+        usage: ProviderUsage,
+        retained: i32,
+        memory_tokens: u64,
+    },
+    Failed {
+        reason: String,
+        usage: Vec<ProviderUsage>,
+    },
+}
+
+pub async fn check(
+    session: &Session,
+    settings: &RollingMemorySettings,
+    conversation: &Conversation,
+) -> anyhow::Result<Option<Pending>> {
+    let counter = crate::token_counter::create_token_counter()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let messages = conversation.messages();
+    let counts: Vec<usize> = messages
+        .iter()
+        .map(|m| {
+            if m.is_agent_visible() {
+                counter.count_chat_tokens("", &[m.agent_visible_content()], &[])
+            } else {
+                0
+            }
+        })
+        .collect();
+
+    let state = read_state(&session.extension_data);
+    let est = estimate(&session.usage, messages, &counts, state.ratio);
+
+    if est <= settings.budget_tokens as u64 {
+        return Ok(None);
+    }
+
+    if backed_off(&state, est, settings) {
+        tracing::info!(
+            session_id = %session.id,
+            est,
+            failures = state.consecutive_failures,
+            "rolling memory backed off"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(Pending {
+        est,
+        counts,
+        state,
+        settings: *settings,
+    }))
+}
+
+async fn persist_state(
+    session_manager: &SessionManager,
+    session_id: &str,
+    state: &RollingState,
+) -> anyhow::Result<()> {
+    let mut fresh = session_manager.get_session(session_id, false).await?;
+    write_state(&mut fresh.extension_data, state);
+    session_manager
+        .update(session_id)
+        .extension_data(fresh.extension_data)
+        .apply()
+        .await?;
+    Ok(())
+}
+
+pub async fn execute_fold(
+    session_manager: &SessionManager,
+    provider: &dyn Provider,
+    model_config: &ModelConfig,
+    session_id: &str,
+    pending: Pending,
+    conversation: &Conversation,
+    system: &str,
+    tools: &[rmcp::model::Tool],
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
+) -> FoldOutcome {
+    let counter = match crate::token_counter::create_token_counter().await {
+        Ok(c) => c,
+        Err(e) => {
+            return FoldOutcome::Failed {
+                reason: format!("failed to create token counter: {e}"),
+                usage: vec![],
+            };
+        }
+    };
+
+    let base_o200k = counter.count_chat_tokens(system, &[], tools);
+    let mut state = pending.state;
+    let mut est = pending.est;
+    let messages = conversation.messages();
+    let counts = pending.counts;
+    let settings = pending.settings;
+
+    let session = match session_manager.get_session(session_id, false).await {
+        Ok(s) => s,
+        Err(e) => {
+            return FoldOutcome::Failed {
+                reason: format!("failed to load session: {e}"),
+                usage: vec![],
+            };
+        }
+    };
+
+    let anchor_opt = anchor_index(messages, &session.usage);
+    if let Some(anchor) = anchor_opt {
+        if let Some(anchor_usage) = messages[anchor].metadata.usage.as_ref() {
+            if let Some(input_tokens) = anchor_usage.input_tokens {
+                let projected_before_anchor: Vec<Message> = messages[..anchor]
+                    .iter()
+                    .filter(|m| m.is_agent_visible())
+                    .map(|m| m.agent_visible_content())
+                    .collect();
+                let request_o200k =
+                    counter.count_chat_tokens(system, &projected_before_anchor, tools);
+                if let Some(new_ratio) = calibrated_ratio(input_tokens, request_o200k) {
+                    state.ratio = new_ratio;
+                    let _ = persist_state(session_manager, session_id, &state).await;
+                    est = estimate(&session.usage, messages, &counts, state.ratio);
+                }
+            }
+        }
+    } else {
+        est = est.saturating_add((state.ratio * (base_o200k as f64)).round() as u64);
+    }
+
+    let cut_plan = match plan_cut(messages, &counts, state.ratio, settings.tail_tokens) {
+        Ok(p) => p,
+        Err(CutError::SplitToolPair(req_id)) => {
+            tracing::warn!(session_id, %req_id, "rolling memory cut would split tool pair");
+            state.consecutive_failures += 1;
+            state.failed_at_estimate = Some(est);
+            let _ = persist_state(session_manager, session_id, &state).await;
+            return FoldOutcome::Failed {
+                reason: format!("SplitToolPair({req_id})"),
+                usage: vec![],
+            };
+        }
+    };
+
+    match decide(est, cut_plan.as_ref(), base_o200k, state.ratio, &settings) {
+        Decision::Skip(reason) => {
+            tracing::info!(session_id, reason, "rolling memory fold skipped by decide");
+            return FoldOutcome::NotNeeded;
+        }
+        Decision::Fold => {}
+    }
+
+    let plan = cut_plan.expect("decide Fold implies plan is Some");
+
+    let previous_memory_text = plan
+        .previous_memory
+        .and_then(|idx| messages.get(idx))
+        .map(|m| m.as_concat_text());
+
+    let memory_fut = write_memory_with_retry(
+        provider,
+        model_config,
+        session_id,
+        previous_memory_text.as_deref(),
+        messages,
+        &plan,
+        state.ratio,
+    );
+
+    let memory_res = if let Some(cancel) = cancel_token {
+        tokio::select! {
+            res = memory_fut => res,
+            _ = cancel.cancelled() => {
+                return FoldOutcome::Failed {
+                    reason: "cancelled".to_string(),
+                    usage: vec![],
+                };
+            }
+        }
+    } else {
+        memory_fut.await
+    };
+
+    let memory = match memory_res {
+        Ok(m) => m,
+        Err(err) => {
+            let reason = err.to_string();
+            let usage = match err {
+                MemoryError::OutputLimit(u)
+                | MemoryError::StopReason(_, u)
+                | MemoryError::Empty(u) => vec![u],
+                _ => vec![],
+            };
+            state.consecutive_failures += 1;
+            state.failed_at_estimate = Some(est);
+            let _ = persist_state(session_manager, session_id, &state).await;
+            return FoldOutcome::Failed { reason, usage };
+        }
+    };
+
+    let compacted_conversation = match fold_rows(messages, &plan, &memory.text) {
+        Ok(c) => c,
+        Err(err) => {
+            let reason = format!("fold_rows error: {err}");
+            state.consecutive_failures += 1;
+            state.failed_at_estimate = Some(est);
+            let _ = persist_state(session_manager, session_id, &state).await;
+            return FoldOutcome::Failed {
+                reason,
+                usage: vec![memory.usage],
+            };
+        }
+    };
+
+    if let Err(err) = session_manager
+        .save_compacted_conversation(session_id, &compacted_conversation)
+        .await
+    {
+        let reason = format!("save_compacted_conversation error: {err}");
+        state.consecutive_failures += 1;
+        state.failed_at_estimate = Some(est);
+        let _ = persist_state(session_manager, session_id, &state).await;
+        return FoldOutcome::Failed {
+            reason,
+            usage: vec![memory.usage],
+        };
+    }
+
+    let reloaded_conversation = match session_manager.get_session(session_id, true).await {
+        Ok(s) => s.conversation.unwrap_or(compacted_conversation),
+        Err(e) => {
+            tracing::warn!(
+                session_id,
+                %e,
+                "failed to reload session after fold save; using local folded conversation"
+            );
+            compacted_conversation
+        }
+    };
+
+    let retained =
+        match crate::context_mgmt::count_context_tokens(reloaded_conversation.messages()).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(session_id, %e, "failed to count context tokens after fold");
+                0
+            }
+        };
+
+    let o200k_mem = counter.count_tokens(&memory.text);
+    let memory_tokens = (state.ratio * (o200k_mem as f64)).round() as u64;
+
+    state.consecutive_failures = 0;
+    state.failed_at_estimate = None;
+    let _ = persist_state(session_manager, session_id, &state).await;
+
+    FoldOutcome::Folded {
+        conversation: reloaded_conversation,
+        usage: memory.usage,
+        retained,
+        memory_tokens,
+    }
 }
 
 #[cfg(test)]
@@ -2351,5 +2629,66 @@ mod tests {
         };
         let err = fold_rows(&messages, &plan, "mem").expect_err("should reject empty folded");
         assert!(err.to_string().contains("nothing to fold"));
+    }
+
+    #[tokio::test]
+    async fn rolling_check_under_budget_returns_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session = sm
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "test-under-budget".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        let conv = Conversation::new_unvalidated(vec![
+            Message::user().with_text("short prompt"),
+            Message::assistant().with_text("short reply"),
+        ]);
+        let settings = RollingMemorySettings {
+            budget_tokens: 10_000,
+            tail_tokens: 3_000,
+        };
+        let pending = check(&session, &settings, &conv).await.unwrap();
+        assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn rolling_check_backed_off_returns_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _guard = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap()))]);
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let mut session = sm
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "test-backed-off".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        let state = RollingState {
+            ratio: 1.45,
+            consecutive_failures: 2,
+            failed_at_estimate: Some(15_000),
+        };
+        write_state(&mut session.extension_data, &state);
+        session.usage = Usage::new(Some(16_000), Some(100), Some(16_100));
+
+        let conv = Conversation::new_unvalidated(vec![
+            Message::user().with_text("prompt"),
+            Message::assistant().with_text("reply"),
+        ]);
+        let settings = RollingMemorySettings {
+            budget_tokens: 10_000,
+            tail_tokens: 4_000,
+        };
+        // 16_100 < 15_000 + 4_000/2 = 17_000 -> backed off
+        let pending = check(&session, &settings, &conv).await.unwrap();
+        assert!(pending.is_none());
     }
 }

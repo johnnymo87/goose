@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: record side call usage for rolling memory.
 use anyhow::Result;
 use goose_providers::errors::ProviderError;
 use regex::Regex;
@@ -790,6 +791,35 @@ impl Agent {
             .await?;
 
         Ok(enriched)
+    }
+
+    pub(crate) async fn record_side_call_usage(
+        &self,
+        session_id: &str,
+        schedule_id: Option<String>,
+        usage: &ProviderUsage,
+    ) -> Result<()> {
+        let manager = self.config.session_manager.clone();
+        let session = manager.get_session(session_id, false).await?;
+
+        let (chunk_cost, cost_source) = resolve_usage_cost(session.provider_name.as_deref(), usage);
+
+        let mut enriched = usage.clone();
+        enriched.cost = chunk_cost;
+        enriched.cost_source = cost_source;
+        let ledger = MessageUsage::from_provider_usage(&enriched, false);
+
+        manager
+            .record_usage_metrics(
+                session_id,
+                schedule_id,
+                session.usage,
+                &usage.model,
+                &ledger,
+            )
+            .await?;
+
+        Ok(())
     }
 }
 
