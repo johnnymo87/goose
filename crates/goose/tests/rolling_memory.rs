@@ -1313,7 +1313,7 @@ async fn rolling_fires_only_once_across_turns() -> Result<()> {
         )
         .await?;
     tokio::pin!(stream1);
-    while let Some(_) = stream1.next().await {}
+    while stream1.next().await.is_some() {}
 
     assert_eq!(
         provider.memory_call_count(),
@@ -1331,7 +1331,7 @@ async fn rolling_fires_only_once_across_turns() -> Result<()> {
         )
         .await?;
     tokio::pin!(stream2);
-    while let Some(_) = stream2.next().await {}
+    while stream2.next().await.is_some() {}
 
     // Assert exactly one memory call in total (turn 2 did not fold!)
     assert_eq!(

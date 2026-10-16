@@ -1100,6 +1100,7 @@ pub async fn plan_fold(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_fold<F, Fut>(
     session_manager: &SessionManager,
     provider: &dyn Provider,
