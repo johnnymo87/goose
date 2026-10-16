@@ -43,7 +43,7 @@ jobs:
           cargo test --release -p goose --features "$F" --lib -- gcpvertexai gcpauth process_group cache_ttl max_turns_from_meta test_add_final_output_tool rolling
           cargo test --release -p goose --features "$F" --test acp_server_test -- test_session_settings test_prompt_max_turns_bounds_run
           cargo test --release -p goose --features "$F" --test rolling_memory
-          cargo test --release -p goose-sdk-types --lib -- settings_request
+          cargo test --release -p goose-sdk-types --lib -- settings_request rolling_memory_dto
           cargo test --release -p goose-cli --lib -- cache_ttl
           cargo test --release -p agent-client-protocol-http --features server --lib
 
