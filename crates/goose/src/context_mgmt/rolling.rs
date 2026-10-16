@@ -1058,7 +1058,11 @@ pub async fn plan_fold(
         Err(CutError::SplitToolPair(req_id)) => {
             tracing::warn!(session_id, %req_id, "rolling memory cut would split tool pair");
             state.consecutive_failures += 1;
-            let check_est = if anchor_opt.is_some() { est } else { pending.est };
+            let check_est = if anchor_opt.is_some() {
+                est
+            } else {
+                pending.est
+            };
             state.failed_at_estimate = Some(check_est);
             if let Err(e) = persist_state(session_manager, session_id, &state).await {
                 tracing::warn!(session_id, %e, "failed to persist rolling memory state");
@@ -1083,7 +1087,11 @@ pub async fn plan_fold(
     }
 
     let plan = cut_plan.expect("decide Fold implies plan is Some");
-    let check_est = if anchor_opt.is_some() { est } else { pending.est };
+    let check_est = if anchor_opt.is_some() {
+        est
+    } else {
+        pending.est
+    };
 
     PlanOutcome::Ready(FoldPlan {
         plan,
@@ -1106,7 +1114,11 @@ where
     F: FnOnce(ProviderUsage, i32) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    let FoldPlan { plan, mut state, est } = fold_plan;
+    let FoldPlan {
+        plan,
+        mut state,
+        est,
+    } = fold_plan;
     let messages = conversation.messages();
 
     let previous_memory_text = plan

@@ -2432,10 +2432,35 @@ mod tests {
 
     #[test]
     fn rolling_memory_dto_validation() {
-        assert!(RollingMemoryDto { budget_tokens: 10_000, tail_tokens: 1_000 }.validate().is_ok());
-        assert!(RollingMemoryDto { budget_tokens: 9_999, tail_tokens: 1_000 }.validate().is_err());
-        assert!(RollingMemoryDto { budget_tokens: 10_000, tail_tokens: 999 }.validate().is_err());
-        assert!(RollingMemoryDto { budget_tokens: 10_000, tail_tokens: 10_000 }.validate().is_err());
-        assert!(RollingMemoryDto { budget_tokens: 10_000, tail_tokens: 11_000 }.validate().is_err());
+        assert!(RollingMemoryDto {
+            budget_tokens: 10_000,
+            tail_tokens: 1_000
+        }
+        .validate()
+        .is_ok());
+        assert!(RollingMemoryDto {
+            budget_tokens: 9_999,
+            tail_tokens: 1_000
+        }
+        .validate()
+        .is_err());
+        assert!(RollingMemoryDto {
+            budget_tokens: 10_000,
+            tail_tokens: 999
+        }
+        .validate()
+        .is_err());
+        assert!(RollingMemoryDto {
+            budget_tokens: 10_000,
+            tail_tokens: 10_000
+        }
+        .validate()
+        .is_err());
+        assert!(RollingMemoryDto {
+            budget_tokens: 10_000,
+            tail_tokens: 11_000
+        }
+        .validate()
+        .is_err());
     }
 }

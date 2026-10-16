@@ -887,10 +887,12 @@ impl Agent {
         ];
 
         let Ok(provider) = self.provider().await else {
-            events.push(AgentEvent::Message(Message::assistant().with_system_notification(
-                SystemNotificationType::InlineMessage,
-                "Rolling memory fold skipped: failed to get provider",
-            )));
+            events.push(AgentEvent::Message(
+                Message::assistant().with_system_notification(
+                    SystemNotificationType::InlineMessage,
+                    "Rolling memory fold skipped: failed to get provider",
+                ),
+            ));
             return (conversation.clone(), session, events);
         };
 
@@ -928,10 +930,12 @@ impl Agent {
                     .await
                     .unwrap_or(session);
 
-                events.push(AgentEvent::Message(Message::assistant().with_system_notification(
-                    SystemNotificationType::InlineMessage,
-                    "Memory updated",
-                )));
+                events.push(AgentEvent::Message(
+                    Message::assistant().with_system_notification(
+                        SystemNotificationType::InlineMessage,
+                        "Memory updated",
+                    ),
+                ));
 
                 (folded_conv, fresh_session, events)
             }
@@ -951,10 +955,12 @@ impl Agent {
                     "rolling memory fold skipped due to failure"
                 );
 
-                events.push(AgentEvent::Message(Message::assistant().with_system_notification(
-                    SystemNotificationType::InlineMessage,
-                    format!("Rolling memory fold skipped: {reason}"),
-                )));
+                events.push(AgentEvent::Message(
+                    Message::assistant().with_system_notification(
+                        SystemNotificationType::InlineMessage,
+                        format!("Rolling memory fold skipped: {reason}"),
+                    ),
+                ));
 
                 (conversation.clone(), session, events)
             }
