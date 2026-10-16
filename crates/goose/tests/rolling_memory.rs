@@ -36,6 +36,9 @@ struct MockRollingProvider {
     session_id: Option<String>,
     pub main_call_saw_retained: Arc<std::sync::atomic::AtomicBool>,
     default_main_tokens: Arc<Mutex<Option<i32>>>,
+    pub block_memory_call: Arc<std::sync::atomic::AtomicBool>,
+    pub memory_call_entered: Arc<tokio::sync::Notify>,
+    pub memory_call_gate: Arc<tokio::sync::Notify>,
 }
 
 impl MockRollingProvider {
@@ -49,6 +52,9 @@ impl MockRollingProvider {
             session_id: None,
             main_call_saw_retained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             default_main_tokens: Arc::new(Mutex::new(None)),
+            block_memory_call: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            memory_call_entered: Arc::new(tokio::sync::Notify::new()),
+            memory_call_gate: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -65,6 +71,9 @@ impl MockRollingProvider {
             session_id: Some(session_id),
             main_call_saw_retained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             default_main_tokens: Arc::new(Mutex::new(None)),
+            block_memory_call: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            memory_call_entered: Arc::new(tokio::sync::Notify::new()),
+            memory_call_gate: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -162,6 +171,10 @@ impl Provider for MockRollingProvider {
                 m.as_concat_text()
                     .contains("Write your memory of the history in the system prompt.")
             });
+        if is_memory && self.block_memory_call.load(std::sync::atomic::Ordering::SeqCst) {
+            self.memory_call_entered.notify_waiters();
+            self.memory_call_gate.notified().await;
+        }
         if !is_memory {
             if let (Some(sm), Some(sid)) = (&self.session_manager, &self.session_id) {
                 if let Ok(s) = sm.get_session(sid, false).await {
@@ -187,6 +200,10 @@ impl Provider for MockRollingProvider {
                 m.as_concat_text()
                     .contains("Write your memory of the history in the system prompt.")
             });
+        if is_memory && self.block_memory_call.load(std::sync::atomic::Ordering::SeqCst) {
+            self.memory_call_entered.notify_waiters();
+            self.memory_call_gate.notified().await;
+        }
         if !is_memory {
             if let (Some(sm), Some(sid)) = (&self.session_manager, &self.session_id) {
                 if let Ok(s) = sm.get_session(sid, false).await {
@@ -896,6 +913,140 @@ async fn rolling_metrics_use_retained_form() -> Result<()> {
             .main_call_saw_retained
             .load(std::sync::atomic::Ordering::SeqCst),
         "main call must see retained session usage with NULL cache fields before main call overwrites it"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+
+    let mut messages = vec![
+        build_long_message(rmcp::model::Role::User, "prompt 1", 300),
+        build_long_message(rmcp::model::Role::Assistant, "reply 1", 300),
+        build_long_message(rmcp::model::Role::User, "prompt 2", 300),
+        build_long_message(rmcp::model::Role::Assistant, "reply 2", 300),
+    ];
+    messages[3].metadata.usage = Some(Box::new(MessageUsage {
+        input_tokens: Some(6500),
+        output_tokens: Some(500),
+        total_tokens: Some(7000),
+        ..Default::default()
+    }));
+
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "test-cancel-cleanly",
+        messages,
+        Some(Usage::new(Some(6500), Some(500), Some(7000))),
+    )
+    .await?;
+
+    let mut s = agent
+        .config
+        .session_manager
+        .get_session(&session.id, false)
+        .await?;
+    rolling::write_settings(
+        &mut s.extension_data,
+        Some(RollingMemorySettings {
+            budget_tokens: 3000,
+            tail_tokens: 1000,
+        }),
+    );
+    // Set initial consecutive_failures to 1
+    rolling::write_state(
+        &mut s.extension_data,
+        &rolling::RollingState {
+            ratio: 1.45,
+            consecutive_failures: 1,
+            failed_at_estimate: Some(7000),
+        },
+    );
+    agent
+        .config
+        .session_manager
+        .update(&session.id)
+        .extension_data(s.extension_data)
+        .apply()
+        .await?;
+
+    let initial_accumulated = session.accumulated_usage.total_tokens.unwrap_or(0);
+
+    let provider = Arc::new(MockRollingProvider::new());
+    provider
+        .block_memory_call
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    agent
+        .update_provider(provider.clone(), ModelConfig::new("mock-model"), &session.id)
+        .await?;
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    let session_config = SessionConfig {
+        id: session.id.clone(),
+        schedule_id: None,
+        max_turns: None,
+        retry_config: None,
+    };
+
+    let entered = provider.memory_call_entered.clone();
+    let cancel = cancel_token.clone();
+    tokio::spawn(async move {
+        entered.notified().await;
+        cancel.cancel();
+    });
+
+    let reply_stream = agent
+        .reply(
+            Message::user().with_text("Prompt while memory call is cancelled"),
+            session_config,
+            false,
+            Some(cancel_token),
+        )
+        .await?;
+    tokio::pin!(reply_stream);
+
+    let mut turn_events = Vec::new();
+    while let Some(event_res) = reply_stream.next().await {
+        turn_events.push(event_res?);
+    }
+    assert!(
+        !turn_events.is_empty(),
+        "turn must complete and yield events"
+    );
+
+    let reloaded = agent
+        .config
+        .session_manager
+        .get_session(&session.id, true)
+        .await?;
+    let conv = reloaded.conversation.unwrap();
+
+    // 1. Assert no pair rows saved
+    let pair_count = conv
+        .messages()
+        .iter()
+        .filter(|m| rolling::fold_part(m).is_some())
+        .count();
+    assert_eq!(pair_count, 0, "no pair rows saved after cancellation");
+
+    // 2. Assert consecutive_failures unchanged (still 1)
+    let state = rolling::read_state(&reloaded.extension_data);
+    assert_eq!(
+        state.consecutive_failures, 1,
+        "consecutive_failures must remain unchanged after cancellation"
+    );
+
+    // 3. Assert no usage recorded for memory call (accumulated usage unchanged)
+    let accumulated_after = reloaded.accumulated_usage.total_tokens.unwrap_or(0);
+    assert_eq!(
+        accumulated_after, initial_accumulated,
+        "no memory call usage recorded"
     );
 
     Ok(())

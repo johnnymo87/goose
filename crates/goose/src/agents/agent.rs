@@ -863,7 +863,7 @@ impl Agent {
         }
         Ok(result)
     }
-    async fn load_project_instructions(&self, session: &Session) -> Option<String> {
+    pub(crate) async fn load_project_instructions(&self, session: &Session) -> Option<String> {
         let project_id = session.project_id.as_deref()?;
         let entry = crate::sources::read_project(project_id).ok()?;
         let mut parts = Vec::new();
@@ -2520,67 +2520,21 @@ impl Agent {
                     COMPACTION_PROGRESS_TEXT,
                 ));
 
-                let fold_outcome = self
-                    .execute_rolling_fold(
-                        &session_config.id,
+                let (folded_conv, fresh_session, events) = self
+                    .handle_rolling_fold(
+                        &session_config,
                         pending,
                         &conversation_to_compact,
+                        session,
                         cancel_token.as_ref(),
                     )
                     .await;
 
-                match fold_outcome {
-                    crate::context_mgmt::rolling::FoldOutcome::Folded {
-                        conversation: folded_conv,
-                        usage,
-                        retained,
-                        ..
-                    } => {
-                        let _ = self
-                            .update_session_metrics(
-                                &session_config.id,
-                                session_config.schedule_id.clone(),
-                                &usage,
-                                Some(retained),
-                            )
-                            .await;
-
-                        yield AgentEvent::Message(Message::assistant().with_system_notification(
-                            SystemNotificationType::InlineMessage,
-                            "Memory updated",
-                        ));
-
-                        let fresh_session = session_manager
-                            .get_session(&session_config.id, true)
-                            .await
-                            .unwrap_or(session);
-
-                        (folded_conv, fresh_session)
-                    }
-                    crate::context_mgmt::rolling::FoldOutcome::Failed { reason, usage } => {
-                        for u in &usage {
-                            let _ = self
-                                .record_side_call_usage(
-                                    &session_config.id,
-                                    session_config.schedule_id.clone(),
-                                    u,
-                                )
-                                .await;
-                        }
-                        tracing::warn!(session_id = %session_config.id, %reason, "rolling memory fold skipped due to failure");
-
-                        yield AgentEvent::Message(Message::assistant().with_system_notification(
-                            SystemNotificationType::InlineMessage,
-                            format!("Rolling memory fold skipped: {reason}"),
-                        ));
-
-                        (conversation, session)
-                    }
-                    crate::context_mgmt::rolling::FoldOutcome::NotNeeded
-                    | crate::context_mgmt::rolling::FoldOutcome::BackedOff => {
-                        (conversation, session)
-                    }
+                for event in events {
+                    yield event;
                 }
+
+                (folded_conv, fresh_session)
             } else if !needs_auto_compact {
                 (conversation, session)
             } else {
@@ -2652,54 +2606,6 @@ impl Agent {
                 yield event?;
             }
         }))
-    }
-
-    async fn execute_rolling_fold(
-        &self,
-        session_id: &str,
-        pending: crate::context_mgmt::rolling::Pending,
-        conversation: &Conversation,
-        cancel_token: Option<&CancellationToken>,
-    ) -> crate::context_mgmt::rolling::FoldOutcome {
-        let sm = &self.config.session_manager;
-        let Ok(fallback_session) = sm.get_session(session_id, false).await else {
-            return crate::context_mgmt::rolling::FoldOutcome::Failed {
-                reason: "failed to load session".into(),
-                usage: vec![],
-            };
-        };
-        let Ok((prompt_session, lease, tools, _, mut system_prompt, model_config)) =
-            self.prepare_tools_and_prompt(&fallback_session).await
-        else {
-            return crate::context_mgmt::rolling::FoldOutcome::Failed {
-                reason: "failed to prepare tools and prompt".into(),
-                usage: vec![],
-            };
-        };
-        if let Some(project_addendum) = self.load_project_instructions(&prompt_session).await {
-            system_prompt = format!("{system_prompt}\n\n{project_addendum}");
-        }
-        drop(lease);
-
-        let Ok(provider) = self.provider().await else {
-            return crate::context_mgmt::rolling::FoldOutcome::Failed {
-                reason: "failed to get provider".into(),
-                usage: vec![],
-            };
-        };
-
-        crate::context_mgmt::rolling::execute_fold(
-            sm,
-            provider.as_ref(),
-            &model_config,
-            session_id,
-            pending,
-            conversation,
-            &system_prompt,
-            &tools,
-            cancel_token,
-        )
-        .await
     }
 
     async fn reply_internal(
