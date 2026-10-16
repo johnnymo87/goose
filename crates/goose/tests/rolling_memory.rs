@@ -463,6 +463,18 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
         "last message seen by main call must be the new prompt"
     );
 
+    let pool = agent.config.session_manager.pool().await?;
+    let compaction_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM usage_ledger WHERE session_id = ? AND is_compaction = 1",
+    )
+    .bind(&session.id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        compaction_rows, 1,
+        "ledger must have exactly one is_compaction row"
+    );
+
     Ok(())
 }
 
@@ -1094,6 +1106,251 @@ async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
     assert_eq!(
         accumulated_after, initial_accumulated,
         "no memory call usage recorded"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rolling_decide_skip_yields_no_folding_notice_and_no_memory_call() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+
+    // Budget: 50_000, Tail: 10_000.
+    // Pre-cut: 100 words (~150 tokens) -> ratio * new_material < 30_000 MIN_PROGRESS_TOKENS.
+    // Tail: 10_000 words (~13_000 tokens).
+    // Total tokens: ~55_000 > 50_000 budget, but <= 100_000 (hard cap 2B).
+    // Decide will skip with "too little progress".
+    let mut messages = vec![
+        build_long_message(rmcp::model::Role::User, "prompt 1", 100),
+        build_long_message(rmcp::model::Role::Assistant, "reply 1", 100),
+        build_long_message(rmcp::model::Role::User, "prompt 2", 5000),
+        build_long_message(rmcp::model::Role::Assistant, "reply 2", 5000),
+    ];
+    messages[3].metadata.usage = Some(Box::new(MessageUsage {
+        input_tokens: Some(54_000),
+        output_tokens: Some(1000),
+        total_tokens: Some(55_000),
+        ..Default::default()
+    }));
+
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "test-decide-skip",
+        messages,
+        Some(Usage::new(Some(54_000), Some(1000), Some(55_000))),
+    )
+    .await?;
+
+    let mut s = agent
+        .config
+        .session_manager
+        .get_session(&session.id, false)
+        .await?;
+    rolling::write_settings(
+        &mut s.extension_data,
+        Some(RollingMemorySettings {
+            budget_tokens: 50_000,
+            tail_tokens: 10_000,
+        }),
+    );
+    agent
+        .config
+        .session_manager
+        .update(&session.id)
+        .extension_data(s.extension_data)
+        .apply()
+        .await?;
+
+    let provider = Arc::new(MockRollingProvider::new());
+    agent
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    let session_config = SessionConfig {
+        id: session.id.clone(),
+        schedule_id: None,
+        max_turns: None,
+        retry_config: None,
+    };
+
+    let reply_stream = agent
+        .reply(
+            Message::user().with_text("New user prompt"),
+            session_config,
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(reply_stream);
+
+    let mut inline_notifications = Vec::new();
+    while let Some(event_res) = reply_stream.next().await {
+        if let Ok(AgentEvent::Message(msg)) = event_res {
+            for content in &msg.content {
+                if let Some(note) = content.as_system_notification() {
+                    inline_notifications.push(note.msg.clone());
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        provider.memory_call_count(),
+        0,
+        "no memory call when decide skips"
+    );
+    assert!(
+        !inline_notifications
+            .iter()
+            .any(|n| n.contains("Folding older history into memory")),
+        "must not emit folding notice when decide skips"
+    );
+    assert!(
+        !inline_notifications
+            .iter()
+            .any(|n| n.contains("compacting the conversation")),
+        "must not emit progress notice when decide skips"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rolling_fires_only_once_across_turns() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let agent = Agent::new();
+
+    // Budget: 12_000, Tail: 3_000.
+    // Turn 1 setup: over 24_000 tokens (hard cap triggers fold).
+    let mut messages = vec![
+        build_long_message(rmcp::model::Role::User, "prompt 1", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "reply 1", 1500),
+        build_long_message(rmcp::model::Role::User, "prompt 2", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "reply 2", 1500),
+    ];
+    messages[3].metadata.usage = Some(Box::new(MessageUsage {
+        input_tokens: Some(24_000),
+        output_tokens: Some(1000),
+        total_tokens: Some(25_000),
+        ..Default::default()
+    }));
+
+    let session = setup_test_session(
+        &agent,
+        &temp_dir,
+        "test-fires-only-once",
+        messages,
+        Some(Usage::new(Some(24_000), Some(1000), Some(25_000))),
+    )
+    .await?;
+
+    let mut s = agent
+        .config
+        .session_manager
+        .get_session(&session.id, false)
+        .await?;
+    rolling::write_settings(
+        &mut s.extension_data,
+        Some(RollingMemorySettings {
+            budget_tokens: 12_000,
+            tail_tokens: 3_000,
+        }),
+    );
+    agent
+        .config
+        .session_manager
+        .update(&session.id)
+        .extension_data(s.extension_data)
+        .apply()
+        .await?;
+
+    let provider = Arc::new(MockRollingProvider::new());
+    // On Turn 1 main call, report realistic post-fold usage (input ~ 4000, with cache fields set so is_retained is false)
+    let post_fold_usage = ProviderUsage::new(
+        "mock-model".to_string(),
+        Usage {
+            input_tokens: Some(4000),
+            output_tokens: Some(100),
+            total_tokens: Some(4100),
+            cache_read_input_tokens: Some(3500),
+            cache_write_input_tokens: Some(500),
+        },
+    )
+    .with_finish_reasons(vec!["end_turn".to_string()]);
+    provider.queue_main_response(Ok((
+        Message::assistant().with_text("Turn 1 assistant answer."),
+        post_fold_usage,
+    )));
+
+    agent
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("mock-model"),
+            &session.id,
+        )
+        .await?;
+
+    let session_config = SessionConfig {
+        id: session.id.clone(),
+        schedule_id: None,
+        max_turns: None,
+        retry_config: None,
+    };
+
+    // Turn 1: fold happens!
+    let stream1 = agent
+        .reply(
+            Message::user().with_text("Turn 1 user prompt"),
+            session_config.clone(),
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(stream1);
+    while let Some(_) = stream1.next().await {}
+
+    assert_eq!(
+        provider.memory_call_count(),
+        1,
+        "turn 1 must trigger exactly one memory call"
+    );
+
+    // Turn 2: small user prompt. Context is well under budget (total ~ 4100 < 12_000).
+    let stream2 = agent
+        .reply(
+            Message::user().with_text("Turn 2 small prompt"),
+            session_config.clone(),
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(stream2);
+    while let Some(_) = stream2.next().await {}
+
+    // Assert exactly one memory call in total (turn 2 did not fold!)
+    assert_eq!(
+        provider.memory_call_count(),
+        1,
+        "turn 2 must not trigger a second memory call"
+    );
+
+    // Assert exactly one is_compaction row in usage_ledger
+    let pool = agent.config.session_manager.pool().await?;
+    let compaction_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM usage_ledger WHERE session_id = ? AND is_compaction = 1",
+    )
+    .bind(&session.id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        compaction_rows, 1,
+        "must have exactly one is_compaction row in ledger across both turns"
     );
 
     Ok(())

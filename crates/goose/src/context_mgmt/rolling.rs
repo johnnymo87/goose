@@ -869,6 +869,20 @@ pub struct Pending {
     pub settings: RollingMemorySettings,
 }
 
+#[derive(Debug, Clone)]
+pub struct FoldPlan {
+    pub plan: CutPlan,
+    pub state: RollingState,
+    pub est: u64,
+}
+
+#[derive(Debug)]
+pub enum PlanOutcome {
+    NotNeeded,
+    Failed { reason: String },
+    Ready(FoldPlan),
+}
+
 #[derive(Debug)]
 pub enum FoldOutcome {
     NotNeeded,
@@ -984,24 +998,19 @@ async fn persist_state(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_fold(
+pub async fn plan_fold(
     session_manager: &SessionManager,
-    provider: &dyn Provider,
-    model_config: &ModelConfig,
     session_id: &str,
     pending: Pending,
     conversation: &Conversation,
     system: &str,
     tools: &[rmcp::model::Tool],
-    cancel_token: Option<&tokio_util::sync::CancellationToken>,
-) -> FoldOutcome {
+) -> PlanOutcome {
     let counter = match crate::token_counter::create_token_counter().await {
         Ok(c) => c,
         Err(e) => {
-            return FoldOutcome::Failed {
+            return PlanOutcome::Failed {
                 reason: format!("failed to create token counter: {e}"),
-                usage: vec![],
             };
         }
     };
@@ -1017,9 +1026,8 @@ pub async fn execute_fold(
     let session = match session_manager.get_session(session_id, false).await {
         Ok(s) => s,
         Err(e) => {
-            return FoldOutcome::Failed {
+            return PlanOutcome::Failed {
                 reason: format!("failed to load session: {e}"),
-                usage: vec![],
             };
         }
     };
@@ -1050,13 +1058,13 @@ pub async fn execute_fold(
         Err(CutError::SplitToolPair(req_id)) => {
             tracing::warn!(session_id, %req_id, "rolling memory cut would split tool pair");
             state.consecutive_failures += 1;
-            state.failed_at_estimate = Some(est);
+            let check_est = if anchor_opt.is_some() { est } else { pending.est };
+            state.failed_at_estimate = Some(check_est);
             if let Err(e) = persist_state(session_manager, session_id, &state).await {
                 tracing::warn!(session_id, %e, "failed to persist rolling memory state");
             }
-            return FoldOutcome::Failed {
+            return PlanOutcome::Failed {
                 reason: format!("SplitToolPair({req_id})"),
-                usage: vec![],
             };
         }
     };
@@ -1069,12 +1077,37 @@ pub async fn execute_fold(
                     tracing::warn!(session_id, %e, "failed to persist rolling memory state");
                 }
             }
-            return FoldOutcome::NotNeeded;
+            return PlanOutcome::NotNeeded;
         }
         Decision::Fold => {}
     }
 
     let plan = cut_plan.expect("decide Fold implies plan is Some");
+    let check_est = if anchor_opt.is_some() { est } else { pending.est };
+
+    PlanOutcome::Ready(FoldPlan {
+        plan,
+        state,
+        est: check_est,
+    })
+}
+
+pub async fn execute_fold<F, Fut>(
+    session_manager: &SessionManager,
+    provider: &dyn Provider,
+    model_config: &ModelConfig,
+    session_id: &str,
+    fold_plan: FoldPlan,
+    conversation: &Conversation,
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    record_metrics: F,
+) -> FoldOutcome
+where
+    F: FnOnce(ProviderUsage, i32) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let FoldPlan { plan, mut state, est } = fold_plan;
+    let messages = conversation.messages();
 
     let previous_memory_text = plan
         .previous_memory
@@ -1156,20 +1189,14 @@ pub async fn execute_fold(
         };
     }
 
-    let reloaded_conversation = match session_manager.get_session(session_id, true).await {
-        Ok(s) => s.conversation.unwrap_or(compacted_conversation),
-        Err(e) => {
-            tracing::warn!(
-                session_id,
-                %e,
-                "failed to reload session after fold save; using local folded conversation"
-            );
-            compacted_conversation
-        }
-    };
+    let mut full_messages = compacted_conversation.messages().to_vec();
+    if plan.cut < messages.len() {
+        full_messages.extend_from_slice(&messages[plan.cut..]);
+    }
+    let full_conversation = Conversation::new_unvalidated(full_messages);
 
     let retained =
-        match crate::context_mgmt::count_context_tokens(reloaded_conversation.messages()).await {
+        match crate::context_mgmt::count_context_tokens(full_conversation.messages()).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(session_id, %e, "failed to count context tokens after fold");
@@ -1177,8 +1204,15 @@ pub async fn execute_fold(
             }
         };
 
-    let o200k_mem = counter.count_tokens(&memory.text);
-    let memory_tokens = (state.ratio * (o200k_mem as f64)).round() as u64;
+    if let Err(e) = record_metrics(memory.usage.clone(), retained).await {
+        tracing::warn!(
+            session_id,
+            %e,
+            "failed to update session metrics after rolling fold"
+        );
+    }
+
+    let memory_tokens = memory.usage.usage.output_tokens.unwrap_or(0) as u64;
 
     state.consecutive_failures = 0;
     state.failed_at_estimate = None;
@@ -1187,7 +1221,7 @@ pub async fn execute_fold(
     }
 
     FoldOutcome::Folded {
-        conversation: reloaded_conversation,
+        conversation: full_conversation,
         usage: Box::new(memory.usage),
         retained,
         memory_tokens,

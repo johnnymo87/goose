@@ -88,7 +88,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
-const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
+pub(crate) const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
 const MAX_EMPTY_TURN_RETRIES: u32 = 3;
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
@@ -2521,15 +2521,6 @@ impl Agent {
             }
 
             let (final_conversation, session) = if let Some(pending) = rolling_pending {
-                yield AgentEvent::Message(Message::assistant().with_system_notification(
-                    SystemNotificationType::InlineMessage,
-                    "Context is over the rolling memory budget. Folding older history into memory...",
-                ));
-                yield AgentEvent::Message(Message::assistant().with_system_notification(
-                    SystemNotificationType::ProgressMessage,
-                    COMPACTION_PROGRESS_TEXT,
-                ));
-
                 let (folded_conv, fresh_session, events) = self
                     .handle_rolling_fold(
                         &session_config,
