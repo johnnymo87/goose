@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing.
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold.
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,7 +88,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
-const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
+pub(crate) const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
 const MAX_EMPTY_TURN_RETRIES: u32 = 3;
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
@@ -863,7 +863,7 @@ impl Agent {
         }
         Ok(result)
     }
-    async fn load_project_instructions(&self, session: &Session) -> Option<String> {
+    pub(crate) async fn load_project_instructions(&self, session: &Session) -> Option<String> {
         let project_id = session.project_id.as_deref()?;
         let entry = crate::sources::read_project(project_id).ok()?;
         let mut parts = Vec::new();
@@ -1858,6 +1858,20 @@ impl Agent {
         session_config: SessionConfig,
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
+        let session = self
+            .config
+            .session_manager
+            .get_session(&session_config.id, false)
+            .await?;
+        if crate::context_mgmt::rolling::resolve_settings(&session.extension_data, |k| {
+            std::env::var(k).ok()
+        })
+        .is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "rolling memory is on for this session; the unrolled agent loop is not supported"
+            ));
+        }
         let session_id = session_config.id.clone();
         let events = crate::session_context::with_session_id(
             Some(session_id.clone()),
@@ -2473,13 +2487,29 @@ impl Agent {
             }
         }
 
-        let needs_auto_compact = check_if_compaction_needed(
-            self.provider().await?.as_ref(),
-            &conversation,
-            None,
-            &session,
-        )
-        .await?;
+        let rolling_settings =
+            crate::context_mgmt::rolling::resolve_settings(&session.extension_data, |k| {
+                std::env::var(k).ok()
+            });
+
+        let (needs_auto_compact, rolling_pending) = if let Some(settings) = rolling_settings {
+            let pending = crate::context_mgmt::rolling::check(&session, &settings, &conversation)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(session_id = %session.id, %e, "rolling memory check failed");
+                    None
+                });
+            (false, pending)
+        } else {
+            let needs_auto = check_if_compaction_needed(
+                self.provider().await?.as_ref(),
+                &conversation,
+                None,
+                &session,
+            )
+            .await?;
+            (needs_auto, None)
+        };
 
         let conversation_to_compact = conversation.clone();
         let reply_span = tracing::Span::current();
@@ -2490,8 +2520,24 @@ impl Agent {
                 yield event;
             }
 
-            let final_conversation = if !needs_auto_compact {
-                conversation
+            let (final_conversation, session) = if let Some(pending) = rolling_pending {
+                let (folded_conv, fresh_session, events) = self
+                    .handle_rolling_fold(
+                        &session_config,
+                        pending,
+                        &conversation_to_compact,
+                        session,
+                        cancel_token.as_ref(),
+                    )
+                    .await;
+
+                for event in events {
+                    yield event;
+                }
+
+                (folded_conv, fresh_session)
+            } else if !needs_auto_compact {
+                (conversation, session)
             } else {
                 let config = Config::global();
                 let threshold = config
@@ -2542,7 +2588,7 @@ impl Agent {
                             )
                         );
 
-                        compacted_conversation
+                        (compacted_conversation, session)
                     }
                     Err(e) => {
                         yield AgentEvent::Message(
@@ -2702,7 +2748,12 @@ impl Agent {
             let mut last_assistant_text = String::new();
             let mut turn_total_usage = Usage::default();
             let mut goal_check_pending = false;
-            let mut tool_pair_summarization_done = false;
+            let rolling_on = crate::context_mgmt::rolling::resolve_settings(
+                &session.extension_data,
+                |k| std::env::var(k).ok(),
+            )
+            .is_some();
+            let mut tool_pair_summarization_done = rolling_on;
             let mut stop_hook_handled_for_exit = false;
             let mut retrying_after_stop_hook_denial = false;
             let mut consecutive_stop_hook_blocks = 0u32;

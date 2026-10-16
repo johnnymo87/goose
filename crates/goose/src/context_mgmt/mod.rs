@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: rolling memory module.
+pub mod rolling;
 pub use goose_context_management::structured;
 
 use crate::conversation::message::MessageMetadata;

@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns.
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -1790,6 +1790,179 @@ fn test_prompt_max_turns_bounds_run() {
         assert!(
             combined_text.contains("maximum number of actions"),
             "expected max turns message in updates, got: {combined_text}"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_session_settings_rolling_memory() {
+    run_test(async move {
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+        let session_manager = SessionManager::new(temp_data.path().to_path_buf());
+
+        // 1. tailTokens >= budgetTokens -> invalid_params
+        let invalid_err = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "rollingMemory": {
+                    "budgetTokens": 50000,
+                    "tailTokens": 60000
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid_err.code, ErrorCode::InvalidParams);
+        assert!(
+            invalid_err
+                .data
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("invalid rollingMemory: "),
+            "expected data starting with 'invalid rollingMemory: '"
+        );
+
+        // 2. set an object -> extension_data["rolling_memory.v0"] equals it
+        let res = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "rollingMemory": {
+                    "budgetTokens": 150000,
+                    "tailTokens": 60000
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res, serde_json::json!({}));
+
+        let stored = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        let setting_val = stored
+            .extension_data
+            .get_extension_state("rolling_memory", "v0")
+            .cloned();
+        assert_eq!(
+            setting_val,
+            Some(serde_json::json!({
+                "budgetTokens": 150000,
+                "tailTokens": 60000
+            }))
+        );
+
+        // 3. a second settings/set with only cacheTtl leaves it unchanged
+        let res2 = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res2, serde_json::json!({}));
+
+        let stored2 = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored2
+                .extension_data
+                .get_extension_state("rolling_memory", "v0")
+                .cloned(),
+            Some(serde_json::json!({
+                "budgetTokens": 150000,
+                "tailTokens": 60000
+            }))
+        );
+
+        // 4. rollingMemory: null stores null
+        let res3 = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "rollingMemory": null
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res3, serde_json::json!({}));
+
+        let stored3 = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored3
+                .extension_data
+                .get_extension_state("rolling_memory", "v0"),
+            Some(&serde_json::Value::Null)
+        );
+
+        // Re-set to an object so we can test session/load on a new connection
+        let res4 = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "rollingMemory": {
+                    "budgetTokens": 120000,
+                    "tailTokens": 40000
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res4, serde_json::json!({}));
+
+        // 5. the setting survives session/load on a new connection
+        let openai2 = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+        let mut conn2 = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai2,
+        )
+        .await;
+        let _loaded = conn2.load_session(&session_id, vec![]).await.unwrap();
+
+        let stored_after_load = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_after_load
+                .extension_data
+                .get_extension_state("rolling_memory", "v0")
+                .cloned(),
+            Some(serde_json::json!({
+                "budgetTokens": 120000,
+                "tailTokens": 40000
+            }))
         );
     });
 }

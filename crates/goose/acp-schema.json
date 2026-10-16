@@ -4262,14 +4262,42 @@
               "type": "null"
             }
           ]
+        },
+        "rollingMemory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RollingMemoryDto"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Rolling memory for this session. Absent: unchanged. null: off."
         }
       },
       "required": [
         "sessionId"
       ],
-      "description": "Pin a session's cache TTL and recipe.\n\nNote: Recipe `settings`, `extensions`, `prompt`, and `parameters` are\nignored by this call (only `instructions` and `response` are applied;\nthe model stays the session's).",
+      "description": "Pin a session's cache TTL, recipe and rolling memory.\n\nNote: Recipe `settings`, `extensions`, `prompt`, and `parameters` are\nignored by this call (only `instructions` and `response` are applied;\nthe model stays the session's).",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/settings/set"
+    },
+    "RollingMemoryDto": {
+      "type": "object",
+      "properties": {
+        "budgetTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tailTokens": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "budgetTokens",
+        "tailTokens"
+      ]
     },
     "DecodeRecipeRequest_unstable": {
       "type": "object",

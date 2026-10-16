@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: list_sessions_matching sorts and limits on ids before fetching full rows.
+// Modified by Jonathan Mohrbacher, 2026: list_sessions_matching sorts and limits on ids before fetching full rows; expose pool for session storage inspection.
 use crate::config::paths::Paths;
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageMetadata, MessageUsage, TokenState};
@@ -411,6 +411,10 @@ impl SessionManager {
 
     pub fn storage(&self) -> &Arc<SessionStorage> {
         &self.storage
+    }
+
+    pub async fn pool(&self) -> Result<&sqlx::Pool<sqlx::Sqlite>> {
+        self.storage.pool().await
     }
 
     pub(crate) fn action_required(

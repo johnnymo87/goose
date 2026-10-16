@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: on_set_session_settings pins session cache TTL and recipe.
+// Modified by Jonathan Mohrbacher, 2026: on_set_session_settings pins session cache TTL and recipe; rolling memory setting in settings/set.
 use super::*;
 
 impl GooseAcpAgent {
@@ -100,6 +100,13 @@ impl GooseAcpAgent {
             if normalized != "5m" && normalized != "1h" {
                 return Err(agent_client_protocol::Error::invalid_params()
                     .data("invalid cacheTtl: must be '5m' or '1h'"));
+            }
+        }
+
+        if let Some(Some(dto)) = &req.rolling_memory {
+            if let Err(msg) = dto.validate() {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data(format!("invalid rollingMemory: {msg}")));
             }
         }
 
@@ -208,6 +215,22 @@ impl GooseAcpAgent {
                 .internal_err_ctx("Failed to persist recipe to session")?;
         } else if session.recipe.is_some() {
             self.apply_session_recipe(&agent, &session).await?;
+        }
+
+        if let Some(v) = req.rolling_memory {
+            let session = self
+                .session_manager
+                .get_session(session_id, false)
+                .await
+                .internal_err_ctx("Failed to re-read session")?;
+            let mut data = session.extension_data;
+            crate::context_mgmt::rolling::write_settings(&mut data, v.map(Into::into));
+            self.session_manager
+                .update(session_id)
+                .extension_data(data)
+                .apply()
+                .await
+                .internal_err_ctx("Failed to persist rolling memory settings to session")?;
         }
 
         Ok(EmptyResponse {})
