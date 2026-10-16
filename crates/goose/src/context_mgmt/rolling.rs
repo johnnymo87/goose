@@ -1305,12 +1305,30 @@ mod tests {
     }
 
     #[test]
-    fn rolling_settings_validate_zero_tail_invalid() {
-        let settings = RollingMemorySettings {
+    fn rolling_settings_validate_floors() {
+        let settings_zero_tail = RollingMemorySettings {
             budget_tokens: 100_000,
             tail_tokens: 0,
         };
-        assert!(settings.validate().is_err());
+        assert!(settings_zero_tail.validate().is_err());
+
+        let settings_small_budget = RollingMemorySettings {
+            budget_tokens: 9_999,
+            tail_tokens: 1_000,
+        };
+        assert!(settings_small_budget.validate().is_err());
+
+        let settings_small_tail = RollingMemorySettings {
+            budget_tokens: 10_000,
+            tail_tokens: 999,
+        };
+        assert!(settings_small_tail.validate().is_err());
+
+        let settings_valid = RollingMemorySettings {
+            budget_tokens: 10_000,
+            tail_tokens: 1_000,
+        };
+        assert!(settings_valid.validate().is_ok());
     }
 
     #[test]

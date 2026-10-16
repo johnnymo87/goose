@@ -314,23 +314,23 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
     let temp_dir = TempDir::new()?;
     let agent = Agent::new();
 
-    // Build 6 messages that exceed a 3000-token budget with a 1000-token tail
+    // Build 6 messages that exceed a 12000-token budget with a 3000-token tail
     // Messages 0, 1: Turn 1 (will be folded)
     // Messages 2, 3: Turn 2 (will be folded)
     // Messages 4, 5: Turn 3 (tail)
     let mut messages = vec![
-        build_long_message(rmcp::model::Role::User, "turn 1 prompt", 300),
-        build_long_message(rmcp::model::Role::Assistant, "turn 1 reply", 300),
-        build_long_message(rmcp::model::Role::User, "turn 2 prompt", 300),
-        build_long_message(rmcp::model::Role::Assistant, "turn 2 reply", 300),
-        build_long_message(rmcp::model::Role::User, "turn 3 prompt", 300),
-        build_long_message(rmcp::model::Role::Assistant, "turn 3 reply", 300),
+        build_long_message(rmcp::model::Role::User, "turn 1 prompt", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "turn 1 reply", 1500),
+        build_long_message(rmcp::model::Role::User, "turn 2 prompt", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "turn 2 reply", 1500),
+        build_long_message(rmcp::model::Role::User, "turn 3 prompt", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "turn 3 reply", 1500),
     ];
     // Attach usage to turn 3 assistant so it serves as an anchor
     messages[5].metadata.usage = Some(Box::new(MessageUsage {
-        input_tokens: Some(6500),
-        output_tokens: Some(500),
-        total_tokens: Some(7000),
+        input_tokens: Some(24_000),
+        output_tokens: Some(1000),
+        total_tokens: Some(25_000),
         ..Default::default()
     }));
 
@@ -339,11 +339,11 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
         &temp_dir,
         "test-fold-happens",
         messages,
-        Some(Usage::new(Some(6500), Some(500), Some(7000))),
+        Some(Usage::new(Some(24_000), Some(1000), Some(25_000))),
     )
     .await?;
 
-    // Enable rolling memory: budget 3000, tail 1000
+    // Enable rolling memory: budget 12000, tail 3000
     let mut s = agent
         .config
         .session_manager
@@ -352,8 +352,8 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
     rolling::write_settings(
         &mut s.extension_data,
         Some(RollingMemorySettings {
-            budget_tokens: 3000,
-            tail_tokens: 1000,
+            budget_tokens: 12_000,
+            tail_tokens: 3_000,
         }),
     );
     agent
@@ -806,8 +806,8 @@ async fn rolling_refuses_unrolled_agent_loop() -> Result<()> {
     rolling::write_settings(
         &mut s.extension_data,
         Some(RollingMemorySettings {
-            budget_tokens: 3000,
-            tail_tokens: 1000,
+            budget_tokens: 12_000,
+            tail_tokens: 3_000,
         }),
     );
     agent
@@ -856,15 +856,15 @@ async fn rolling_metrics_use_retained_form() -> Result<()> {
     let agent = Agent::new();
 
     let mut messages = vec![
-        build_long_message(rmcp::model::Role::User, "prompt 1", 300),
-        build_long_message(rmcp::model::Role::Assistant, "reply 1", 300),
-        build_long_message(rmcp::model::Role::User, "prompt 2", 300),
-        build_long_message(rmcp::model::Role::Assistant, "reply 2", 300),
+        build_long_message(rmcp::model::Role::User, "prompt 1", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "reply 1", 1500),
+        build_long_message(rmcp::model::Role::User, "prompt 2", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "reply 2", 1500),
     ];
     messages[3].metadata.usage = Some(Box::new(MessageUsage {
-        input_tokens: Some(6500),
-        output_tokens: Some(500),
-        total_tokens: Some(7000),
+        input_tokens: Some(24_000),
+        output_tokens: Some(1000),
+        total_tokens: Some(25_000),
         ..Default::default()
     }));
 
@@ -873,7 +873,7 @@ async fn rolling_metrics_use_retained_form() -> Result<()> {
         &temp_dir,
         "test-metrics-retained",
         messages,
-        Some(Usage::new(Some(6500), Some(500), Some(7000))),
+        Some(Usage::new(Some(24_000), Some(1000), Some(25_000))),
     )
     .await?;
 
@@ -885,8 +885,8 @@ async fn rolling_metrics_use_retained_form() -> Result<()> {
     rolling::write_settings(
         &mut s.extension_data,
         Some(RollingMemorySettings {
-            budget_tokens: 3000,
-            tail_tokens: 1000,
+            budget_tokens: 12_000,
+            tail_tokens: 3_000,
         }),
     );
     agent
@@ -967,15 +967,15 @@ async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
     let agent = Agent::new();
 
     let mut messages = vec![
-        build_long_message(rmcp::model::Role::User, "prompt 1", 300),
-        build_long_message(rmcp::model::Role::Assistant, "reply 1", 300),
-        build_long_message(rmcp::model::Role::User, "prompt 2", 300),
-        build_long_message(rmcp::model::Role::Assistant, "reply 2", 300),
+        build_long_message(rmcp::model::Role::User, "prompt 1", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "reply 1", 1500),
+        build_long_message(rmcp::model::Role::User, "prompt 2", 1500),
+        build_long_message(rmcp::model::Role::Assistant, "reply 2", 1500),
     ];
     messages[3].metadata.usage = Some(Box::new(MessageUsage {
-        input_tokens: Some(6500),
-        output_tokens: Some(500),
-        total_tokens: Some(7000),
+        input_tokens: Some(24_000),
+        output_tokens: Some(1000),
+        total_tokens: Some(25_000),
         ..Default::default()
     }));
 
@@ -984,7 +984,7 @@ async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
         &temp_dir,
         "test-cancel-cleanly",
         messages,
-        Some(Usage::new(Some(6500), Some(500), Some(7000))),
+        Some(Usage::new(Some(24_000), Some(1000), Some(25_000))),
     )
     .await?;
 
@@ -996,8 +996,8 @@ async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
     rolling::write_settings(
         &mut s.extension_data,
         Some(RollingMemorySettings {
-            budget_tokens: 3000,
-            tail_tokens: 1000,
+            budget_tokens: 12_000,
+            tail_tokens: 3_000,
         }),
     );
     // Set initial consecutive_failures to 1
@@ -1006,7 +1006,7 @@ async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
         &rolling::RollingState {
             ratio: 1.45,
             consecutive_failures: 1,
-            failed_at_estimate: Some(7000),
+            failed_at_estimate: Some(25_000),
         },
     );
     agent

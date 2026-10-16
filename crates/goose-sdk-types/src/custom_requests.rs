@@ -235,10 +235,13 @@ pub struct RollingMemoryDto {
 }
 
 impl RollingMemoryDto {
-    /// 0 < tail < budget. Returns a message for invalid_params otherwise.
+    /// 0 < tail < budget, budget >= 10_000, tail >= 1_000. Returns a message for invalid_params otherwise.
     pub fn validate(&self) -> Result<(), String> {
-        if self.tail_tokens == 0 {
-            return Err("tailTokens must be greater than 0".to_string());
+        if self.tail_tokens < 1_000 {
+            return Err("tailTokens must be at least 1000".to_string());
+        }
+        if self.budget_tokens < 10_000 {
+            return Err("budgetTokens must be at least 10000".to_string());
         }
         if self.tail_tokens >= self.budget_tokens {
             return Err("tailTokens must be less than budgetTokens".to_string());
@@ -2425,5 +2428,14 @@ mod tests {
                 tail_tokens: 500,
             }))
         );
+    }
+
+    #[test]
+    fn rolling_memory_dto_validation() {
+        assert!(RollingMemoryDto { budget_tokens: 10_000, tail_tokens: 1_000 }.validate().is_ok());
+        assert!(RollingMemoryDto { budget_tokens: 9_999, tail_tokens: 1_000 }.validate().is_err());
+        assert!(RollingMemoryDto { budget_tokens: 10_000, tail_tokens: 999 }.validate().is_err());
+        assert!(RollingMemoryDto { budget_tokens: 10_000, tail_tokens: 10_000 }.validate().is_err());
+        assert!(RollingMemoryDto { budget_tokens: 10_000, tail_tokens: 11_000 }.validate().is_err());
     }
 }
