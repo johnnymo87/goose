@@ -217,9 +217,13 @@ impl Agent {
             .await;
         let lease = Arc::new(lease);
         let mut tools = lease.tools().await;
-        if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
-            tools.push(final_output_tool.tool());
-        }
+        let has_final_output =
+            if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
+                tools.push(final_output_tool.tool());
+                true
+            } else {
+                false
+            };
         ensure_unique_tool_names(&tools)?;
 
         #[cfg(feature = "code-mode")]
@@ -228,8 +232,18 @@ impl Agent {
         let code_execution_active = false;
 
         let mut tools = prepare_inference_tools(tools, code_execution_active);
-        if self.self_compact_available(&session).await {
-            tools.push(crate::agents::self_compact::self_compact_tool());
+        if !has_final_output && self.self_compact_available(&session).await {
+            if !tools
+                .iter()
+                .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME)
+            {
+                tools.push(crate::agents::self_compact::self_compact_tool());
+            } else {
+                tracing::warn!(
+                    "Extension already registered tool '{}'; skipping built-in self_compact_and_resume",
+                    crate::agents::self_compact::SELF_COMPACT_TOOL_NAME
+                );
+            }
         }
 
         let extensions_info = lease.instructions().await;

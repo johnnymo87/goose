@@ -1099,6 +1099,14 @@ impl Agent {
     }
 
     pub async fn self_compact_available(&self, session: &Session) -> bool {
+        if session.session_type == SessionType::SubAgent {
+            return false;
+        }
+
+        if session.recipe.as_ref().is_some_and(|r| r.retry.is_some()) {
+            return false;
+        }
+
         let enabled = Config::global()
             .get_param::<bool>("GOOSE_SELF_COMPACT")
             .unwrap_or(true);
@@ -1107,14 +1115,6 @@ impl Agent {
         }
 
         if self.final_output_tool.lock().await.is_some() {
-            return false;
-        }
-
-        if session.recipe.as_ref().is_some_and(|r| r.retry.is_some()) {
-            return false;
-        }
-
-        if session.session_type == SessionType::SubAgent {
             return false;
         }
 
@@ -1581,18 +1581,34 @@ impl Agent {
         };
 
         if include_final_output {
-            if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
-                prefixed_tools.push(final_output_tool.tool());
-            }
+            let has_final_output =
+                if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
+                    prefixed_tools.push(final_output_tool.tool());
+                    true
+                } else {
+                    false
+                };
 
-            if let Ok(session) = self
-                .config
-                .session_manager
-                .get_session(session_id, false)
-                .await
-            {
-                if self.self_compact_available(&session).await {
-                    prefixed_tools.push(crate::agents::self_compact::self_compact_tool());
+            if !has_final_output {
+                if let Ok(session) = self
+                    .config
+                    .session_manager
+                    .get_session(session_id, false)
+                    .await
+                {
+                    if self.self_compact_available(&session).await {
+                        if !prefixed_tools
+                            .iter()
+                            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME)
+                        {
+                            prefixed_tools.push(crate::agents::self_compact::self_compact_tool());
+                        } else {
+                            warn!(
+                                "Extension already registered tool '{}'; skipping built-in self_compact_and_resume",
+                                crate::agents::self_compact::SELF_COMPACT_TOOL_NAME
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -6927,466 +6943,6 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         assert_eq!(results[0]["policy_evaluated"], false);
         assert_eq!(results[0]["blocked_by"], "test-plugin");
         assert_eq!(results[0]["tool_call_id"], "call-closed-1");
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_listed_when_available() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let (agent, session_id) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
-        )
-        .await?;
-        let session = agent
-            .config
-            .session_manager
-            .get_session(&session_id, false)
-            .await?;
-
-        assert!(agent.self_compact_available(&session).await);
-
-        let tools = agent.list_tools(&session.id, None).await;
-        assert!(tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-
-        let (_, _, prep_tools, _, _, _) = agent.prepare_tools_and_prompt(&session).await?;
-        assert!(prep_tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_not_listed_when_session_cannot_be_loaded() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let (agent, _) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
-        )
-        .await?;
-
-        let tools = agent.list_tools("non-existent-session-id", None).await;
-        assert!(!tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_not_listed_when_disabled_by_config() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", Some("false")),
-        ]);
-        let (agent, session_id) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
-        )
-        .await?;
-        let session = agent
-            .config
-            .session_manager
-            .get_session(&session_id, false)
-            .await?;
-
-        assert!(!agent.self_compact_available(&session).await);
-
-        let tools = agent.list_tools(&session.id, None).await;
-        assert!(!tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-
-        let (_, _, prep_tools, _, _, _) = agent.prepare_tools_and_prompt(&session).await?;
-        assert!(!prep_tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_not_listed_when_final_output_tool_set() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let (agent, session_id) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
-        )
-        .await?;
-        let session = agent
-            .config
-            .session_manager
-            .get_session(&session_id, false)
-            .await?;
-
-        let response = Response {
-            json_schema: Some(serde_json::json!({
-                "type": "object",
-                "properties": { "result": { "type": "string" } }
-            })),
-        };
-        agent.add_final_output_tool(response).await?;
-
-        assert!(!agent.self_compact_available(&session).await);
-
-        let tools = agent.list_tools(&session.id, None).await;
-        assert!(!tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-
-        let (_, _, prep_tools, _, _, _) = agent.prepare_tools_and_prompt(&session).await?;
-        assert!(!prep_tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-        Ok(())
-    }
-
-    struct SelfCompactContextOwningProvider;
-    #[async_trait::async_trait]
-    impl crate::providers::base::Provider for SelfCompactContextOwningProvider {
-        async fn stream(
-            &self,
-            _model_config: &goose_providers::model::ModelConfig,
-            _system_prompt: &str,
-            _messages: &[Message],
-            _tools: &[Tool],
-        ) -> Result<MessageStream, ProviderError> {
-            Ok(stream_from_single_message(
-                Message::assistant().with_text("mock"),
-                ProviderUsage::new("mock-model".to_string(), Usage::default()),
-            ))
-        }
-        fn get_name(&self) -> &str {
-            "self-compact-context-owning"
-        }
-        fn manages_own_context(&self) -> bool {
-            true
-        }
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_not_listed_when_provider_manages_own_context() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let (agent, session_id) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(SelfCompactContextOwningProvider),
-        )
-        .await?;
-        let session = agent
-            .config
-            .session_manager
-            .get_session(&session_id, false)
-            .await?;
-
-        assert!(!agent.self_compact_available(&session).await);
-
-        let tools = agent.list_tools(&session.id, None).await;
-        assert!(!tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-
-        let (_, _, prep_tools, _, _, _) = agent.prepare_tools_and_prompt(&session).await?;
-        assert!(!prep_tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_not_listed_for_subagent_session() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let provider = Arc::new(CountingTextProvider::new());
-        let (agent, _) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            provider.clone(),
-        )
-        .await?;
-        let subagent_session = agent
-            .config
-            .session_manager
-            .create_session(
-                std::path::PathBuf::default(),
-                "subagent".to_string(),
-                SessionType::SubAgent,
-                GooseMode::Auto,
-            )
-            .await?;
-        agent
-            .update_provider(
-                provider,
-                goose_providers::model::ModelConfig::new("mock-model"),
-                &subagent_session.id,
-            )
-            .await?;
-
-        assert!(!agent.self_compact_available(&subagent_session).await);
-
-        let tools = agent.list_tools(&subagent_session.id, None).await;
-        assert!(!tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-
-        let (_, _, prep_tools, _, _, _) = agent.prepare_tools_and_prompt(&subagent_session).await?;
-        assert!(!prep_tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_not_listed_when_recipe_retry_configured() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let provider = Arc::new(CountingTextProvider::new());
-        let (agent, _) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            provider.clone(),
-        )
-        .await?;
-        let mut recipe = crate::recipe::Recipe::builder()
-            .title("test-recipe")
-            .description("test-desc")
-            .instructions("test-instructions")
-            .build()
-            .unwrap();
-        recipe.retry = Some(crate::agents::types::RetryConfig {
-            max_retries: 3,
-            timeout_seconds: None,
-            on_failure: None,
-            on_failure_timeout_seconds: None,
-            checks: vec![],
-        });
-        let recipe_session = agent
-            .config
-            .session_manager
-            .create_session(
-                std::path::PathBuf::default(),
-                "recipe".to_string(),
-                SessionType::User,
-                GooseMode::Auto,
-            )
-            .await?;
-        agent
-            .update_provider(
-                provider,
-                goose_providers::model::ModelConfig::new("mock-model"),
-                &recipe_session.id,
-            )
-            .await?;
-        agent
-            .config
-            .session_manager
-            .update(&recipe_session.id)
-            .recipe(Some(recipe))
-            .apply()
-            .await?;
-        let recipe_session = agent
-            .config
-            .session_manager
-            .get_session(&recipe_session.id, false)
-            .await?;
-
-        assert!(!agent.self_compact_available(&recipe_session).await);
-
-        let tools = agent.list_tools(&recipe_session.id, None).await;
-        assert!(!tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-
-        let (_, _, prep_tools, _, _, _) = agent.prepare_tools_and_prompt(&recipe_session).await?;
-        assert!(!prep_tools
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_dispatch_success() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let (agent, session_id) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
-        )
-        .await?;
-        let session = agent
-            .config
-            .session_manager
-            .get_session(&session_id, false)
-            .await?;
-
-        let lease = agent.resolve_lease(&session.id, &session.working_dir).await;
-        let tool_call = rmcp::model::CallToolRequestParams::new(
-            crate::agents::self_compact::SELF_COMPACT_TOOL_NAME,
-        )
-        .with_arguments(rmcp::object!({ "prompt": "Continue with task B" }));
-
-        let (req_id, result) = agent
-            .dispatch_tool_call_on(&lease, tool_call, "call-1".to_string(), None, &session)
-            .await;
-        assert_eq!(req_id, "call-1");
-        let tool_call_result = result.expect("dispatch should return Ok");
-        let output = tool_call_result
-            .result
-            .await
-            .expect("tool call result success");
-        assert_ne!(output.is_error, Some(true));
-        assert_eq!(
-            output.content[0].as_text().unwrap().text,
-            crate::agents::self_compact::SELF_COMPACT_SUCCESS_MESSAGE
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_dispatch_validation_errors() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let (agent, session_id) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
-        )
-        .await?;
-        let session = agent
-            .config
-            .session_manager
-            .get_session(&session_id, false)
-            .await?;
-        let lease = agent.resolve_lease(&session.id, &session.working_dir).await;
-
-        // Missing prompt
-        let call_missing = rmcp::model::CallToolRequestParams::new(
-            crate::agents::self_compact::SELF_COMPACT_TOOL_NAME,
-        );
-        let (_, res) = agent
-            .dispatch_tool_call_on(
-                &lease,
-                call_missing,
-                "call-missing".to_string(),
-                None,
-                &session,
-            )
-            .await;
-        let out = res.unwrap().result.await.unwrap();
-        assert_eq!(out.is_error, Some(true));
-
-        // Empty prompt
-        let call_empty = rmcp::model::CallToolRequestParams::new(
-            crate::agents::self_compact::SELF_COMPACT_TOOL_NAME,
-        )
-        .with_arguments(rmcp::object!({ "prompt": "   " }));
-        let (_, res) = agent
-            .dispatch_tool_call_on(&lease, call_empty, "call-empty".to_string(), None, &session)
-            .await;
-        let out = res.unwrap().result.await.unwrap();
-        assert_eq!(out.is_error, Some(true));
-
-        // Oversized prompt
-        let call_oversized = rmcp::model::CallToolRequestParams::new(
-            crate::agents::self_compact::SELF_COMPACT_TOOL_NAME,
-        )
-        .with_arguments(rmcp::object!({ "prompt": "x".repeat(crate::agents::self_compact::SELF_COMPACT_PROMPT_MAX_CHARS + 1) }));
-        let (_, res) = agent
-            .dispatch_tool_call_on(
-                &lease,
-                call_oversized,
-                "call-over".to_string(),
-                None,
-                &session,
-            )
-            .await;
-        let out = res.unwrap().result.await.unwrap();
-        assert_eq!(out.is_error, Some(true));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_self_compact_tool_dispatch_unavailable() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let _env = env_lock::lock_env([
-            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
-            ("GOOSE_SELF_COMPACT", None::<&str>),
-        ]);
-        let (agent, session_id) = create_test_agent(
-            temp_dir.path().join("data"),
-            crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
-        )
-        .await?;
-        let session = agent
-            .config
-            .session_manager
-            .get_session(&session_id, false)
-            .await?;
-
-        // Make unavailable by setting final output tool
-        agent
-            .add_final_output_tool(Response {
-                json_schema: Some(serde_json::json!({ "type": "object" })),
-            })
-            .await?;
-
-        let lease = agent.resolve_lease(&session.id, &session.working_dir).await;
-        let tool_call = rmcp::model::CallToolRequestParams::new(
-            crate::agents::self_compact::SELF_COMPACT_TOOL_NAME,
-        )
-        .with_arguments(rmcp::object!({ "prompt": "Resume" }));
-
-        let (_, res) = agent
-            .dispatch_tool_call_on(
-                &lease,
-                tool_call,
-                "call-unavail".to_string(),
-                None,
-                &session,
-            )
-            .await;
-        let out = res.unwrap().result.await.unwrap();
-        assert_eq!(out.is_error, Some(true));
-        assert!(out.content[0]
-            .as_text()
-            .unwrap()
-            .text
-            .contains("self_compact_and_resume is not available in this session"));
-        Ok(())
     }
 
     #[tokio::test]
