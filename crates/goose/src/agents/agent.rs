@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch.
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh.
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -340,7 +340,7 @@ async fn persist_and_push_message_with_id(
     Ok(message)
 }
 
-async fn persist_turn_context_if_changed(
+pub(crate) async fn persist_turn_context_if_changed(
     session_manager: &SessionManager,
     session_id: &str,
     conversation: &mut Conversation,
@@ -353,7 +353,7 @@ async fn persist_turn_context_if_changed(
         .messages()
         .iter()
         .rev()
-        .find(|message| message.is_turn_context())
+        .find(|message| message.is_turn_context() && message.is_agent_visible())
         .is_some_and(|current| current.as_concat_text() == turn_context.as_concat_text())
     {
         return Ok(());
@@ -2839,9 +2839,10 @@ impl Agent {
             let mut retrying_after_stop_hook_denial = false;
             let mut consecutive_stop_hook_blocks = 0u32;
             let stop_hook_block_cap = self.stop_hook_block_cap();
+            let mut pending_self_compact: Option<String> = None;
             let mut can_drain_pending_steers = false;
             let turn_start = chrono::Local::now();
-            let turn_start_compaction_info =
+            let mut turn_start_compaction_info =
                 super::moim::compute_compaction_info(&session_config.id, &self.extension_manager)
                     .await;
 
@@ -2862,7 +2863,7 @@ impl Agent {
             )
             .await?;
             // Snapshot after the turn-context append so a retry keeps the sent prefix.
-            let initial_messages = conversation.messages().clone();
+            let mut initial_messages = conversation.messages().clone();
 
             let mut first_inference = true;
             loop {
@@ -2902,6 +2903,77 @@ impl Agent {
                         .await,
                     )
                     .await?;
+                }
+
+                if let Some(prompt) = pending_self_compact.take() {
+                    if turns_taken >= max_turns {
+                        let notice = crate::agents::self_compact::self_compact_skipped_notice(&prompt);
+                        session_manager.add_message(&session_config.id, &notice).await?;
+                        conversation.push(notice.clone());
+                        yield AgentEvent::Message(notice);
+                    } else {
+                        yield AgentEvent::Message(crate::agents::self_compact::self_compact_progress_notice());
+                        let provider = self.provider().await?;
+                        match crate::agents::self_compact::execute_self_compact(
+                            &session_manager,
+                            &session_config.id,
+                            provider.as_ref(),
+                            &model_config,
+                            &cancel_token,
+                            &prompt,
+                        )
+                        .await?
+                        {
+                            crate::agents::self_compact::SelfCompactOutcome::Success(success) => {
+                                let crate::agents::self_compact::SelfCompactSuccess {
+                                    new_conversation,
+                                    note_message,
+                                    resume_message,
+                                    retained_context_tokens,
+                                    usage,
+                                } = *success;
+                                self.update_session_metrics(
+                                    &session_config.id,
+                                    session_config.schedule_id.clone(),
+                                    &usage,
+                                    Some(retained_context_tokens),
+                                )
+                                .await?;
+                                yield AgentEvent::HistoryReplaced(new_conversation.clone());
+                                yield AgentEvent::Message(note_message);
+                                yield AgentEvent::Message(resume_message);
+                                conversation = new_conversation;
+                                compaction_attempts = 0;
+                                turn_start_compaction_info = super::moim::compute_compaction_info(
+                                    &session_config.id,
+                                    &self.extension_manager,
+                                )
+                                .await;
+                                persist_turn_context_if_changed(
+                                    &session_manager,
+                                    &session_config.id,
+                                    &mut conversation,
+                                    super::moim::turn_context_message(
+                                        &session_config.id,
+                                        &self.extension_manager,
+                                        &inference_lease,
+                                        turns_taken,
+                                        max_turns,
+                                        turn_start,
+                                        turn_start_compaction_info.clone(),
+                                    )
+                                    .await,
+                                )
+                                .await?;
+                                initial_messages = conversation.messages().clone();
+                            }
+                            crate::agents::self_compact::SelfCompactOutcome::Failed { notice, .. } => {
+                                conversation.push(notice.clone());
+                                yield AgentEvent::Message(notice);
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 if can_drain_pending_steers {
@@ -3404,6 +3476,10 @@ impl Agent {
                                         }
                                     };
 
+                                    if let Some(prompt) = crate::agents::self_compact::check_self_compact_call(request, &final_response) {
+                                        pending_self_compact = Some(prompt);
+                                    }
+
                                     // Response placeholder is created before tools run, so clamp request to avoid inverted ordering.
                                     if request_msg.created > final_response.created {
                                         request_msg.created = final_response.created;
@@ -3827,6 +3903,20 @@ impl Agent {
                 }
 
                 tokio::task::yield_now().await;
+            }
+
+            if let Some(prompt) = pending_self_compact.take() {
+                let is_cancelled = is_token_cancelled(&cancel_token);
+                let reason = if is_cancelled {
+                    "cancelled"
+                } else {
+                    "run ended before compaction"
+                };
+                let notice = crate::agents::self_compact::self_compact_failed_notice(reason, &prompt);
+                if let Err(e) = session_manager.add_message(&session_config.id, &notice).await {
+                    warn!("Failed to persist self-compaction leftover notice: {e}");
+                }
+                yield AgentEvent::Message(notice);
             }
 
             if !last_assistant_text.is_empty()
