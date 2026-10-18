@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold.
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind.
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,7 +53,7 @@ use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
 use crate::config::{Config, GooseMode};
 use crate::context_mgmt::{
-    check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
+    check_if_compaction_needed, compact_messages, CompactionKind, DEFAULT_COMPACTION_THRESHOLD,
 };
 use crate::conversation::message::{
     ActionRequiredData, InferenceMetadata, Message, MessageContent, MessageUsage, ProviderMetadata,
@@ -2570,7 +2570,7 @@ impl Agent {
                     &compact_model_config,
                     &session_config.id,
                     &conversation_to_compact,
-                    false,
+                    CompactionKind::Auto,
                 )
                 .await
                 {
@@ -3371,7 +3371,7 @@ impl Agent {
                                 &model_config,
                                 &session_config.id,
                                 &conversation,
-                                false,
+                                CompactionKind::Auto,
                             )
                             .await
                             {
