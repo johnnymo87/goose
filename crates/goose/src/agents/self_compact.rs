@@ -1477,6 +1477,10 @@ mod tests {
             .get_session(&recipe_session.id, false)
             .await?;
 
+        assert!(
+            setup.agent.final_output_tool.lock().await.is_none(),
+            "final_output_tool must not be installed in memory"
+        );
         assert_self_compact_unavailable(&setup.agent, &recipe_session).await
     }
 }

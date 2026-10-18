@@ -2435,8 +2435,10 @@ fn test_prompt_self_compact() {
     });
 }
 
+/// Regression guard: a recipe session (with response schema) loaded on a fresh connection
+/// must never list self_compact_and_resume.
 #[tokio::test]
-async fn test_session_settings_reload_excludes_self_compact_for_recipe_response_schema() {
+async fn test_recipe_session_after_reload_never_lists_self_compact_and_resume() {
     run_test(async move {
         let temp_data = tempfile::tempdir().unwrap();
         let openai = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;

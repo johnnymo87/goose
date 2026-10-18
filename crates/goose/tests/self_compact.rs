@@ -9,7 +9,6 @@ use goose::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig
 use goose::config::permission::PermissionManager;
 use goose::config::GooseMode;
 use goose::conversation::message::Message;
-use goose::conversation::Conversation;
 use goose::providers::base::{stream_from_single_message, MessageStream, Provider};
 use goose::session::session_manager::{Session, SessionManager, SessionType};
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
@@ -34,27 +33,50 @@ type SummaryHook = Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 struct ScriptedSelfCompactProvider {
     normal_responses: Arc<Mutex<Vec<Message>>>,
-    summary_response: Arc<Mutex<Option<Result<Message, ProviderError>>>>,
+    summary_responses: Arc<Mutex<Vec<Result<Message, ProviderError>>>>,
     recorded_calls: Arc<Mutex<Vec<RecordedCall>>>,
     on_summary: Arc<Mutex<Option<SummaryHook>>>,
+    normal_usage: Arc<Mutex<Option<Usage>>>,
 }
 
 impl ScriptedSelfCompactProvider {
     fn new(normal_responses: Vec<Message>) -> Self {
         Self {
             normal_responses: Arc::new(Mutex::new(normal_responses)),
-            summary_response: Arc::new(Mutex::new(None)),
+            summary_responses: Arc::new(Mutex::new(Vec::new())),
             recorded_calls: Arc::new(Mutex::new(Vec::new())),
             on_summary: Arc::new(Mutex::new(None)),
+            normal_usage: Arc::new(Mutex::new(None)),
         }
     }
 
     fn with_summary_error(self, err: ProviderError) -> Self {
         Self {
             normal_responses: self.normal_responses,
-            summary_response: Arc::new(Mutex::new(Some(Err(err)))),
+            summary_responses: Arc::new(Mutex::new(vec![Err(err)])),
             recorded_calls: self.recorded_calls,
             on_summary: self.on_summary,
+            normal_usage: self.normal_usage,
+        }
+    }
+
+    fn with_summary_responses(self, responses: Vec<Result<Message, ProviderError>>) -> Self {
+        Self {
+            normal_responses: self.normal_responses,
+            summary_responses: Arc::new(Mutex::new(responses)),
+            recorded_calls: self.recorded_calls,
+            on_summary: self.on_summary,
+            normal_usage: self.normal_usage,
+        }
+    }
+
+    fn with_normal_usage(self, usage: Usage) -> Self {
+        Self {
+            normal_responses: self.normal_responses,
+            summary_responses: self.summary_responses,
+            recorded_calls: self.recorded_calls,
+            on_summary: self.on_summary,
+            normal_usage: Arc::new(Mutex::new(Some(usage))),
         }
     }
 
@@ -88,17 +110,18 @@ impl Provider for ScriptedSelfCompactProvider {
             if let Some(fut) = hook {
                 fut.await;
             }
-            let resp = self.summary_response.lock().await.clone();
+            let mut guard = self.summary_responses.lock().await;
+            let resp = if guard.is_empty() {
+                Ok(Message::assistant().with_text("<mock summary of conversation>"))
+            } else {
+                guard.remove(0)
+            };
             match resp {
-                Some(Ok(msg)) => Ok(stream_from_single_message(
+                Ok(msg) => Ok(stream_from_single_message(
                     msg,
                     ProviderUsage::new("mock-model".to_string(), Usage::default()),
                 )),
-                Some(Err(err)) => Err(err),
-                None => Ok(stream_from_single_message(
-                    Message::assistant().with_text("<mock summary of conversation>"),
-                    ProviderUsage::new("mock-model".to_string(), Usage::default()),
-                )),
+                Err(err) => Err(err),
             }
         } else {
             let mut guard = self.normal_responses.lock().await;
@@ -107,9 +130,10 @@ impl Provider for ScriptedSelfCompactProvider {
             } else {
                 guard.remove(0)
             };
+            let usage = self.normal_usage.lock().await.unwrap_or_default();
             Ok(stream_from_single_message(
                 msg,
-                ProviderUsage::new("mock-model".to_string(), Usage::default()),
+                ProviderUsage::new("mock-model".to_string(), usage),
             ))
         }
     }
@@ -714,6 +738,98 @@ async fn test_failed_compaction_drains_pending_steers_self_compact() -> Result<(
 }
 
 #[tokio::test]
+async fn test_failed_compaction_allows_retry_when_steer_continues_run_self_compact() -> Result<()> {
+    let ctx = TestContext::new().await?;
+
+    let tc1 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "First prompt" }));
+    let tc2 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "Retry prompt" }));
+    let turn1_msg = Message::assistant().with_tool_request("call_1", Ok(tc1));
+    let turn2_msg = Message::assistant().with_tool_request("call_2", Ok(tc2));
+    let turn3_msg = Message::assistant().with_text("done after retry");
+
+    // Summary responses: first attempt fails, second attempt succeeds
+    let provider = Arc::new(
+        ScriptedSelfCompactProvider::new(vec![turn1_msg, turn2_msg, turn3_msg])
+            .with_summary_responses(vec![
+                Err(ProviderError::ExecutionError(
+                    "first summary failed".to_string(),
+                )),
+                Ok(Message::assistant().with_text("<successful second summary>")),
+            ]),
+    );
+    let recorded_calls = provider.recorded_calls.clone();
+
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+    let agent_clone = ctx.agent.clone();
+    let session_id_clone = ctx.session.id.clone();
+    provider
+        .set_on_summary(move || {
+            let attempt = attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ag = agent_clone.clone();
+            let sid = session_id_clone.clone();
+            Box::pin(async move {
+                if attempt == 0 {
+                    ag.steer(&sid, Message::user().with_text("please retry compaction"))
+                        .await;
+                }
+            })
+        })
+        .await;
+
+    ctx.agent
+        .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
+        .await?;
+
+    let reply_stream = ctx
+        .agent
+        .reply(
+            Message::user().with_text("start work"),
+            ctx.session_config(Some(5)),
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(reply_stream);
+
+    let mut events = Vec::new();
+    while let Some(res) = reply_stream.next().await {
+        events.push(res?);
+    }
+
+    // Provider calls: Turn 1 (calls R1) -> Summary 1 (fails) -> Turn 2 (handles steer, calls R2) -> Summary 2 (succeeds) -> Turn 3 ("done after retry")
+    let calls = recorded_calls.lock().await.clone();
+    let summary_calls = calls.iter().filter(|c| c.is_summary).count();
+    assert_eq!(
+        summary_calls, 2,
+        "Exactly 2 summary calls expected: 1 failed, 1 retried successfully"
+    );
+
+    // Verify DB conversation has the final successful resume message
+    let reloaded = ctx
+        .session_manager
+        .get_session(&ctx.session.id, true)
+        .await?;
+    let conv = reloaded.conversation.unwrap();
+    assert!(
+        conv.messages()
+            .iter()
+            .any(|m| m.as_concat_text() == "Retry prompt"),
+        "Retry prompt must be in DB after successful retry"
+    );
+    assert!(
+        conv.messages()
+            .iter()
+            .any(|m| m.as_concat_text() == "done after retry"),
+        "Final text after retry must be in DB"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_chat_mode_does_not_arm_self_compact() -> Result<()> {
     let ctx = TestContext::with_mode(GooseMode::Chat).await?;
 
@@ -997,9 +1113,10 @@ async fn test_max_turns_skips_compaction_self_compact() -> Result<()> {
     }
 
     let calls = recorded_calls.lock().await.clone();
-    assert_eq!(calls.len(), 1);
+    assert_eq!(calls.len(), 1, "Only 1 turn should run (no summary call)");
     assert!(!calls[0].is_summary);
 
+    // Skipped notice was yielded in events
     let has_notice = events.iter().any(|e| match e {
         AgentEvent::Message(m) => {
             m.as_concat_text()
@@ -1008,17 +1125,35 @@ async fn test_max_turns_skips_compaction_self_compact() -> Result<()> {
         }
         _ => false,
     });
-    assert!(has_notice, "Skipped notice missing");
+    assert!(has_notice, "Skipped notice missing from events");
 
+    // Skipped notice was persisted in DB
     let reloaded = ctx
         .session_manager
         .get_session(&ctx.session.id, true)
         .await?;
     let conv = reloaded.conversation.unwrap();
+    let notice_in_db = conv.messages().iter().any(|m| {
+        m.as_concat_text()
+            .contains("Self-compaction skipped: the turn limit was reached")
+            && m.as_concat_text().contains("R on last turn")
+    });
+    assert!(notice_in_db, "Skipped notice must be persisted in DB");
+
+    // No resume message in DB
     assert!(!conv
         .messages()
         .iter()
         .any(|m| m.as_concat_text() == "R on last turn"));
+
+    // Max turns message was also yielded
+    let has_max_turns = events.iter().any(|e| match e {
+        AgentEvent::Message(m) => m
+            .as_concat_text()
+            .contains("reached the maximum number of actions"),
+        _ => false,
+    });
+    assert!(has_max_turns, "Max turns message missing");
 
     Ok(())
 }
@@ -1194,52 +1329,24 @@ async fn test_turn_context_after_compaction_not_stale_self_compact() -> Result<(
 async fn test_rolling_memory_does_not_fold_after_self_compact() -> Result<()> {
     let ctx = TestContext::new().await?;
 
-    // Enable rolling memory with tight budget
-    let settings = goose::context_mgmt::rolling::RollingMemorySettings {
-        budget_tokens: 1_000,
-        tail_tokens: 400,
-    };
-    let mut session = ctx
-        .session_manager
-        .get_session(&ctx.session.id, false)
-        .await?;
-    goose::context_mgmt::rolling::write_settings(&mut session.extension_data, Some(settings));
-    ctx.session_manager
-        .update(&ctx.session.id)
-        .extension_data(session.extension_data.clone())
-        .apply()
-        .await?;
-
-    // Seed conversation with history that exceeds 1,000 budget
-    let long_text = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(30);
-    let mut initial_msgs = Vec::new();
-    for i in 0..6 {
-        initial_msgs.push(Message::user().with_text(format!("user {i}: {long_text}")));
-        initial_msgs.push(Message::assistant().with_text(format!("assistant {i}: {long_text}")));
-    }
-    let pre_conv = Conversation::new_unvalidated(initial_msgs);
-    ctx.session_manager
-        .replace_conversation(&ctx.session.id, &pre_conv)
-        .await?;
-
-    // Verify that prior to compaction, rolling check would fold
-    let pre_check = goose::context_mgmt::rolling::check(&session, &settings, &pre_conv).await?;
-    assert!(
-        pre_check.is_some(),
-        "Pre-compaction conversation must exceed budget and trigger rolling memory check"
-    );
-
     let tool_call = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
         .with_arguments(rmcp::object!({ "prompt": "Resume prompt" }));
     let turn1_msg = Message::assistant().with_tool_request("call_1", Ok(tool_call));
-    let turn2_msg = Message::assistant().with_text("done");
+    let turn2_msg = Message::assistant().with_text("done run 1");
 
-    let provider = Arc::new(ScriptedSelfCompactProvider::new(vec![turn1_msg, turn2_msg]));
+    // Provider reports large normal usage (e.g. 40,000 input tokens) during normal turns
+    let provider =
+        Arc::new(
+            ScriptedSelfCompactProvider::new(vec![turn1_msg, turn2_msg])
+                .with_normal_usage(Usage::new(Some(40_000), Some(100), Some(40_100))),
+        );
+    let recorded_calls = provider.recorded_calls.clone();
+
     ctx.agent
         .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
         .await?;
 
-    // Run Turn 1: performs self-compaction
+    // Run 1: rolling memory is NOT enabled yet. Agent performs self-compaction.
     let reply_stream1 = ctx
         .agent
         .reply(
@@ -1254,22 +1361,43 @@ async fn test_rolling_memory_does_not_fold_after_self_compact() -> Result<()> {
         res?;
     }
 
-    // Verify session and conversation after Turn 1: under budget
+    // Assert run 1 made exactly one summary call
+    let calls = recorded_calls.lock().await.clone();
+    let summary_calls = calls.iter().filter(|c| c.is_summary).count();
+    assert_eq!(summary_calls, 1, "Run 1 must make exactly 1 summary call");
+
+    // Assert run 1 left the compaction note in the DB
     let reloaded = ctx
         .session_manager
         .get_session(&ctx.session.id, true)
         .await?;
-    let conversation = reloaded.conversation.clone().expect("conversation exists");
-
-    let post_check =
-        goose::context_mgmt::rolling::check(&reloaded, &settings, &conversation).await?;
+    let conv = reloaded.conversation.expect("conversation exists");
     assert!(
-        post_check.is_none(),
-        "Post-compaction conversation must not exceed budget"
+        conv.messages()
+            .iter()
+            .any(|m| m.as_concat_text() == SELF_COMPACTED_NOTE_TEXT),
+        "Compaction note must be in DB after run 1"
     );
 
-    // Run Turn 2 (new turn): verify it does NOT trigger rolling memory fold
-    let turn3_msg = Message::assistant().with_text("turn 2 finished");
+    // Now enable rolling memory with a budget of 10,000 tokens (well below the 40,000 uncompacted usage,
+    // but well above the ~200 retained tokens recorded by self-compaction).
+    let settings = goose::context_mgmt::rolling::RollingMemorySettings {
+        budget_tokens: 10_000,
+        tail_tokens: 4_000,
+    };
+    let mut session = ctx
+        .session_manager
+        .get_session(&ctx.session.id, false)
+        .await?;
+    goose::context_mgmt::rolling::write_settings(&mut session.extension_data, Some(settings));
+    ctx.session_manager
+        .update(&ctx.session.id)
+        .extension_data(session.extension_data)
+        .apply()
+        .await?;
+
+    // Run 2 (new turn): verify it does NOT fold!
+    let turn3_msg = Message::assistant().with_text("run 2 reply");
     let provider2 = Arc::new(ScriptedSelfCompactProvider::new(vec![turn3_msg]));
     ctx.agent
         .update_provider(provider2, ModelConfig::new("mock-model"), &ctx.session.id)
@@ -1278,7 +1406,7 @@ async fn test_rolling_memory_does_not_fold_after_self_compact() -> Result<()> {
     let reply_stream2 = ctx
         .agent
         .reply(
-            Message::user().with_text("next prompt"),
+            Message::user().with_text("next task in run 2"),
             ctx.session_config(Some(5)),
             false,
             None,
@@ -1298,7 +1426,7 @@ async fn test_rolling_memory_does_not_fold_after_self_compact() -> Result<()> {
     });
     assert!(
         !folded_event,
-        "Turn 2 must not fold history because self-compaction kept context under budget"
+        "Run 2 must not fold history because self-compaction kept context under budget"
     );
 
     Ok(())

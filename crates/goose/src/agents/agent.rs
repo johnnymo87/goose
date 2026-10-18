@@ -1277,40 +1277,42 @@ impl Agent {
         self.emit_pre_tool_extended_hooks(&tool_call.name, tool_input_for_hooks.as_ref(), session)
             .await;
 
-        let is_shadowed = lease
-            .tools()
-            .await
-            .iter()
-            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME);
+        if tool_call.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME {
+            let is_shadowed = lease
+                .tools()
+                .await
+                .iter()
+                .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME);
 
-        if tool_call.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME && !is_shadowed {
-            let result = if !self.self_compact_available(session).await {
-                ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "self_compact_and_resume is not available in this session",
-                )])))
-            } else if self.has_self_compacted_in_run(&session.id).await {
-                ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
-                    crate::agents::self_compact::SELF_COMPACT_ALREADY_COMPACTED_MESSAGE,
-                )])))
-            } else {
-                match crate::agents::self_compact::validate_self_compact_args(
-                    tool_call.arguments.as_ref(),
-                ) {
-                    Ok(_) => {
-                        self.record_self_compact_in_run(&session.id).await;
-                        ToolCallResult::from(Ok(CallToolResult::success(vec![ContentBlock::text(
-                            crate::agents::self_compact::SELF_COMPACT_SUCCESS_MESSAGE,
-                        )])))
+            if !is_shadowed {
+                let result = if !self.self_compact_available(session).await {
+                    ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
+                        "self_compact_and_resume is not available in this session",
+                    )])))
+                } else if self.has_self_compacted_in_run(&session.id).await {
+                    ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
+                        crate::agents::self_compact::SELF_COMPACT_ALREADY_COMPACTED_MESSAGE,
+                    )])))
+                } else {
+                    match crate::agents::self_compact::validate_self_compact_args(
+                        tool_call.arguments.as_ref(),
+                    ) {
+                        Ok(_) => {
+                            self.record_self_compact_in_run(&session.id).await;
+                            ToolCallResult::from(Ok(CallToolResult::success(vec![
+                                ContentBlock::text(
+                                    crate::agents::self_compact::SELF_COMPACT_SUCCESS_MESSAGE,
+                                ),
+                            ])))
+                        }
+                        Err(err) => ToolCallResult::from(Ok(CallToolResult::error(vec![
+                            ContentBlock::text(err),
+                        ]))),
                     }
-                    Err(err) => {
-                        ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
-                            err,
-                        )])))
-                    }
-                }
-            };
-            let result = self.with_post_tool_hook(result, &tool_call, session, &request_id);
-            return (request_id, Ok(result));
+                };
+                let result = self.with_post_tool_hook(result, &tool_call, session, &request_id);
+                return (request_id, Ok(result));
+            }
         }
 
         if tool_call.name == FINAL_OUTPUT_TOOL_NAME {
@@ -3045,6 +3047,7 @@ impl Agent {
                                 conversation.push(notice.clone());
                                 yield AgentEvent::Message(notice);
                                 if !is_cancelled && self.has_pending_steers(&session_config.id).await {
+                                    self.reset_self_compact_run(&session_config.id).await;
                                     continue;
                                 }
                                 break;
