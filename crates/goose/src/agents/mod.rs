@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: self-compaction module.
 mod agent;
 pub mod container;
 pub mod execute_commands;
@@ -17,6 +18,7 @@ pub mod reply_parts;
 pub mod retry;
 #[cfg(feature = "scheduler")]
 mod schedule_tool;
+pub mod self_compact;
 pub mod state_machine;
 pub mod subagent_execution_tool;
 pub(crate) mod subagent_handler;

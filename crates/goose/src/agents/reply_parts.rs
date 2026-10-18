@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: record side call usage for rolling memory; execute and handle rolling fold.
+// Modified by Jonathan Mohrbacher, 2026: record side call usage for rolling memory; execute and handle rolling fold; list self-compaction tool.
 use anyhow::Result;
 use goose_providers::errors::ProviderError;
 use regex::Regex;
@@ -227,7 +227,10 @@ impl Agent {
         #[cfg(not(feature = "code-mode"))]
         let code_execution_active = false;
 
-        let tools = prepare_inference_tools(tools, code_execution_active);
+        let mut tools = prepare_inference_tools(tools, code_execution_active);
+        if self.self_compact_available(&session).await {
+            tools.push(crate::agents::self_compact::self_compact_tool());
+        }
 
         let extensions_info = lease.instructions().await;
         let model_config = self.effective_model_config_for_session(&session.id).await?;
