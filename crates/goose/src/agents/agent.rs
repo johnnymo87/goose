@@ -1,5 +1,5 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh.
-use std::collections::HashMap;
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass.
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -304,6 +304,7 @@ pub struct Agent {
     pub(super) goal: Mutex<Option<String>>,
     pub(super) grind: Mutex<Option<String>>,
     steer_queues: Mutex<HashMap<String, SteerQueue>>,
+    self_compact_runs: Mutex<HashSet<String>>,
 }
 
 fn ensure_message_event_id(event: AgentEvent) -> AgentEvent {
@@ -525,6 +526,7 @@ impl Agent {
             goal: Mutex::new(None),
             grind: Mutex::new(None),
             steer_queues: Mutex::new(HashMap::new()),
+            self_compact_runs: Mutex::new(HashSet::new()),
         }
     }
 
@@ -664,6 +666,21 @@ impl Agent {
             .entry(session_id.to_string())
             .or_default()
             .clone()
+    }
+
+    pub(super) async fn reset_self_compact_run(&self, session_id: &str) {
+        self.self_compact_runs.lock().await.remove(session_id);
+    }
+
+    pub(super) async fn has_self_compacted_in_run(&self, session_id: &str) -> bool {
+        self.self_compact_runs.lock().await.contains(session_id)
+    }
+
+    pub(super) async fn record_self_compact_in_run(&self, session_id: &str) {
+        self.self_compact_runs
+            .lock()
+            .await
+            .insert(session_id.to_string());
     }
 
     async fn emit_pre_tool_extended_hooks(
@@ -1133,7 +1150,11 @@ impl Agent {
             return false;
         }
 
-        if session.recipe.as_ref().is_some_and(|r| r.retry.is_some()) {
+        if session
+            .recipe
+            .as_ref()
+            .is_some_and(|r| r.retry.is_some() || r.response.is_some())
+        {
             return false;
         }
 
@@ -1256,26 +1277,38 @@ impl Agent {
         self.emit_pre_tool_extended_hooks(&tool_call.name, tool_input_for_hooks.as_ref(), session)
             .await;
 
-        if tool_call.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME {
-            let result =
-                if !self.self_compact_available(session).await {
-                    ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
-                        "self_compact_and_resume is not available in this session",
-                    )])))
-                } else {
-                    match crate::agents::self_compact::validate_self_compact_args(
-                        tool_call.arguments.as_ref(),
-                    ) {
-                        Ok(_) => ToolCallResult::from(Ok(CallToolResult::success(vec![
-                            ContentBlock::text(
-                                crate::agents::self_compact::SELF_COMPACT_SUCCESS_MESSAGE,
-                            ),
-                        ]))),
-                        Err(err) => ToolCallResult::from(Ok(CallToolResult::error(vec![
-                            ContentBlock::text(err),
-                        ]))),
+        let is_shadowed = lease
+            .tools()
+            .await
+            .iter()
+            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME);
+
+        if tool_call.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME && !is_shadowed {
+            let result = if !self.self_compact_available(session).await {
+                ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "self_compact_and_resume is not available in this session",
+                )])))
+            } else if self.has_self_compacted_in_run(&session.id).await {
+                ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
+                    crate::agents::self_compact::SELF_COMPACT_ALREADY_COMPACTED_MESSAGE,
+                )])))
+            } else {
+                match crate::agents::self_compact::validate_self_compact_args(
+                    tool_call.arguments.as_ref(),
+                ) {
+                    Ok(_) => {
+                        self.record_self_compact_in_run(&session.id).await;
+                        ToolCallResult::from(Ok(CallToolResult::success(vec![ContentBlock::text(
+                            crate::agents::self_compact::SELF_COMPACT_SUCCESS_MESSAGE,
+                        )])))
                     }
-                };
+                    Err(err) => {
+                        ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
+                            err,
+                        )])))
+                    }
+                }
+            };
             let result = self.with_post_tool_hook(result, &tool_call, session, &request_id);
             return (request_id, Ok(result));
         }
@@ -2846,6 +2879,7 @@ impl Agent {
             }
         }
         let inner = Box::pin(async_stream::try_stream! {
+            self.reset_self_compact_run(&session_config.id).await;
             let mut session = session;
             let mut turns_taken = 0u32;
             let max_turns = session_config.max_turns.unwrap_or_else(|| {
@@ -2936,7 +2970,7 @@ impl Agent {
                     } else {
                         yield AgentEvent::Message(crate::agents::self_compact::self_compact_progress_notice());
                         let provider = self.provider().await?;
-                        match crate::agents::self_compact::execute_self_compact(
+                        let outcome = crate::agents::self_compact::execute_self_compact(
                             &session_manager,
                             &session_config.id,
                             provider.as_ref(),
@@ -2944,32 +2978,43 @@ impl Agent {
                             &cancel_token,
                             &prompt,
                         )
-                        .await?
-                        {
+                        .await;
+                        match outcome {
                             crate::agents::self_compact::SelfCompactOutcome::Success(success) => {
                                 let crate::agents::self_compact::SelfCompactSuccess {
                                     new_conversation,
+                                    history_replaced_conversation,
                                     note_message,
                                     resume_message,
                                     retained_context_tokens,
                                     usage,
                                 } = *success;
-                                let enriched = self
+                                let mut post_compaction_usage = match self
                                     .update_session_metrics(
                                         &session_config.id,
                                         session_config.schedule_id.clone(),
                                         &usage,
                                         Some(retained_context_tokens),
                                     )
-                                    .await?;
-                                let mut post_compaction_usage = enriched;
+                                    .await
+                                {
+                                    Ok(enriched) => enriched,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            session_id = %session_config.id,
+                                            error = %e,
+                                            "Failed to update session metrics after self-compaction"
+                                        );
+                                        usage
+                                    }
+                                };
                                 post_compaction_usage.usage = Usage::new(
                                     Some(retained_context_tokens),
                                     None,
                                     Some(retained_context_tokens),
                                 );
                                 yield AgentEvent::Usage(post_compaction_usage);
-                                yield AgentEvent::HistoryReplaced(new_conversation.clone());
+                                yield AgentEvent::HistoryReplaced(history_replaced_conversation);
                                 yield AgentEvent::Message(note_message);
                                 yield AgentEvent::Message(resume_message);
                                 conversation = new_conversation;
@@ -2993,9 +3038,15 @@ impl Agent {
                                 .await?;
                                 initial_messages = conversation.messages().clone();
                             }
-                            crate::agents::self_compact::SelfCompactOutcome::Failed { notice, .. } => {
+                            crate::agents::self_compact::SelfCompactOutcome::Failed {
+                                notice,
+                                is_cancelled,
+                            } => {
                                 conversation.push(notice.clone());
                                 yield AgentEvent::Message(notice);
+                                if !is_cancelled && self.has_pending_steers(&session_config.id).await {
+                                    continue;
+                                }
                                 break;
                             }
                         }
@@ -3956,6 +4007,7 @@ impl Agent {
             if !stop_hook_handled_for_exit {
                 self.emit_stop_hook(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy()).await;
             }
+            self.reset_self_compact_run(&session_config.id).await;
             drop(inference_lease);
         }.instrument(reply_stream_span));
         Ok(inner)

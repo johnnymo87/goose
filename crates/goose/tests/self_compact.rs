@@ -2,11 +2,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::StreamExt;
-use goose::agents::self_compact::{SELF_COMPACTED_NOTE_TEXT, SELF_COMPACT_TOOL_NAME};
+use goose::agents::self_compact::{
+    SELF_COMPACTED_NOTE_TEXT, SELF_COMPACT_ALREADY_COMPACTED_MESSAGE, SELF_COMPACT_TOOL_NAME,
+};
 use goose::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig};
 use goose::config::permission::PermissionManager;
 use goose::config::GooseMode;
 use goose::conversation::message::Message;
+use goose::conversation::Conversation;
 use goose::providers::base::{stream_from_single_message, MessageStream, Provider};
 use goose::session::session_manager::{Session, SessionManager, SessionType};
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
@@ -111,19 +114,23 @@ impl Provider for ScriptedSelfCompactProvider {
         }
     }
 
+    async fn get_context_limit(&self, _model: &str, override_limit: Option<usize>) -> usize {
+        override_limit.unwrap_or(100_000)
+    }
+
     fn get_name(&self) -> &str {
         "scripted-self-compact"
     }
 }
 
-async fn setup_agent(temp_dir: &TempDir) -> Result<(Agent, Arc<SessionManager>)> {
+async fn setup_agent(temp_dir: &TempDir, mode: GooseMode) -> Result<(Agent, Arc<SessionManager>)> {
     let session_manager = Arc::new(SessionManager::new(temp_dir.path().join("data")));
     let permission_manager = Arc::new(PermissionManager::new(temp_dir.path().join("data")));
     let config = AgentConfig::new(
         session_manager.clone(),
         permission_manager,
         None,
-        GooseMode::Auto,
+        mode,
         true,
         GoosePlatform::GooseCli,
     );
@@ -140,14 +147,18 @@ struct TestContext {
 
 impl TestContext {
     async fn new() -> Result<Self> {
+        Self::with_mode(GooseMode::Auto).await
+    }
+
+    async fn with_mode(mode: GooseMode) -> Result<Self> {
         let temp_dir = TempDir::new()?;
-        let (agent, session_manager) = setup_agent(&temp_dir).await?;
+        let (agent, session_manager) = setup_agent(&temp_dir, mode).await?;
         let session = session_manager
             .create_session(
                 temp_dir.path().to_path_buf(),
                 "test".to_string(),
                 SessionType::User,
-                GooseMode::Auto,
+                mode,
             )
             .await?;
         Ok(Self {
@@ -223,26 +234,37 @@ async fn test_happy_path_self_compact() -> Result<()> {
         );
     }
 
-    // Check summary message is present (agent-only)
-    assert!(calls[2]
+    // Assert exact request order in final request: summary, continuation, resume, turn context
+    let summary_pos = calls[2]
         .messages
         .iter()
-        .any(|m| m.as_concat_text().contains("mock summary")));
+        .position(|m| m.as_concat_text().contains("mock summary"))
+        .expect("summary in final request");
+    let cont_pos = calls[2]
+        .messages
+        .iter()
+        .position(|m| {
+            m.as_concat_text()
+                .contains("You compacted your own context")
+        })
+        .expect("continuation in final request");
+    let resume_pos = calls[2]
+        .messages
+        .iter()
+        .position(|m| m.as_concat_text().contains("R"))
+        .expect("resume in final request");
+    let tc_pos = calls[2]
+        .messages
+        .iter()
+        .position(|m| m.as_concat_text().contains("<turn-context>"))
+        .expect("turn context in final request");
 
-    // Check continuation message is present (agent-only)
-    assert!(calls[2].messages.iter().any(|m| m
-        .as_concat_text()
-        .contains("You compacted your own context")));
-
-    // Check resume prompt "R" and turn context are present (in request messages)
-    assert!(calls[2]
-        .messages
-        .iter()
-        .any(|m| m.as_concat_text().contains("R")));
-    assert!(calls[2]
-        .messages
-        .iter()
-        .any(|m| m.as_concat_text().contains("<turn-context>")));
+    assert!(summary_pos < cont_pos, "summary must precede continuation");
+    assert!(cont_pos < resume_pos, "continuation must precede resume");
+    assert!(
+        resume_pos <= tc_pos,
+        "resume must precede or accompany turn context"
+    );
 
     // Events include Usage event for compaction (retained tokens), HistoryReplaced, and resume user message
     let usage_idx = events
@@ -280,6 +302,53 @@ async fn test_happy_path_self_compact() -> Result<()> {
         history_idx < resume_idx,
         "HistoryReplaced must precede resume message"
     );
+
+    // HistoryReplaced carries conversation WITHOUT trailing note + resume
+    let history_replaced_conv = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::HistoryReplaced(c) => Some(c),
+            _ => None,
+        })
+        .expect("HistoryReplaced conversation");
+    assert!(
+        !history_replaced_conv
+            .messages()
+            .iter()
+            .any(|m| m.as_concat_text() == SELF_COMPACTED_NOTE_TEXT),
+        "HistoryReplaced must not contain compaction note"
+    );
+    assert!(
+        !history_replaced_conv
+            .messages()
+            .iter()
+            .any(|m| m.as_concat_text() == "R"),
+        "HistoryReplaced must not contain resume prompt"
+    );
+
+    // Simulate CLI/scheduler state: replacing conversation and then appending messages results in exactly 1 note and 1 resume
+    let mut client_messages: Vec<Message> = Vec::new();
+    for event in &events {
+        match event {
+            AgentEvent::HistoryReplaced(c) => {
+                client_messages = c.messages().clone();
+            }
+            AgentEvent::Message(m) => {
+                client_messages.push(m.clone());
+            }
+            _ => {}
+        }
+    }
+    let note_count = client_messages
+        .iter()
+        .filter(|m| m.as_concat_text() == SELF_COMPACTED_NOTE_TEXT)
+        .count();
+    let resume_count = client_messages
+        .iter()
+        .filter(|m| m.as_concat_text() == "R")
+        .count();
+    assert_eq!(note_count, 1, "Client must have exactly 1 note message");
+    assert_eq!(resume_count, 1, "Client must have exactly 1 resume prompt");
 
     Ok(())
 }
@@ -392,10 +461,9 @@ async fn test_turns_taken_not_reset_self_compact() -> Result<()> {
 
     let tc1 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
         .with_arguments(rmcp::object!({ "prompt": "R1" }));
-    let tc2 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
-        .with_arguments(rmcp::object!({ "prompt": "R2" }));
+    let other_tc = CallToolRequestParams::new("nonexistent_tool");
     let turn1_msg = Message::assistant().with_tool_request("call_1", Ok(tc1));
-    let turn2_msg = Message::assistant().with_tool_request("call_2", Ok(tc2));
+    let turn2_msg = Message::assistant().with_tool_request("call_2", Ok(other_tc));
 
     let provider = Arc::new(ScriptedSelfCompactProvider::new(vec![turn1_msg, turn2_msg]));
     let recorded_calls = provider.recorded_calls.clone();
@@ -417,23 +485,12 @@ async fn test_turns_taken_not_reset_self_compact() -> Result<()> {
     }
 
     let calls = recorded_calls.lock().await.clone();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 3, "Expected 3 calls: turn 1, summary, turn 2");
     assert!(!calls[0].is_summary);
     assert!(calls[1].is_summary);
     assert!(!calls[2].is_summary);
 
-    // Event checking: notice that self-compaction skipped due to turn limit was yielded
-    let has_skipped_notice = events.iter().any(|e| match e {
-        AgentEvent::Message(m) => {
-            m.as_concat_text()
-                .contains("Self-compaction skipped: the turn limit was reached")
-                && m.as_concat_text().contains("R2")
-        }
-        _ => false,
-    });
-    assert!(has_skipped_notice, "Skipped notice for R2 missing");
-
-    // Max turns message was also yielded
+    // Max turns message was yielded because turns_taken was not reset on compaction and reached 2
     let has_max_turns = events.iter().any(|e| match e {
         AgentEvent::Message(m) => m
             .as_concat_text()
@@ -446,16 +503,269 @@ async fn test_turns_taken_not_reset_self_compact() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_second_call_in_same_run_returns_error_self_compact() -> Result<()> {
+    let ctx = TestContext::new().await?;
+
+    let tc1 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "R1" }));
+    let tc2 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "R2" }));
+    let turn1_msg = Message::assistant().with_tool_request("call_1", Ok(tc1));
+    let turn2_msg = Message::assistant().with_tool_request("call_2", Ok(tc2));
+    let turn3_msg = Message::assistant().with_text("done");
+
+    let provider = Arc::new(ScriptedSelfCompactProvider::new(vec![
+        turn1_msg, turn2_msg, turn3_msg,
+    ]));
+    let recorded_calls = provider.recorded_calls.clone();
+
+    ctx.agent
+        .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
+        .await?;
+
+    let user_msg = Message::user().with_text("start work");
+    let reply_stream = ctx
+        .agent
+        .reply(user_msg, ctx.session_config(Some(5)), false, None)
+        .await?;
+    tokio::pin!(reply_stream);
+
+    let mut events = Vec::new();
+    while let Some(res) = reply_stream.next().await {
+        events.push(res?);
+    }
+
+    // Provider calls: Turn 1 (calls R1) -> Summary 1 -> Turn 2 (calls R2, gets error) -> Turn 3 ("done")
+    // Exactly ONE summary call occurred, because the second call returned an error and did not arm!
+    let calls = recorded_calls.lock().await.clone();
+    let summary_calls = calls.iter().filter(|c| c.is_summary).count();
+    assert_eq!(
+        summary_calls, 1,
+        "Exactly 1 summary call expected; second call must not compact"
+    );
+
+    // Verify DB conversation has the error response for call_2
+    let reloaded = ctx
+        .session_manager
+        .get_session(&ctx.session.id, true)
+        .await?;
+    let conv = reloaded.conversation.unwrap();
+    let error_found = conv.messages().iter().any(|m| {
+        m.content.iter().any(|c| match c {
+            goose::conversation::message::MessageContentBlock::ToolResponse(r) => match &r
+                .tool_result
+            {
+                Ok(res) => res.content.iter().any(|b| {
+                    b.as_text()
+                        .is_some_and(|t| t.text.contains(SELF_COMPACT_ALREADY_COMPACTED_MESSAGE))
+                }),
+                _ => false,
+            },
+            _ => false,
+        })
+    });
+    assert!(
+        error_found,
+        "Error message for second self_compact_and_resume call missing from history"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_new_run_can_compact_again_self_compact() -> Result<()> {
+    let ctx = TestContext::new().await?;
+
+    let tc1 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "R1" }));
+    let turn1_1 = Message::assistant().with_tool_request("call_1", Ok(tc1));
+    let turn1_2 = Message::assistant().with_text("done 1");
+
+    let tc2 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "R2" }));
+    let turn2_1 = Message::assistant().with_tool_request("call_2", Ok(tc2));
+    let turn2_2 = Message::assistant().with_text("done 2");
+
+    let provider = Arc::new(ScriptedSelfCompactProvider::new(vec![
+        turn1_1, turn1_2, turn2_1, turn2_2,
+    ]));
+    let recorded_calls = provider.recorded_calls.clone();
+
+    ctx.agent
+        .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
+        .await?;
+
+    // Run 1
+    let reply_stream1 = ctx
+        .agent
+        .reply(
+            Message::user().with_text("run 1 prompt"),
+            ctx.session_config(Some(5)),
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(reply_stream1);
+    while let Some(res) = reply_stream1.next().await {
+        res?;
+    }
+
+    // Run 2 (new user turn)
+    let reply_stream2 = ctx
+        .agent
+        .reply(
+            Message::user().with_text("run 2 prompt"),
+            ctx.session_config(Some(5)),
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(reply_stream2);
+    while let Some(res) = reply_stream2.next().await {
+        res?;
+    }
+
+    // Assert that both runs were able to self-compact (2 summary calls)
+    let calls = recorded_calls.lock().await.clone();
+    let summary_calls = calls.iter().filter(|c| c.is_summary).count();
+    assert_eq!(
+        summary_calls, 2,
+        "Both runs must be able to self-compact once"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_failed_compaction_drains_pending_steers_self_compact() -> Result<()> {
+    let ctx = TestContext::new().await?;
+
+    let tool_call = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "Resume prompt R" }));
+    let turn1_msg = Message::assistant().with_tool_request("call_1", Ok(tool_call));
+    let turn2_msg = Message::assistant().with_text("handled steer after compaction failure");
+
+    let provider = Arc::new(
+        ScriptedSelfCompactProvider::new(vec![turn1_msg, turn2_msg])
+            .with_summary_error(ProviderError::ExecutionError("provider broke".to_string())),
+    );
+    let recorded_calls = provider.recorded_calls.clone();
+
+    let agent_clone = ctx.agent.clone();
+    let session_id_clone = ctx.session.id.clone();
+    provider
+        .set_on_summary(move || {
+            let ag = agent_clone.clone();
+            let sid = session_id_clone.clone();
+            Box::pin(async move {
+                ag.steer(&sid, Message::user().with_text("urgent steer on failure"))
+                    .await;
+            })
+        })
+        .await;
+
+    ctx.agent
+        .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
+        .await?;
+
+    let reply_stream = ctx
+        .agent
+        .reply(
+            Message::user().with_text("start work"),
+            ctx.session_config(Some(5)),
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(reply_stream);
+
+    let mut events = Vec::new();
+    while let Some(res) = reply_stream.next().await {
+        events.push(res?);
+    }
+
+    // Failure notice was yielded
+    let has_fail_notice = events.iter().any(|e| match e {
+        AgentEvent::Message(m) => {
+            m.as_concat_text().contains("Self-compaction failed:")
+                && m.as_concat_text().contains("Resume prompt R")
+        }
+        _ => false,
+    });
+    assert!(has_fail_notice, "Failure notice missing from events");
+
+    // Steer message was drained and received by provider on the next iteration
+    let calls = recorded_calls.lock().await.clone();
+    assert_eq!(
+        calls.len(),
+        3,
+        "Calls: turn 1, failed summary, turn 2 handling steer"
+    );
+    let turn2_call = &calls[2];
+    assert!(
+        turn2_call
+            .messages
+            .iter()
+            .any(|m| m.as_concat_text().contains("urgent steer on failure")),
+        "Steer message must be drained and delivered to model after compaction failure"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_chat_mode_does_not_arm_self_compact() -> Result<()> {
+    let ctx = TestContext::with_mode(GooseMode::Chat).await?;
+
+    let tool_call = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "Resume prompt" }));
+    let turn1_msg = Message::assistant().with_tool_request("call_chat", Ok(tool_call));
+    let turn2_msg = Message::assistant().with_text("chat completed");
+
+    let provider = Arc::new(ScriptedSelfCompactProvider::new(vec![turn1_msg, turn2_msg]));
+    let recorded_calls = provider.recorded_calls.clone();
+
+    ctx.agent
+        .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
+        .await?;
+
+    let reply_stream = ctx
+        .agent
+        .reply(
+            Message::user().with_text("chat message"),
+            ctx.session_config(Some(5)),
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(reply_stream);
+    while let Some(res) = reply_stream.next().await {
+        res?;
+    }
+
+    // In Chat mode, tool calls are skipped and do NOT arm self-compaction!
+    let calls = recorded_calls.lock().await.clone();
+    assert_eq!(
+        calls.iter().filter(|c| c.is_summary).count(),
+        0,
+        "Chat mode must never arm self-compaction"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_last_call_wins_and_failed_call_does_not_arm_self_compact() -> Result<()> {
     let ctx = TestContext::new().await?;
 
-    // Scenario A: Two calls in one step. Last call wins ("Winner Prompt").
-    let tc1 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
-        .with_arguments(rmcp::object!({ "prompt": "First Prompt" }));
+    // Scenario A: First call fails (empty prompt -> is_error), second call succeeds ("Winner Prompt").
+    // Failed call does not arm; successful call arms ("Winner Prompt").
+    let tc1_invalid = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+        .with_arguments(rmcp::object!({ "prompt": "   " }));
     let tc2 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
         .with_arguments(rmcp::object!({ "prompt": "Winner Prompt" }));
     let turn1_msg = Message::assistant()
-        .with_tool_request("call_1", Ok(tc1))
+        .with_tool_request("call_1", Ok(tc1_invalid))
         .with_tool_request("call_2", Ok(tc2));
     let turn2_msg = Message::assistant().with_text("done");
 
@@ -483,12 +793,8 @@ async fn test_last_call_wins_and_failed_call_does_not_arm_self_compact() -> Resu
         .messages()
         .iter()
         .any(|m| m.as_concat_text() == "Winner Prompt"));
-    assert!(!conv
-        .messages()
-        .iter()
-        .any(|m| m.as_concat_text() == "First Prompt"));
 
-    // Scenario B: Failed call (empty prompt -> is_error) does NOT arm.
+    // Scenario B: Failed call (empty prompt -> is_error) alone does NOT arm.
     let ctx_b = TestContext::new().await?;
 
     let tc_invalid = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
@@ -804,6 +1110,14 @@ async fn test_turn_context_after_compaction_not_stale_self_compact() -> Result<(
     let provider = Arc::new(ScriptedSelfCompactProvider::new(vec![turn1_msg, turn2_msg]));
     let recorded_calls = provider.recorded_calls.clone();
 
+    // ModelConfig uses "mock-model" whose context limit is 100,000 (0.8 threshold -> 80,000 compaction threshold).
+    // Seed session usage at 72,000 tokens (90% of 80,000), so compaction_remaining_line generates "~8k tokens remaining".
+    ctx.session_manager
+        .update(&ctx.session.id)
+        .usage(Usage::new(Some(72_000), Some(0), Some(72_000)))
+        .apply()
+        .await?;
+
     ctx.agent
         .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
         .await?;
@@ -823,11 +1137,31 @@ async fn test_turn_context_after_compaction_not_stale_self_compact() -> Result<(
     }
 
     let calls = recorded_calls.lock().await.clone();
-    let last_call = &calls[2];
-    assert!(last_call
+    assert_eq!(calls.len(), 3);
+
+    // Turn 1 (before compaction): turn context contains "~8k tokens remaining"
+    let turn1_tc = calls[0]
         .messages
         .iter()
-        .any(|m| m.as_concat_text().contains("<turn-context>")));
+        .find(|m| m.as_concat_text().contains("<turn-context>"))
+        .expect("turn context in turn 1");
+    assert!(
+        turn1_tc.as_concat_text().contains("tokens remaining"),
+        "Turn 1 turn context must show tokens remaining before compaction: {}",
+        turn1_tc.as_concat_text()
+    );
+
+    // Turn 2 (after compaction): turn context was recomputed with retained tokens and does NOT show stale "~8k tokens remaining"
+    let turn2_tc = calls[2]
+        .messages
+        .iter()
+        .find(|m| m.as_concat_text().contains("<turn-context>"))
+        .expect("turn context in turn 2");
+    assert!(
+        !turn2_tc.as_concat_text().contains("tokens remaining"),
+        "Turn 2 turn context must not show stale tokens remaining after compaction: {}",
+        turn2_tc.as_concat_text()
+    );
 
     let reloaded = ctx
         .session_manager
@@ -844,6 +1178,14 @@ async fn test_turn_context_after_compaction_not_stale_self_compact() -> Result<(
         "Turn context message must be in DB"
     );
     assert!(turn_context_msgs.last().unwrap().is_agent_visible());
+    assert!(
+        !turn_context_msgs
+            .last()
+            .unwrap()
+            .as_concat_text()
+            .contains("tokens remaining"),
+        "Latest DB turn context must not contain stale tokens remaining"
+    );
 
     Ok(())
 }
@@ -851,6 +1193,41 @@ async fn test_turn_context_after_compaction_not_stale_self_compact() -> Result<(
 #[tokio::test]
 async fn test_rolling_memory_does_not_fold_after_self_compact() -> Result<()> {
     let ctx = TestContext::new().await?;
+
+    // Enable rolling memory with tight budget
+    let settings = goose::context_mgmt::rolling::RollingMemorySettings {
+        budget_tokens: 1_000,
+        tail_tokens: 400,
+    };
+    let mut session = ctx
+        .session_manager
+        .get_session(&ctx.session.id, false)
+        .await?;
+    goose::context_mgmt::rolling::write_settings(&mut session.extension_data, Some(settings));
+    ctx.session_manager
+        .update(&ctx.session.id)
+        .extension_data(session.extension_data.clone())
+        .apply()
+        .await?;
+
+    // Seed conversation with history that exceeds 1,000 budget
+    let long_text = "lorem ipsum dolor sit amet consectetur adipiscing elit ".repeat(30);
+    let mut initial_msgs = Vec::new();
+    for i in 0..6 {
+        initial_msgs.push(Message::user().with_text(format!("user {i}: {long_text}")));
+        initial_msgs.push(Message::assistant().with_text(format!("assistant {i}: {long_text}")));
+    }
+    let pre_conv = Conversation::new_unvalidated(initial_msgs);
+    ctx.session_manager
+        .replace_conversation(&ctx.session.id, &pre_conv)
+        .await?;
+
+    // Verify that prior to compaction, rolling check would fold
+    let pre_check = goose::context_mgmt::rolling::check(&session, &settings, &pre_conv).await?;
+    assert!(
+        pre_check.is_some(),
+        "Pre-compaction conversation must exceed budget and trigger rolling memory check"
+    );
 
     let tool_call = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
         .with_arguments(rmcp::object!({ "prompt": "Resume prompt" }));
@@ -862,7 +1239,8 @@ async fn test_rolling_memory_does_not_fold_after_self_compact() -> Result<()> {
         .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
         .await?;
 
-    let reply_stream = ctx
+    // Run Turn 1: performs self-compaction
+    let reply_stream1 = ctx
         .agent
         .reply(
             Message::user().with_text("start work"),
@@ -871,27 +1249,56 @@ async fn test_rolling_memory_does_not_fold_after_self_compact() -> Result<()> {
             None,
         )
         .await?;
-    tokio::pin!(reply_stream);
-    while let Some(res) = reply_stream.next().await {
+    tokio::pin!(reply_stream1);
+    while let Some(res) = reply_stream1.next().await {
         res?;
     }
 
+    // Verify session and conversation after Turn 1: under budget
     let reloaded = ctx
         .session_manager
         .get_session(&ctx.session.id, true)
         .await?;
     let conversation = reloaded.conversation.clone().expect("conversation exists");
 
-    let settings = goose::context_mgmt::rolling::RollingMemorySettings {
-        budget_tokens: 100_000,
-        tail_tokens: 20_000,
-    };
-
-    let check_result =
+    let post_check =
         goose::context_mgmt::rolling::check(&reloaded, &settings, &conversation).await?;
     assert!(
-        check_result.is_none(),
-        "Rolling memory should not fold after self-compaction"
+        post_check.is_none(),
+        "Post-compaction conversation must not exceed budget"
+    );
+
+    // Run Turn 2 (new turn): verify it does NOT trigger rolling memory fold
+    let turn3_msg = Message::assistant().with_text("turn 2 finished");
+    let provider2 = Arc::new(ScriptedSelfCompactProvider::new(vec![turn3_msg]));
+    ctx.agent
+        .update_provider(provider2, ModelConfig::new("mock-model"), &ctx.session.id)
+        .await?;
+
+    let reply_stream2 = ctx
+        .agent
+        .reply(
+            Message::user().with_text("next prompt"),
+            ctx.session_config(Some(5)),
+            false,
+            None,
+        )
+        .await?;
+    tokio::pin!(reply_stream2);
+    let mut turn2_events = Vec::new();
+    while let Some(res) = reply_stream2.next().await {
+        turn2_events.push(res?);
+    }
+
+    let folded_event = turn2_events.iter().any(|e| match e {
+        AgentEvent::Message(m) => m
+            .as_concat_text()
+            .contains("Folding older history into memory"),
+        _ => false,
+    });
+    assert!(
+        !folded_event,
+        "Turn 2 must not fold history because self-compaction kept context under budget"
     );
 
     Ok(())

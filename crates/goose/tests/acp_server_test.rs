@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test; self-compaction over ACP test.
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test; self-compaction over ACP test; reload excludes self_compact_and_resume for recipe response schema.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -2372,11 +2372,24 @@ fn test_prompt_self_compact() {
             })
             .expect("expected 'Context self-compacted.' AgentMessageChunk");
 
-        // A usage_update follows compaction
-        let usage_update_idx = updates
+        // A usage_update follows compaction (pick the one emitted upon compaction immediately before note chunk)
+        let usage_update_idx = updates[tool_call_idx..note_chunk_idx]
             .iter()
-            .position(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
-            .expect("expected usage_update following compaction");
+            .rposition(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
+            .map(|idx| tool_call_idx + idx)
+            .expect("expected usage_update between tool call and note chunk");
+
+        if let SessionUpdate::UsageUpdate(ref u) = updates[usage_update_idx] {
+            assert!(
+                u.used > 0,
+                "UsageUpdate used should reflect retained tokens (> 0)"
+            );
+            assert!(
+                u.used < 1000,
+                "UsageUpdate used should reflect compact retained tokens, not full history: {}",
+                u.used
+            );
+        }
 
         assert!(
             tool_call_idx < usage_update_idx,
@@ -2418,6 +2431,106 @@ fn test_prompt_self_compact() {
         assert!(
             final_null_idx > resume_chunk_idx,
             "activeRunId: null should arrive after the resume chunk"
+        );
+    });
+}
+
+#[tokio::test]
+async fn test_session_settings_reload_excludes_self_compact_for_recipe_response_schema() {
+    run_test(async move {
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // Recipe with a response schema (recipe final_output)
+        let recipe = serde_json::json!({
+            "title": "Response Schema Recipe",
+            "description": "Recipe with response schema",
+            "instructions": "Instructions",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "result": { "type": "string" }
+                    },
+                    "required": ["result"]
+                }
+            }
+        });
+
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Verify tool list before reload
+        let tools_before = send_custom(
+            conn.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools_before_arr = tools_before
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array");
+        assert!(
+            !tools_before_arr
+                .iter()
+                .any(|t| t["name"] == "self_compact_and_resume"),
+            "Before reload: session with response schema must NOT list self_compact_and_resume"
+        );
+
+        // Fresh connection to simulate restored session after reload
+        let openai2 = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+        let mut conn2 = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai2,
+        )
+        .await;
+
+        let _loaded = conn2.load_session(&session_id, vec![]).await.unwrap();
+
+        let tools_after = send_custom(
+            conn2.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools_after_arr = tools_after
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array");
+
+        assert!(
+            !tools_after_arr.iter().any(|t| t["name"] == "self_compact_and_resume"),
+            "After reload: restored session with response schema must NOT list self_compact_and_resume"
+        );
+        assert_eq!(
+            tools_before_arr.len(),
+            tools_after_arr.len(),
+            "Tool list length must match before and after reload"
         );
     });
 }

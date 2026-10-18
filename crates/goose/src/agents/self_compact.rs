@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: self-compaction agent tool definition and validation; loop execution helpers, outcome and messages.
+// Modified by Jonathan Mohrbacher, 2026: self-compaction agent tool definition and validation; loop execution helpers, outcome and messages; per-run cap message, updated tool description, and error resilience.
 use crate::conversation::message::{
     Message, MessageContentBlock, SystemNotificationType, ToolRequest,
 };
@@ -13,9 +13,11 @@ use tokio_util::sync::CancellationToken;
 pub const SELF_COMPACT_TOOL_NAME: &str = "self_compact_and_resume";
 pub const SELF_COMPACT_PROMPT_MAX_CHARS: usize = 16_000;
 pub const SELF_COMPACT_TOOL_DESCRIPTION: &str =
-    "Compact your own context now and continue with a resumption prompt you write. After this step the conversation so far is replaced by a summary, then `prompt` is delivered to you as the next user message and you keep working in the same turn. Use it at a juncture (a chunk of work done, before the next), after persisting anything durable (beads, plan files, commits) that the summary may lose. Call it alone, as the last tool call of the step. The prompt must stand on its own: restate the goal, current state, and the first concrete action.";
+    "Compact your own context and continue with a resumption prompt you write. Use it only when your context has grown long enough that earlier detail is being crowded out, or when the user asks you to; it is not a routine step between tasks, and works at most once per turn. Before calling it, persist anything durable (beads, plan files, commits) that a summary may lose. After this step the conversation so far is replaced by a summary and `prompt` is delivered to you as the next user message; you keep working in the same turn. Call it alone, as the last tool call of the step. The prompt must stand on its own: restate the goal, the current state, and the first concrete action.";
 pub const SELF_COMPACT_SUCCESS_MESSAGE: &str =
     "Compaction runs right after this step; your prompt will be the next user message. Do not call other tools in this step.";
+pub const SELF_COMPACT_ALREADY_COMPACTED_MESSAGE: &str =
+    "Already self-compacted in this turn; continue from the resume prompt. Context overflow is still handled automatically.";
 
 pub fn self_compact_tool() -> Tool {
     let schema: JsonObject = serde_json::from_value(serde_json::json!({
@@ -75,7 +77,16 @@ pub fn check_self_compact_call(request: &ToolRequest, final_response: &Message) 
         if let MessageContentBlock::ToolResponse(r) = c {
             if r.id == request.id {
                 if let Ok(res) = &r.tool_result {
-                    return res.is_error != Some(true);
+                    if res.is_error == Some(true) {
+                        return false;
+                    }
+                    let text = res
+                        .content
+                        .iter()
+                        .filter_map(|b| b.as_text().map(|t| t.text.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    return text == SELF_COMPACT_SUCCESS_MESSAGE;
                 }
             }
         }
@@ -157,6 +168,7 @@ pub async fn handle_leftover_pending(
 #[derive(Debug)]
 pub struct SelfCompactSuccess {
     pub new_conversation: Conversation,
+    pub history_replaced_conversation: Conversation,
     pub note_message: Message,
     pub resume_message: Message,
     pub retained_context_tokens: i32,
@@ -176,8 +188,21 @@ pub async fn execute_self_compact(
     model_config: &ModelConfig,
     cancel_token: &Option<CancellationToken>,
     prompt: &str,
-) -> anyhow::Result<SelfCompactOutcome> {
-    let session = session_manager.get_session(session_id, true).await?;
+) -> SelfCompactOutcome {
+    let session = match session_manager.get_session(session_id, true).await {
+        Ok(s) => s,
+        Err(e) => {
+            let error_str = format!("failed to load session: {e}");
+            let notice = self_compact_failed_notice(&error_str, prompt);
+            if let Err(err) = session_manager.add_message(session_id, &notice).await {
+                tracing::warn!("Failed to persist self-compaction failure notice: {err}");
+            }
+            return SelfCompactOutcome::Failed {
+                notice,
+                is_cancelled: false,
+            };
+        }
+    };
     let conversation = session.conversation.unwrap_or_default();
 
     let compact_result = if let Some(token) = cancel_token.as_ref() {
@@ -218,6 +243,8 @@ pub async fn execute_self_compact(
             let note = self_compacted_note_message(max_created);
             let resume = self_compact_resume_message(prompt, note.created);
 
+            let history_replaced_conversation = compaction.conversation.clone();
+
             let mut new_messages = compaction.conversation.messages().clone();
             new_messages.push(note.clone());
             new_messages.push(resume.clone());
@@ -232,16 +259,25 @@ pub async fn execute_self_compact(
                     error = %e,
                     "Failed to replace conversation during self-compaction"
                 );
-                return Err(e);
+                let error_str = format!("failed to save conversation: {e}");
+                let notice = self_compact_failed_notice(&error_str, prompt);
+                if let Err(err) = session_manager.add_message(session_id, &notice).await {
+                    tracing::warn!("Failed to persist self-compaction failure notice: {err}");
+                }
+                return SelfCompactOutcome::Failed {
+                    notice,
+                    is_cancelled: false,
+                };
             }
 
-            Ok(SelfCompactOutcome::Success(Box::new(SelfCompactSuccess {
+            SelfCompactOutcome::Success(Box::new(SelfCompactSuccess {
                 new_conversation,
+                history_replaced_conversation,
                 note_message: note,
                 resume_message: resume,
                 retained_context_tokens: compaction.retained_context_tokens,
                 usage: compaction.usage,
-            })))
+            }))
         }
         Err(err) => {
             let is_cancelled = cancel_token.as_ref().is_some_and(|t| t.is_cancelled())
@@ -255,10 +291,10 @@ pub async fn execute_self_compact(
             if let Err(e) = session_manager.add_message(session_id, &notice).await {
                 tracing::warn!("Failed to persist self-compaction failure notice: {e}");
             }
-            Ok(SelfCompactOutcome::Failed {
+            SelfCompactOutcome::Failed {
                 notice,
                 is_cancelled,
-            })
+            }
         }
     }
 }
@@ -1089,12 +1125,13 @@ mod tests {
             &cancel_token,
             "Resume task after compaction",
         )
-        .await?;
+        .await;
 
         match outcome {
             SelfCompactOutcome::Success(success) => {
                 let SelfCompactSuccess {
                     new_conversation,
+                    history_replaced_conversation,
                     note_message,
                     resume_message,
                     ..
@@ -1106,6 +1143,16 @@ mod tests {
                     reloaded_conv.messages().len(),
                     new_conversation.messages().len()
                 );
+
+                // HistoryReplaced conversation does NOT contain trailing note or resume
+                assert!(!history_replaced_conversation
+                    .messages()
+                    .iter()
+                    .any(|m| m.as_concat_text() == SELF_COMPACTED_NOTE_TEXT));
+                assert!(!history_replaced_conversation
+                    .messages()
+                    .iter()
+                    .any(|m| m.as_concat_text() == "Resume task after compaction"));
 
                 // Note message checks
                 assert_eq!(note_message.as_concat_text(), SELF_COMPACTED_NOTE_TEXT);
@@ -1173,7 +1220,7 @@ mod tests {
             &cancel_token,
             "Resume prompt",
         )
-        .await?;
+        .await;
 
         match outcome {
             SelfCompactOutcome::Failed {
@@ -1227,7 +1274,7 @@ mod tests {
             &cancel_token,
             "Resume prompt",
         )
-        .await?;
+        .await;
 
         match outcome {
             SelfCompactOutcome::Failed {
@@ -1241,5 +1288,195 @@ mod tests {
             SelfCompactOutcome::Success { .. } => panic!("Expected Failed outcome"),
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_execute_self_compact_session_load_error_self_compact() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let session_manager = Arc::new(SessionManager::new(temp_dir.path().join("data")));
+        let provider: Arc<dyn Provider> = Arc::new(MockTextProvider);
+        let model_config = ModelConfig::new("mock-model");
+
+        let outcome = execute_self_compact(
+            &session_manager,
+            "non-existent-session-id",
+            provider.as_ref(),
+            &model_config,
+            &None,
+            "Resume prompt",
+        )
+        .await;
+
+        match outcome {
+            SelfCompactOutcome::Failed {
+                notice,
+                is_cancelled,
+            } => {
+                assert!(!is_cancelled);
+                assert!(notice.as_concat_text().contains("failed to load session"));
+                assert!(notice.as_concat_text().contains("Resume prompt"));
+            }
+            SelfCompactOutcome::Success { .. } => panic!("Expected Failed outcome"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_self_compact_call_chat_mode_skipped_does_not_arm_self_compact() {
+        let request = ToolRequest {
+            id: "call-chat".to_string(),
+            tool_call: Ok(CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+                .with_arguments(rmcp::object!({ "prompt": "Resume prompt" }))),
+            metadata: None,
+            tool_meta: None,
+        };
+        let mut response = Message::user().with_generated_id();
+        response.add_tool_response_with_metadata(
+            "call-chat",
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text(
+                    crate::agents::tool_execution::CHAT_MODE_TOOL_SKIPPED_RESPONSE,
+                ),
+            ])),
+            None,
+        );
+
+        assert_eq!(check_self_compact_call(&request, &response), None);
+    }
+
+    #[tokio::test]
+    async fn test_self_compact_tool_dispatch_second_call_in_same_run_returns_error_self_compact(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let setup = setup_self_compact_test(&temp_dir).await?;
+
+        let tool_call1 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+            .with_arguments(rmcp::object!({ "prompt": "First call" }));
+        let (_, res1) = setup
+            .agent
+            .dispatch_tool_call(tool_call1, "call-1".to_string(), None, &setup.session)
+            .await;
+        let out1 = res1.unwrap().result.await.unwrap();
+        assert_ne!(out1.is_error, Some(true));
+        assert_eq!(
+            out1.content[0].as_text().unwrap().text,
+            SELF_COMPACT_SUCCESS_MESSAGE
+        );
+
+        // Second call in the same run must return error
+        let tool_call2 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+            .with_arguments(rmcp::object!({ "prompt": "Second call" }));
+        let (_, res2) = setup
+            .agent
+            .dispatch_tool_call(tool_call2, "call-2".to_string(), None, &setup.session)
+            .await;
+        let out2 = res2.unwrap().result.await.unwrap();
+        assert_eq!(out2.is_error, Some(true));
+        assert!(out2.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .contains(SELF_COMPACT_ALREADY_COMPACTED_MESSAGE));
+
+        // Resetting run allows compacting again
+        setup.agent.reset_self_compact_run(&setup.session.id).await;
+        let tool_call3 = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+            .with_arguments(rmcp::object!({ "prompt": "Third call in new run" }));
+        let (_, res3) = setup
+            .agent
+            .dispatch_tool_call(tool_call3, "call-3".to_string(), None, &setup.session)
+            .await;
+        let out3 = res3.unwrap().result.await.unwrap();
+        assert_ne!(out3.is_error, Some(true));
+        assert_eq!(
+            out3.content[0].as_text().unwrap().text,
+            SELF_COMPACT_SUCCESS_MESSAGE
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_self_compact_tool_dispatch_shadowed_by_extension_routes_to_extension_self_compact(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let setup = setup_self_compact_test(&temp_dir).await?;
+
+        setup
+            .agent
+            .extension_manager
+            .add_client(
+                persisted_builtin("developer"),
+                Arc::new(ShadowingClient),
+                None,
+            )
+            .await;
+
+        let tool_call = CallToolRequestParams::new(SELF_COMPACT_TOOL_NAME)
+            .with_arguments(rmcp::object!({ "prompt": "Extension prompt" }));
+        let (_, res) = setup
+            .agent
+            .dispatch_tool_call(tool_call, "call-shadow".to_string(), None, &setup.session)
+            .await;
+        let out = res.unwrap().result.await.unwrap();
+        assert_ne!(out.is_error, Some(true));
+        // Shadowing extension output, NOT the built-in SELF_COMPACT_SUCCESS_MESSAGE!
+        assert_eq!(out.content[0].as_text().unwrap().text, "extension output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_self_compact_tool_not_listed_when_recipe_response_schema_set_self_compact(
+    ) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let setup = setup_self_compact_test(&temp_dir).await?;
+
+        let recipe_session = setup
+            .agent
+            .config
+            .session_manager
+            .create_session(
+                PathBuf::default(),
+                "recipe_response_test".to_string(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await?;
+
+        setup
+            .agent
+            .update_provider(
+                setup.provider.clone(),
+                ModelConfig::new("mock-model"),
+                &recipe_session.id,
+            )
+            .await?;
+
+        let mut recipe = crate::recipe::Recipe::builder()
+            .title("Response Schema Recipe")
+            .description("Recipe with response schema")
+            .instructions("Instructions")
+            .build()
+            .unwrap();
+        recipe.response = Some(Response {
+            json_schema: Some(serde_json::json!({ "type": "object" })),
+        });
+        setup
+            .agent
+            .config
+            .session_manager
+            .update(&recipe_session.id)
+            .recipe(Some(recipe))
+            .apply()
+            .await?;
+
+        let recipe_session = setup
+            .agent
+            .config
+            .session_manager
+            .get_session(&recipe_session.id, false)
+            .await?;
+
+        assert_self_compact_unavailable(&setup.agent, &recipe_session).await
     }
 }
