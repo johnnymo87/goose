@@ -1,5 +1,3 @@
-// Modified by Jonathan Mohrbacher, 2026: gate on acp-http feature.
-#![cfg(feature = "acp-http")]
 #![recursion_limit = "256"]
 use std::sync::Arc;
 

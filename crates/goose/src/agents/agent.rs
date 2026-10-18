@@ -1585,42 +1585,15 @@ impl Agent {
                 prefixed_tools.push(final_output_tool.tool());
             }
 
-            let session = match self
+            if let Ok(session) = self
                 .config
                 .session_manager
                 .get_session(session_id, false)
                 .await
             {
-                Ok(session) => session,
-                Err(_) => Session {
-                    id: session_id.to_string(),
-                    working_dir: std::path::PathBuf::new(),
-                    name: String::new(),
-                    user_set_name: false,
-                    session_type: SessionType::User,
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
-                    extension_data: crate::session::ExtensionData::default(),
-                    usage: goose_providers::conversation::token_usage::Usage::default(),
-                    accumulated_usage: goose_providers::conversation::token_usage::Usage::default(),
-                    accumulated_cost: None,
-                    schedule_id: None,
-                    recipe: None,
-                    user_recipe_values: None,
-                    conversation: None,
-                    message_count: 0,
-                    last_message_at: None,
-                    provider_name: None,
-                    model_config: None,
-                    goose_mode: GooseMode::default(),
-                    archived_at: None,
-                    project_id: None,
-                    parent_session_id: None,
-                    last_message_snippet: None,
-                },
-            };
-            if self.self_compact_available(&session).await {
-                prefixed_tools.push(crate::agents::self_compact::self_compact_tool());
+                if self.self_compact_available(&session).await {
+                    prefixed_tools.push(crate::agents::self_compact::self_compact_tool());
+                }
             }
         }
 
@@ -6958,8 +6931,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_listed_when_available() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
@@ -6987,9 +6963,33 @@ echo start >> "$PLUGIN_ROOT/hook.log"
     }
 
     #[tokio::test]
-    async fn test_self_compact_tool_not_listed_when_disabled_by_config() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", Some("false"))]);
+    async fn test_self_compact_tool_not_listed_when_session_cannot_be_loaded() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
+        let (agent, _) = create_test_agent(
+            temp_dir.path().join("data"),
+            crate::hooks::HookManager::from_plugins_for_test(vec![]),
+            Arc::new(CountingTextProvider::new()),
+        )
+        .await?;
+
+        let tools = agent.list_tools("non-existent-session-id", None).await;
+        assert!(!tools
+            .iter()
+            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_self_compact_tool_not_listed_when_disabled_by_config() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", Some("false")),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
@@ -7018,8 +7018,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_not_listed_when_final_output_tool_set() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
@@ -7079,8 +7082,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_not_listed_when_provider_manages_own_context() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
@@ -7109,12 +7115,16 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_not_listed_for_subagent_session() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
+        let provider = Arc::new(CountingTextProvider::new());
         let (agent, _) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
+            provider.clone(),
         )
         .await?;
         let subagent_session = agent
@@ -7125,6 +7135,13 @@ echo start >> "$PLUGIN_ROOT/hook.log"
                 "subagent".to_string(),
                 SessionType::SubAgent,
                 GooseMode::Auto,
+            )
+            .await?;
+        agent
+            .update_provider(
+                provider,
+                goose_providers::model::ModelConfig::new("mock-model"),
+                &subagent_session.id,
             )
             .await?;
 
@@ -7144,12 +7161,16 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_not_listed_when_recipe_retry_configured() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
+        let provider = Arc::new(CountingTextProvider::new());
         let (agent, _) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
-            Arc::new(CountingTextProvider::new()),
+            provider.clone(),
         )
         .await?;
         let mut recipe = crate::recipe::Recipe::builder()
@@ -7173,6 +7194,13 @@ echo start >> "$PLUGIN_ROOT/hook.log"
                 "recipe".to_string(),
                 SessionType::User,
                 GooseMode::Auto,
+            )
+            .await?;
+        agent
+            .update_provider(
+                provider,
+                goose_providers::model::ModelConfig::new("mock-model"),
+                &recipe_session.id,
             )
             .await?;
         agent
@@ -7204,8 +7232,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_dispatch_success() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
@@ -7243,8 +7274,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_dispatch_validation_errors() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
@@ -7306,8 +7340,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_dispatch_unavailable() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
@@ -7354,8 +7391,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_tool_dispatch_causes_no_state_changes() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
@@ -7387,8 +7427,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     #[tokio::test]
     async fn test_self_compact_smart_approve_needs_no_approval() -> Result<()> {
-        let _env = env_lock::lock_env([("GOOSE_SELF_COMPACT", None::<&str>)]);
         let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
         let (agent, session_id) = create_test_agent(
             temp_dir.path().join("data"),
             crate::hooks::HookManager::from_plugins_for_test(vec![]),
