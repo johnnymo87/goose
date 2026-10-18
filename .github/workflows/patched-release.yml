@@ -41,7 +41,7 @@ jobs:
         run: |
           F=code-mode,tree-sitter,aws-providers,telemetry,otel,rustls-tls,live-voice,system-keyring,platform-apps,chat-recall,scheduler,acp-http,online-model-meta
           cargo test --release -p goose --features "$F" --lib -- gcpvertexai gcpauth process_group cache_ttl max_turns_from_meta test_add_final_output_tool rolling self_compact compact_kind
-          cargo test --release -p goose --features "$F" --test acp_server_test -- test_session_settings test_prompt_max_turns_bounds_run test_prompt_self_compact
+          cargo test --release -p goose --features "$F" --test acp_server_test -- test_session_settings test_prompt_max_turns_bounds_run test_prompt_self_compact test_recipe_session_after_reload_never_lists_self_compact_and_resume
           cargo test --release -p goose --features "$F" --test rolling_memory
           cargo test --release -p goose --features "$F" --test self_compact
           cargo test --release -p goose-sdk-types --lib -- settings_request rolling_memory_dto
