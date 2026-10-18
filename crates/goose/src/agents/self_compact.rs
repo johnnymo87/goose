@@ -135,6 +135,25 @@ pub fn self_compact_failed_notice(error: &str, prompt: &str) -> Message {
         .with_generated_id()
 }
 
+pub async fn handle_leftover_pending(
+    session_manager: &SessionManager,
+    session_id: &str,
+    cancel_token: &Option<CancellationToken>,
+    prompt: &str,
+) -> Message {
+    let is_cancelled = crate::utils::is_token_cancelled(cancel_token);
+    let reason = if is_cancelled {
+        "cancelled"
+    } else {
+        "run ended before compaction"
+    };
+    let notice = self_compact_failed_notice(reason, prompt);
+    if let Err(e) = session_manager.add_message(session_id, &notice).await {
+        tracing::warn!("Failed to persist self-compaction leftover notice: {e}");
+    }
+    notice
+}
+
 #[derive(Debug)]
 pub struct SelfCompactSuccess {
     pub new_conversation: Conversation,
@@ -204,9 +223,17 @@ pub async fn execute_self_compact(
             new_messages.push(resume.clone());
             let new_conversation = Conversation::new_unvalidated(new_messages);
 
-            session_manager
+            if let Err(e) = session_manager
                 .replace_conversation(session_id, &new_conversation)
-                .await?;
+                .await
+            {
+                tracing::error!(
+                    session_id,
+                    error = %e,
+                    "Failed to replace conversation during self-compaction"
+                );
+                return Err(e);
+            }
 
             Ok(SelfCompactOutcome::Success(Box::new(SelfCompactSuccess {
                 new_conversation,

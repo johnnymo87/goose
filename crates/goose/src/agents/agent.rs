@@ -363,6 +363,36 @@ pub(crate) async fn persist_turn_context_if_changed(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn refresh_turn_context(
+    session_manager: &SessionManager,
+    session_id: &str,
+    conversation: &mut Conversation,
+    extension_manager: &crate::agents::extension_manager::ExtensionManager,
+    lease: &crate::agents::extension_manager::ExtensionLease,
+    turns_taken: u32,
+    max_turns: u32,
+    turn_start: chrono::DateTime<chrono::Local>,
+    compaction_info: Option<String>,
+) -> Result<()> {
+    persist_turn_context_if_changed(
+        session_manager,
+        session_id,
+        conversation,
+        super::moim::turn_context_message(
+            session_id,
+            extension_manager,
+            lease,
+            turns_taken,
+            max_turns,
+            turn_start,
+            compaction_info,
+        )
+        .await,
+    )
+    .await
+}
+
 fn project_message_for_user_event(message: &Message) -> Message {
     message.user_visible_content()
 }
@@ -2846,20 +2876,16 @@ impl Agent {
                 super::moim::compute_compaction_info(&session_config.id, &self.extension_manager)
                     .await;
 
-            persist_turn_context_if_changed(
+            refresh_turn_context(
                 &session_manager,
                 &session_config.id,
                 &mut conversation,
-                super::moim::turn_context_message(
-                    &session_config.id,
-                    &self.extension_manager,
-                    &inference_lease,
-                    turns_taken,
-                    max_turns,
-                    turn_start,
-                    turn_start_compaction_info.clone(),
-                )
-                .await,
+                &self.extension_manager,
+                &inference_lease,
+                turns_taken,
+                max_turns,
+                turn_start,
+                turn_start_compaction_info.clone(),
             )
             .await?;
             // Snapshot after the turn-context append so a retry keeps the sent prefix.
@@ -2887,20 +2913,16 @@ impl Agent {
                     if let Some(project_addendum) = &project_addendum {
                         system_prompt = format!("{system_prompt}\n\n{project_addendum}");
                     }
-                    persist_turn_context_if_changed(
+                    refresh_turn_context(
                         &session_manager,
                         &session_config.id,
                         &mut conversation,
-                        super::moim::turn_context_message(
-                            &session_config.id,
-                            &self.extension_manager,
-                            &inference_lease,
-                            turns_taken,
-                            max_turns,
-                            turn_start,
-                            turn_start_compaction_info.clone(),
-                        )
-                        .await,
+                        &self.extension_manager,
+                        &inference_lease,
+                        turns_taken,
+                        max_turns,
+                        turn_start,
+                        turn_start_compaction_info.clone(),
                     )
                     .await?;
                 }
@@ -2932,13 +2954,21 @@ impl Agent {
                                     retained_context_tokens,
                                     usage,
                                 } = *success;
-                                self.update_session_metrics(
-                                    &session_config.id,
-                                    session_config.schedule_id.clone(),
-                                    &usage,
+                                let enriched = self
+                                    .update_session_metrics(
+                                        &session_config.id,
+                                        session_config.schedule_id.clone(),
+                                        &usage,
+                                        Some(retained_context_tokens),
+                                    )
+                                    .await?;
+                                let mut post_compaction_usage = enriched;
+                                post_compaction_usage.usage = Usage::new(
                                     Some(retained_context_tokens),
-                                )
-                                .await?;
+                                    None,
+                                    Some(retained_context_tokens),
+                                );
+                                yield AgentEvent::Usage(post_compaction_usage);
                                 yield AgentEvent::HistoryReplaced(new_conversation.clone());
                                 yield AgentEvent::Message(note_message);
                                 yield AgentEvent::Message(resume_message);
@@ -2949,20 +2979,16 @@ impl Agent {
                                     &self.extension_manager,
                                 )
                                 .await;
-                                persist_turn_context_if_changed(
+                                refresh_turn_context(
                                     &session_manager,
                                     &session_config.id,
                                     &mut conversation,
-                                    super::moim::turn_context_message(
-                                        &session_config.id,
-                                        &self.extension_manager,
-                                        &inference_lease,
-                                        turns_taken,
-                                        max_turns,
-                                        turn_start,
-                                        turn_start_compaction_info.clone(),
-                                    )
-                                    .await,
+                                    &self.extension_manager,
+                                    &inference_lease,
+                                    turns_taken,
+                                    max_turns,
+                                    turn_start,
+                                    turn_start_compaction_info.clone(),
                                 )
                                 .await?;
                                 initial_messages = conversation.messages().clone();
@@ -3906,16 +3932,13 @@ impl Agent {
             }
 
             if let Some(prompt) = pending_self_compact.take() {
-                let is_cancelled = is_token_cancelled(&cancel_token);
-                let reason = if is_cancelled {
-                    "cancelled"
-                } else {
-                    "run ended before compaction"
-                };
-                let notice = crate::agents::self_compact::self_compact_failed_notice(reason, &prompt);
-                if let Err(e) = session_manager.add_message(&session_config.id, &notice).await {
-                    warn!("Failed to persist self-compaction leftover notice: {e}");
-                }
+                let notice = crate::agents::self_compact::handle_leftover_pending(
+                    &session_manager,
+                    &session_config.id,
+                    &cancel_token,
+                    &prompt,
+                )
+                .await;
                 yield AgentEvent::Message(notice);
             }
 
