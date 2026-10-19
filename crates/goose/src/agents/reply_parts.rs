@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: record side call usage for rolling memory; execute and handle rolling fold.
+// Modified by Jonathan Mohrbacher, 2026: record side call usage for rolling memory; execute and handle rolling fold; list self-compaction tool.
 use anyhow::Result;
 use goose_providers::errors::ProviderError;
 use regex::Regex;
@@ -217,9 +217,13 @@ impl Agent {
             .await;
         let lease = Arc::new(lease);
         let mut tools = lease.tools().await;
-        if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
-            tools.push(final_output_tool.tool());
-        }
+        let has_final_output =
+            if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
+                tools.push(final_output_tool.tool());
+                true
+            } else {
+                false
+            };
         ensure_unique_tool_names(&tools)?;
 
         #[cfg(feature = "code-mode")]
@@ -227,7 +231,20 @@ impl Agent {
         #[cfg(not(feature = "code-mode"))]
         let code_execution_active = false;
 
-        let tools = prepare_inference_tools(tools, code_execution_active);
+        let mut tools = prepare_inference_tools(tools, code_execution_active);
+        if !has_final_output && self.self_compact_available(&session).await {
+            if !tools
+                .iter()
+                .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME)
+            {
+                tools.push(crate::agents::self_compact::self_compact_tool());
+            } else {
+                tracing::warn!(
+                    "Extension already registered tool '{}'; skipping built-in self_compact_and_resume",
+                    crate::agents::self_compact::SELF_COMPACT_TOOL_NAME
+                );
+            }
+        }
 
         let extensions_info = lease.instructions().await;
         let model_config = self.effective_model_config_for_session(&session.id).await?;

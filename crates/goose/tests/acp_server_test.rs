@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test.
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test; self-compaction over ACP test; reload excludes self_compact_and_resume for recipe response schema.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -2179,6 +2179,360 @@ fn test_session_settings_templated_recipe_renders_consistently() {
         assert_eq!(
             sys1, sys2,
             "rendered recipe must match on subsequent settings/set without recipe"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_prompt_self_compact() {
+    run_test(async move {
+        // Exchange 1: tool call for self_compact_and_resume
+        let tool_call_chunk = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1766229301,\"model\":\"gpt-5-nano\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_compact\",",
+            "\"type\":\"function\",\"function\":{\"name\":\"self_compact_and_resume\",",
+            "\"arguments\":\"{\\\"prompt\\\":\\\"Resume prompt after compaction\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1766229301,\"model\":\"gpt-5-nano\",",
+            "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        // Exchange 2: summarization during compaction
+        let summary_chunk = concat!(
+            "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1766229302,\"model\":\"gpt-5-nano\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":",
+            "\"{\\\"user_intent\\\":[\\\"compact\\\"],\\\"technical_concepts\\\":[],\\\"files\\\":[],\\\"errors_and_fixes\\\":[],\\\"problem_solving\\\":[],\\\"user_messages\\\":[\\\"start self-compaction\\\"],\\\"pending_tasks\\\":[],\\\"current_work\\\":\\\"compacting\\\"}\"",
+            "},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1766229302,\"model\":\"gpt-5-nano\",",
+            "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        // Exchange 3: final assistant reply after resume
+        let final_chunk = concat!(
+            "data: {\"id\":\"chatcmpl-3\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Resumed successfully after compaction.\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-3\",\"object\":\"chat.completion.chunk\",\"created\":1766229303,\"model\":\"gpt-5-nano\",",
+            "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let openai = OpenAiFixture::new(
+            vec![
+                ("start self-compaction".to_string(), tool_call_chunk),
+                (
+                    "Please summarize the conversation history".to_string(),
+                    summary_chunk,
+                ),
+                ("Resume prompt after compaction".to_string(), final_chunk),
+            ],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+
+        let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // 1. Assert self_compact_and_resume is offered in a plain session
+        let tools_res = send_custom(
+            conn.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools = tools_res
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("tools array");
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("self_compact_and_resume")),
+            "self_compact_and_resume tool should be offered in a plain session"
+        );
+
+        // Drain any session creation updates so we only observe updates from session/prompt
+        let _ = session.session_updates();
+
+        let prompt_res = send_custom(
+            conn.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "start self-compaction" }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            prompt_res.get("stopReason").and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
+
+        let updates = session.session_updates();
+
+        let active_run_id_from_update = |update: &SessionUpdate| -> Option<Option<String>> {
+            match update {
+                SessionUpdate::SessionInfoUpdate(info) => {
+                    let goose = info.meta.as_ref()?.get("goose")?;
+                    let run_val = goose.get("activeRunId")?;
+                    if run_val.is_null() {
+                        Some(None)
+                    } else {
+                        Some(run_val.as_str().map(|s| s.to_string()))
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        let initial_run_id = updates
+            .iter()
+            .find_map(|u| match active_run_id_from_update(u) {
+                Some(Some(id)) => Some(id),
+                _ => None,
+            })
+            .expect("expected initial activeRunId at prompt start");
+
+        let tool_call_idx = updates
+            .iter()
+            .position(|u| match u {
+                SessionUpdate::ToolCall(tc) => {
+                    tc.title == "self_compact_and_resume"
+                        || tc
+                            .meta
+                            .as_ref()
+                            .and_then(|m| m.get("goose"))
+                            .and_then(|g| g.get("toolCall"))
+                            .and_then(|t| t.get("toolName"))
+                            .and_then(|n| n.as_str())
+                            == Some("self_compact_and_resume")
+                }
+                _ => false,
+            })
+            .expect("expected tool_call for self_compact_and_resume");
+
+        let resume_chunk_idx = updates
+            .iter()
+            .position(|u| match u {
+                SessionUpdate::UserMessageChunk(chunk) => {
+                    let is_steer = chunk
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get("goose"))
+                        .and_then(|g| g.get("steer"))
+                        .and_then(|s| s.as_bool())
+                        .unwrap_or(false);
+                    let has_text = match &chunk.content {
+                        ContentBlock::Text(t) => t.text == "Resume prompt after compaction",
+                        _ => false,
+                    };
+                    is_steer && has_text
+                }
+                _ => false,
+            })
+            .expect("expected resume prompt UserMessageChunk with _meta.goose.steer == true");
+
+        // The session_info_update activeRunId stays the same (no activeRunId:null between tool call and resume)
+        for (offset, update) in updates[tool_call_idx..=resume_chunk_idx].iter().enumerate() {
+            if let Some(run_id_opt) = active_run_id_from_update(update) {
+                match run_id_opt {
+                    Some(run_id) => {
+                        assert_eq!(
+                            run_id,
+                            initial_run_id,
+                            "activeRunId changed at update {}",
+                            tool_call_idx + offset
+                        );
+                    }
+                    None => {
+                        panic!(
+                            "unexpected activeRunId: null between tool call and resume at update {}",
+                            tool_call_idx + offset
+                        );
+                    }
+                }
+            }
+        }
+
+        // A "Context self-compacted." agent_message_chunk is seen
+        let note_chunk_idx = updates
+            .iter()
+            .position(|u| match u {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(t) => t.text.contains("Context self-compacted."),
+                    _ => false,
+                },
+                _ => false,
+            })
+            .expect("expected 'Context self-compacted.' AgentMessageChunk");
+
+        // A usage_update follows compaction (pick the one emitted upon compaction immediately before note chunk)
+        let usage_update_idx = updates[tool_call_idx..note_chunk_idx]
+            .iter()
+            .rposition(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
+            .map(|idx| tool_call_idx + idx)
+            .expect("expected usage_update between tool call and note chunk");
+
+        if let SessionUpdate::UsageUpdate(ref u) = updates[usage_update_idx] {
+            assert!(
+                u.used > 0,
+                "UsageUpdate used should reflect retained tokens (> 0)"
+            );
+            assert!(
+                u.used < 1000,
+                "UsageUpdate used should reflect compact retained tokens, not full history: {}",
+                u.used
+            );
+        }
+
+        assert!(
+            tool_call_idx < usage_update_idx,
+            "usage_update must follow tool call"
+        );
+        assert!(
+            usage_update_idx <= note_chunk_idx,
+            "usage_update must precede or accompany compaction note chunk"
+        );
+        assert!(
+            note_chunk_idx < resume_chunk_idx,
+            "note chunk must precede resume chunk"
+        );
+
+        // The final assistant text after the resume is delivered
+        let final_assistant_idx = updates
+            .iter()
+            .position(|u| match u {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(t) => {
+                        t.text.contains("Resumed successfully after compaction")
+                    }
+                    _ => false,
+                },
+                _ => false,
+            })
+            .expect("expected final assistant text after resume");
+
+        assert!(
+            resume_chunk_idx < final_assistant_idx,
+            "final assistant text must be delivered after resume chunk"
+        );
+
+        // Run completes with activeRunId: null
+        let final_null_idx = updates
+            .iter()
+            .position(|u| active_run_id_from_update(u) == Some(None))
+            .expect("expected activeRunId: null at end of prompt");
+        assert!(
+            final_null_idx > resume_chunk_idx,
+            "activeRunId: null should arrive after the resume chunk"
+        );
+    });
+}
+
+/// Regression guard: a recipe session (with response schema) loaded on a fresh connection
+/// must never list self_compact_and_resume.
+#[tokio::test]
+async fn test_recipe_session_after_reload_never_lists_self_compact_and_resume() {
+    run_test(async move {
+        let temp_data = tempfile::tempdir().unwrap();
+        let openai = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        // Recipe with a response schema (recipe final_output)
+        let recipe = serde_json::json!({
+            "title": "Response Schema Recipe",
+            "description": "Recipe with response schema",
+            "instructions": "Instructions",
+            "response": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "result": { "type": "string" }
+                    },
+                    "required": ["result"]
+                }
+            }
+        });
+
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/settings/set",
+            serde_json::json!({
+                "sessionId": session_id,
+                "recipe": recipe,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Verify tool list before reload
+        let tools_before = send_custom(
+            conn.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools_before_arr = tools_before
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array");
+        assert!(
+            !tools_before_arr
+                .iter()
+                .any(|t| t["name"] == "self_compact_and_resume"),
+            "Before reload: session with response schema must NOT list self_compact_and_resume"
+        );
+
+        // Fresh connection to simulate restored session after reload
+        let openai2 = OpenAiFixture::new(vec![], Arc::new(IgnoreSessionId)).await;
+        let mut conn2 = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: temp_data.path().to_path_buf(),
+                ..Default::default()
+            },
+            openai2,
+        )
+        .await;
+
+        let _loaded = conn2.load_session(&session_id, vec![]).await.unwrap();
+
+        let tools_after = send_custom(
+            conn2.cx(),
+            "_goose/unstable/tools/list",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let tools_after_arr = tools_after
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tools array");
+
+        assert!(
+            !tools_after_arr.iter().any(|t| t["name"] == "self_compact_and_resume"),
+            "After reload: restored session with response schema must NOT list self_compact_and_resume"
+        );
+        assert_eq!(
+            tools_before_arr.len(),
+            tools_after_arr.len(),
+            "Tool list length must match before and after reload"
         );
     });
 }

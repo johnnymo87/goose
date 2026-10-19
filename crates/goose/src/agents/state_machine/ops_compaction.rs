@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: self-compaction kind in compact_messages call.
 //! Compacts conversation history when it is too large for the configured context window.
 
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use crate::agents::state_machine::{
     trailing_error, yielded, yielded_with, ConversationEffect, Emitter, GooseEffect, Operation,
     OperationResult, SlashCommand,
 };
-use crate::context_mgmt::{compact_messages, count_context_tokens};
+use crate::context_mgmt::{compact_messages, count_context_tokens, CompactionKind};
 use crate::conversation::message::{Message, MessageErrorKind, SystemNotificationType};
 use crate::conversation::{Conversation, EffectiveRole};
 use crate::providers::base::Provider;
@@ -180,7 +181,7 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
             &self.model_config,
             &session.id,
             conversation,
-            true,
+            CompactionKind::Manual,
         )
         .instrument(span.clone())
         .await
@@ -315,7 +316,7 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
             &self.model_config,
             &session.id,
             conversation,
-            false,
+            CompactionKind::Auto,
         )
         .instrument(span.clone())
         .await

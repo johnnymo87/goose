@@ -1,5 +1,5 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold.
-use std::collections::HashMap;
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass.
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -53,7 +53,7 @@ use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
 use crate::config::{Config, GooseMode};
 use crate::context_mgmt::{
-    check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
+    check_if_compaction_needed, compact_messages, CompactionKind, DEFAULT_COMPACTION_THRESHOLD,
 };
 use crate::conversation::message::{
     ActionRequiredData, InferenceMetadata, Message, MessageContent, MessageUsage, ProviderMetadata,
@@ -70,7 +70,7 @@ use crate::security::adversary_inspector::AdversaryInspector;
 use crate::security::egress_inspector::EgressInspector;
 use crate::security::security_inspector::SecurityInspector;
 use crate::session::extension_data::{EnabledExtensionsState, ExtensionState};
-use crate::session::{Session, SessionManager, SessionNameUpdate};
+use crate::session::{Session, SessionManager, SessionNameUpdate, SessionType};
 use crate::tool_inspection::ToolInspectionManager;
 use crate::tool_monitor::RepetitionInspector;
 use crate::utils::is_token_cancelled;
@@ -304,6 +304,7 @@ pub struct Agent {
     pub(super) goal: Mutex<Option<String>>,
     pub(super) grind: Mutex<Option<String>>,
     steer_queues: Mutex<HashMap<String, SteerQueue>>,
+    self_compact_runs: Mutex<HashSet<String>>,
 }
 
 fn ensure_message_event_id(event: AgentEvent) -> AgentEvent {
@@ -340,7 +341,7 @@ async fn persist_and_push_message_with_id(
     Ok(message)
 }
 
-async fn persist_turn_context_if_changed(
+pub(crate) async fn persist_turn_context_if_changed(
     session_manager: &SessionManager,
     session_id: &str,
     conversation: &mut Conversation,
@@ -353,7 +354,7 @@ async fn persist_turn_context_if_changed(
         .messages()
         .iter()
         .rev()
-        .find(|message| message.is_turn_context())
+        .find(|message| message.is_turn_context() && message.is_agent_visible())
         .is_some_and(|current| current.as_concat_text() == turn_context.as_concat_text())
     {
         return Ok(());
@@ -361,6 +362,36 @@ async fn persist_turn_context_if_changed(
     persist_and_push_message_with_id(session_manager, session_id, conversation, turn_context)
         .await?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_turn_context(
+    session_manager: &SessionManager,
+    session_id: &str,
+    conversation: &mut Conversation,
+    extension_manager: &crate::agents::extension_manager::ExtensionManager,
+    lease: &crate::agents::extension_manager::ExtensionLease,
+    turns_taken: u32,
+    max_turns: u32,
+    turn_start: chrono::DateTime<chrono::Local>,
+    compaction_info: Option<String>,
+) -> Result<()> {
+    persist_turn_context_if_changed(
+        session_manager,
+        session_id,
+        conversation,
+        super::moim::turn_context_message(
+            session_id,
+            extension_manager,
+            lease,
+            turns_taken,
+            max_turns,
+            turn_start,
+            compaction_info,
+        )
+        .await,
+    )
+    .await
 }
 
 fn project_message_for_user_event(message: &Message) -> Message {
@@ -495,6 +526,7 @@ impl Agent {
             goal: Mutex::new(None),
             grind: Mutex::new(None),
             steer_queues: Mutex::new(HashMap::new()),
+            self_compact_runs: Mutex::new(HashSet::new()),
         }
     }
 
@@ -634,6 +666,21 @@ impl Agent {
             .entry(session_id.to_string())
             .or_default()
             .clone()
+    }
+
+    pub(super) async fn reset_self_compact_run(&self, session_id: &str) {
+        self.self_compact_runs.lock().await.remove(session_id);
+    }
+
+    pub(super) async fn has_self_compacted_in_run(&self, session_id: &str) -> bool {
+        self.self_compact_runs.lock().await.contains(session_id)
+    }
+
+    pub(super) async fn record_self_compact_in_run(&self, session_id: &str) {
+        self.self_compact_runs
+            .lock()
+            .await
+            .insert(session_id.to_string());
     }
 
     async fn emit_pre_tool_extended_hooks(
@@ -1098,6 +1145,40 @@ impl Agent {
         Ok(())
     }
 
+    pub async fn self_compact_available(&self, session: &Session) -> bool {
+        if session.session_type == SessionType::SubAgent {
+            return false;
+        }
+
+        if session
+            .recipe
+            .as_ref()
+            .is_some_and(|r| r.retry.is_some() || r.response.is_some())
+        {
+            return false;
+        }
+
+        let enabled = Config::global()
+            .get_param::<bool>("GOOSE_SELF_COMPACT")
+            .unwrap_or(true);
+        if !enabled {
+            return false;
+        }
+
+        if self.final_output_tool.lock().await.is_some() {
+            return false;
+        }
+
+        let Ok(provider) = self.provider().await else {
+            return false;
+        };
+        if provider.manages_own_context() {
+            return false;
+        }
+
+        true
+    }
+
     pub async fn dispatch_tool_call(
         &self,
         tool_call: CallToolRequestParams,
@@ -1195,6 +1276,44 @@ impl Agent {
 
         self.emit_pre_tool_extended_hooks(&tool_call.name, tool_input_for_hooks.as_ref(), session)
             .await;
+
+        if tool_call.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME {
+            let is_shadowed = lease
+                .tools()
+                .await
+                .iter()
+                .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME);
+
+            if !is_shadowed {
+                let result = if !self.self_compact_available(session).await {
+                    ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
+                        "self_compact_and_resume is not available in this session",
+                    )])))
+                } else if self.has_self_compacted_in_run(&session.id).await {
+                    ToolCallResult::from(Ok(CallToolResult::error(vec![ContentBlock::text(
+                        crate::agents::self_compact::SELF_COMPACT_ALREADY_COMPACTED_MESSAGE,
+                    )])))
+                } else {
+                    match crate::agents::self_compact::validate_self_compact_args(
+                        tool_call.arguments.as_ref(),
+                    ) {
+                        Ok(_) => {
+                            self.record_self_compact_in_run(&session.id).await;
+                            ToolCallResult::from(Ok(CallToolResult::success(vec![
+                                ContentBlock::text(
+                                    crate::agents::self_compact::SELF_COMPACT_SUCCESS_MESSAGE,
+                                ),
+                            ])))
+                        }
+                        Err(err) => ToolCallResult::from(Ok(CallToolResult::error(vec![
+                            ContentBlock::text(err),
+                        ]))),
+                    }
+                };
+                let result = self.with_post_tool_hook(result, &tool_call, session, &request_id);
+                return (request_id, Ok(result));
+            }
+        }
 
         if tool_call.name == FINAL_OUTPUT_TOOL_NAME {
             return if let Some(final_output_tool) = self.final_output_tool.lock().await.as_mut() {
@@ -1527,8 +1646,35 @@ impl Agent {
         };
 
         if include_final_output {
-            if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
-                prefixed_tools.push(final_output_tool.tool());
+            let has_final_output =
+                if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
+                    prefixed_tools.push(final_output_tool.tool());
+                    true
+                } else {
+                    false
+                };
+
+            if !has_final_output {
+                if let Ok(session) = self
+                    .config
+                    .session_manager
+                    .get_session(session_id, false)
+                    .await
+                {
+                    if self.self_compact_available(&session).await {
+                        if !prefixed_tools
+                            .iter()
+                            .any(|t| t.name == crate::agents::self_compact::SELF_COMPACT_TOOL_NAME)
+                        {
+                            prefixed_tools.push(crate::agents::self_compact::self_compact_tool());
+                        } else {
+                            warn!(
+                                "Extension already registered tool '{}'; skipping built-in self_compact_and_resume",
+                                crate::agents::self_compact::SELF_COMPACT_TOOL_NAME
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -2570,7 +2716,7 @@ impl Agent {
                     &compact_model_config,
                     &session_config.id,
                     &conversation_to_compact,
-                    false,
+                    CompactionKind::Auto,
                 )
                 .await
                 {
@@ -2735,6 +2881,7 @@ impl Agent {
             }
         }
         let inner = Box::pin(async_stream::try_stream! {
+            self.reset_self_compact_run(&session_config.id).await;
             let mut session = session;
             let mut turns_taken = 0u32;
             let max_turns = session_config.max_turns.unwrap_or_else(|| {
@@ -2758,30 +2905,27 @@ impl Agent {
             let mut retrying_after_stop_hook_denial = false;
             let mut consecutive_stop_hook_blocks = 0u32;
             let stop_hook_block_cap = self.stop_hook_block_cap();
+            let mut pending_self_compact: Option<String> = None;
             let mut can_drain_pending_steers = false;
             let turn_start = chrono::Local::now();
-            let turn_start_compaction_info =
+            let mut turn_start_compaction_info =
                 super::moim::compute_compaction_info(&session_config.id, &self.extension_manager)
                     .await;
 
-            persist_turn_context_if_changed(
+            refresh_turn_context(
                 &session_manager,
                 &session_config.id,
                 &mut conversation,
-                super::moim::turn_context_message(
-                    &session_config.id,
-                    &self.extension_manager,
-                    &inference_lease,
-                    turns_taken,
-                    max_turns,
-                    turn_start,
-                    turn_start_compaction_info.clone(),
-                )
-                .await,
+                &self.extension_manager,
+                &inference_lease,
+                turns_taken,
+                max_turns,
+                turn_start,
+                turn_start_compaction_info.clone(),
             )
             .await?;
             // Snapshot after the turn-context append so a retry keeps the sent prefix.
-            let initial_messages = conversation.messages().clone();
+            let mut initial_messages = conversation.messages().clone();
 
             let mut first_inference = true;
             loop {
@@ -2805,22 +2949,111 @@ impl Agent {
                     if let Some(project_addendum) = &project_addendum {
                         system_prompt = format!("{system_prompt}\n\n{project_addendum}");
                     }
-                    persist_turn_context_if_changed(
+                    refresh_turn_context(
                         &session_manager,
                         &session_config.id,
                         &mut conversation,
-                        super::moim::turn_context_message(
-                            &session_config.id,
-                            &self.extension_manager,
-                            &inference_lease,
-                            turns_taken,
-                            max_turns,
-                            turn_start,
-                            turn_start_compaction_info.clone(),
-                        )
-                        .await,
+                        &self.extension_manager,
+                        &inference_lease,
+                        turns_taken,
+                        max_turns,
+                        turn_start,
+                        turn_start_compaction_info.clone(),
                     )
                     .await?;
+                }
+
+                if let Some(prompt) = pending_self_compact.take() {
+                    if turns_taken >= max_turns {
+                        let notice = crate::agents::self_compact::self_compact_skipped_notice(&prompt);
+                        session_manager.add_message(&session_config.id, &notice).await?;
+                        conversation.push(notice.clone());
+                        yield AgentEvent::Message(notice);
+                    } else {
+                        yield AgentEvent::Message(crate::agents::self_compact::self_compact_progress_notice());
+                        let provider = self.provider().await?;
+                        let outcome = crate::agents::self_compact::execute_self_compact(
+                            &session_manager,
+                            &session_config.id,
+                            provider.as_ref(),
+                            &model_config,
+                            &cancel_token,
+                            &prompt,
+                        )
+                        .await;
+                        match outcome {
+                            crate::agents::self_compact::SelfCompactOutcome::Success(success) => {
+                                let crate::agents::self_compact::SelfCompactSuccess {
+                                    new_conversation,
+                                    history_replaced_conversation,
+                                    note_message,
+                                    resume_message,
+                                    retained_context_tokens,
+                                    usage,
+                                } = *success;
+                                let mut post_compaction_usage = match self
+                                    .update_session_metrics(
+                                        &session_config.id,
+                                        session_config.schedule_id.clone(),
+                                        &usage,
+                                        Some(retained_context_tokens),
+                                    )
+                                    .await
+                                {
+                                    Ok(enriched) => enriched,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            session_id = %session_config.id,
+                                            error = %e,
+                                            "Failed to update session metrics after self-compaction"
+                                        );
+                                        usage
+                                    }
+                                };
+                                post_compaction_usage.usage = Usage::new(
+                                    Some(retained_context_tokens),
+                                    None,
+                                    Some(retained_context_tokens),
+                                );
+                                yield AgentEvent::Usage(post_compaction_usage);
+                                yield AgentEvent::HistoryReplaced(history_replaced_conversation);
+                                yield AgentEvent::Message(note_message);
+                                yield AgentEvent::Message(resume_message);
+                                conversation = new_conversation;
+                                compaction_attempts = 0;
+                                turn_start_compaction_info = super::moim::compute_compaction_info(
+                                    &session_config.id,
+                                    &self.extension_manager,
+                                )
+                                .await;
+                                refresh_turn_context(
+                                    &session_manager,
+                                    &session_config.id,
+                                    &mut conversation,
+                                    &self.extension_manager,
+                                    &inference_lease,
+                                    turns_taken,
+                                    max_turns,
+                                    turn_start,
+                                    turn_start_compaction_info.clone(),
+                                )
+                                .await?;
+                                initial_messages = conversation.messages().clone();
+                            }
+                            crate::agents::self_compact::SelfCompactOutcome::Failed {
+                                notice,
+                                is_cancelled,
+                            } => {
+                                conversation.push(notice.clone());
+                                yield AgentEvent::Message(notice);
+                                if !is_cancelled && self.has_pending_steers(&session_config.id).await {
+                                    self.reset_self_compact_run(&session_config.id).await;
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 if can_drain_pending_steers {
@@ -3323,6 +3556,10 @@ impl Agent {
                                         }
                                     };
 
+                                    if let Some(prompt) = crate::agents::self_compact::check_self_compact_call(request, &final_response) {
+                                        pending_self_compact = Some(prompt);
+                                    }
+
                                     // Response placeholder is created before tools run, so clamp request to avoid inverted ordering.
                                     if request_msg.created > final_response.created {
                                         request_msg.created = final_response.created;
@@ -3371,7 +3608,7 @@ impl Agent {
                                 &model_config,
                                 &session_config.id,
                                 &conversation,
-                                false,
+                                CompactionKind::Auto,
                             )
                             .await
                             {
@@ -3748,6 +3985,17 @@ impl Agent {
                 tokio::task::yield_now().await;
             }
 
+            if let Some(prompt) = pending_self_compact.take() {
+                let notice = crate::agents::self_compact::handle_leftover_pending(
+                    &session_manager,
+                    &session_config.id,
+                    &cancel_token,
+                    &prompt,
+                )
+                .await;
+                yield AgentEvent::Message(notice);
+            }
+
             if !last_assistant_text.is_empty()
                 && gen_ai_telemetry::capture_message_content()
             {
@@ -3762,6 +4010,7 @@ impl Agent {
             if !stop_hook_handled_for_exit {
                 self.emit_stop_hook(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy()).await;
             }
+            self.reset_self_compact_run(&session_config.id).await;
             drop(inference_lease);
         }.instrument(reply_stream_span));
         Ok(inner)
@@ -6862,5 +7111,100 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         assert_eq!(results[0]["policy_evaluated"], false);
         assert_eq!(results[0]["blocked_by"], "test-plugin");
         assert_eq!(results[0]["tool_call_id"], "call-closed-1");
+    }
+
+    #[tokio::test]
+    async fn test_self_compact_tool_dispatch_causes_no_state_changes() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
+        let (agent, session_id) = create_test_agent(
+            temp_dir.path().join("data"),
+            crate::hooks::HookManager::from_plugins_for_test(vec![]),
+            Arc::new(CountingTextProvider::new()),
+        )
+        .await?;
+        let session = agent
+            .config
+            .session_manager
+            .get_session(&session_id, false)
+            .await?;
+        let lease = agent.resolve_lease(&session.id, &session.working_dir).await;
+
+        let tool_call = rmcp::model::CallToolRequestParams::new(
+            crate::agents::self_compact::SELF_COMPACT_TOOL_NAME,
+        )
+        .with_arguments(rmcp::object!({ "prompt": "Resume" }));
+
+        let _ = agent
+            .dispatch_tool_call_on(&lease, tool_call, "call-1".to_string(), None, &session)
+            .await;
+
+        assert!(agent.final_output_tool.lock().await.is_none());
+        assert!(agent.goal.lock().await.is_none());
+        assert!(agent.grind.lock().await.is_none());
+        assert_eq!(agent.get_retry_attempts().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_self_compact_smart_approve_needs_no_approval() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let _env = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(temp_dir.path().to_str().unwrap())),
+            ("GOOSE_SELF_COMPACT", None::<&str>),
+        ]);
+        let (agent, session_id) = create_test_agent(
+            temp_dir.path().join("data"),
+            crate::hooks::HookManager::from_plugins_for_test(vec![]),
+            Arc::new(CountingTextProvider::new()),
+        )
+        .await?;
+        let session = agent
+            .config
+            .session_manager
+            .get_session(&session_id, false)
+            .await?;
+
+        // Switch to SmartApprove
+        *agent.current_goose_mode.lock().await = GooseMode::SmartApprove;
+
+        // Prepare tools (which calls apply_tool_annotations)
+        let _ = agent.prepare_tools_and_prompt(&session).await?;
+
+        let tool_request = crate::conversation::message::ToolRequest {
+            id: "req-1".to_string(),
+            tool_call: Ok(rmcp::model::CallToolRequestParams::new(
+                crate::agents::self_compact::SELF_COMPACT_TOOL_NAME,
+            )
+            .with_arguments(rmcp::object!({ "prompt": "resume" }))),
+            metadata: None,
+            tool_meta: None,
+        };
+
+        let inspection_results = agent
+            .tool_inspection_manager
+            .inspect_tools(
+                &session.id,
+                std::slice::from_ref(&tool_request),
+                &[],
+                GooseMode::SmartApprove,
+            )
+            .await?;
+
+        let permission_result = agent
+            .tool_inspection_manager
+            .process_inspection_results_with_permission_inspector(
+                std::slice::from_ref(&tool_request),
+                &inspection_results,
+            )
+            .expect("permission result");
+
+        assert_eq!(permission_result.approved, vec![tool_request]);
+        assert!(permission_result.needs_approval.is_empty());
+        assert!(permission_result.denied.is_empty());
+        Ok(())
     }
 }
