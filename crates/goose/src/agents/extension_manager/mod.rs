@@ -2086,4 +2086,101 @@ mod tests {
             "stdio::spawn ExtensionError string must contain process quit prefix, got: {err_msg}"
         );
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_mcp_client_startup_timeout_kills_grandchild_process_group() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let gpid_path = temp_dir.path().join("gpid");
+
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!("sleep 600 & echo $! > \"{}\"; wait", gpid_path.display()),
+        ]);
+
+        let ctx = ConnectContext {
+            timeout: Duration::from_secs(30),
+            startup_timeout: Some(Duration::from_millis(500)),
+            client_name: "test".to_string(),
+            capabilities: GooseMcpClientCapabilities::default(),
+            working_dir: temp_dir.path().to_path_buf(),
+            docker_container: None,
+            action_required: Arc::new(crate::action_required_manager::ActionRequiredManager::new()),
+            tools_version: Arc::new(AtomicU64::new(0)),
+        };
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), stdio::spawn(command, ctx))
+            .await
+            .expect("stdio::spawn should finish within 5s and not hang on orphaned grandchild");
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "spawn took too long: {:?}",
+            elapsed
+        );
+
+        let err = match result {
+            Ok(_) => panic!("stdio::spawn should fail due to startup timeout"),
+            Err(e) => e,
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("GOOSE_EXTENSION_STARTUP_TIMEOUT"),
+            "error should contain GOOSE_EXTENSION_STARTUP_TIMEOUT, got: {err_msg}"
+        );
+
+        // Read grandchild PID
+        let mut gpid = None;
+        for _ in 0..50 {
+            if let Ok(content) = std::fs::read_to_string(&gpid_path) {
+                if let Ok(parsed) = content.trim().parse::<i32>() {
+                    gpid = Some(parsed);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let gpid = gpid.expect("grandchild PID should have been written");
+
+        // Verify grandchild process is killed
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut still_alive = true;
+        while std::time::Instant::now() < deadline {
+            let res = unsafe { libc::kill(gpid, 0) };
+            let alive = if res != 0 {
+                false
+            } else {
+                #[cfg(target_os = "linux")]
+                {
+                    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{gpid}/stat")) {
+                        if let Some((_, after_name)) = stat.rsplit_once(") ") {
+                            if let Some(state) = after_name.chars().next() {
+                                state != 'Z' && state != 'X'
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                true
+            };
+            if !alive {
+                still_alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !still_alive,
+            "grandchild process {gpid} should be killed after startup timeout"
+        );
+    }
 }

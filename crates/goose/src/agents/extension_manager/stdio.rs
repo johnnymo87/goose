@@ -1,8 +1,13 @@
+// Modified by Jonathan Mohrbacher, 2026: kill child process group on startup connect error; bounded stderr capture.
+
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::transport::ConfigureCommandExt;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 use super::super::container::Container;
 use super::super::extension::{ExtensionError, ExtensionResult, ProcessExit};
@@ -81,21 +86,41 @@ pub(super) async fn spawn(mut command: Command, ctx: ConnectContext) -> Extensio
     }
 
     let (transport, mut stderr) = spawn_long_lived_mcp_subprocess(command).await?;
+    let child_pid = transport.id();
     let mut stderr = stderr.take().ok_or_else(|| {
         ExtensionError::SetupError("failed to attach child process stderr".to_owned())
     })?;
 
-    let stderr_task = tokio::spawn(async move {
-        let mut all_stderr = Vec::new();
-        stderr.read_to_end(&mut all_stderr).await?;
-        Ok::<String, std::io::Error>(String::from_utf8_lossy(&all_stderr).into())
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf_clone = Arc::clone(&stderr_buf);
+    let mut stderr_task = tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    stderr_buf_clone.lock().await.extend_from_slice(&buf[..n]);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     });
 
     match McpClient::connect(transport, ctx).await {
         Ok(client) => Ok(client),
-        Err(error) => Err(match stderr_task.await? {
-            Ok(stderr_content) => ProcessExit::new(stderr_content, error).into(),
-            Err(e) => e.into(),
-        }),
+        Err(error) => {
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                unsafe {
+                    let _ = libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut stderr_task).await;
+            let all_stderr = stderr_buf.lock().await.clone();
+            let stderr_content = String::from_utf8_lossy(&all_stderr).into_owned();
+            Err(ProcessExit::new(stderr_content, error).into())
+        }
     }
 }
