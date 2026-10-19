@@ -220,14 +220,19 @@ fn is_lexical_project_plugin_path(path: &Path) -> bool {
 /// must see only its own project's skills, such as an unattended recipe run from a dedicated
 /// directory on a host whose interactive sessions keep a large global library.
 ///
-/// Any other value is treated as `false`, with a warning: a process that sets the variable at all
-/// is asking for isolation, and a typo must not silently give it the full host library.
+/// Any other value (including empty or non-UTF-8) is treated as `false`, with a warning: a process
+/// that sets the variable at all is asking for isolation, and a typo must not silently give it the
+/// full host library. The cost is the other direction -- a stray `GOOSE_GLOBAL_SKILLS=1` in an
+/// interactive shell hides that shell's global skills -- so set it only where isolation is meant.
+///
+/// Read from the environment only, not from config.yaml: it is a per-process decision. Tests that
+/// assert on global skills should lock it unset (see the tests below).
 pub fn global_skills_enabled() -> bool {
-    match std::env::var("GOOSE_GLOBAL_SKILLS") {
-        Err(_) => true,
-        Ok(value) => match value.trim() {
-            "true" => true,
-            "false" => false,
+    match std::env::var_os("GOOSE_GLOBAL_SKILLS") {
+        None => true,
+        Some(raw) => match raw.to_str().map(str::trim) {
+            Some("true") => true,
+            Some("false") => false,
             other => {
                 warn!("GOOSE_GLOBAL_SKILLS={other:?} is not 'true' or 'false'; treating it as 'false'");
                 false
