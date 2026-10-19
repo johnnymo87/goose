@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass.
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session.
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1441,22 +1441,21 @@ impl Agent {
             });
 
         let session_id = session.id.clone();
+        let working_dir = Some(session.working_dir.clone());
+        let container = self.container.lock().await.clone();
 
         let extension_futures = enabled_configs
             .into_iter()
             .map(|config| {
-                let config_clone = config.clone();
-                let agent_ref = self.clone();
-                let session_id_clone = session_id.clone();
+                let ext_manager = Arc::clone(&self.extension_manager);
+                let working_dir = working_dir.clone();
+                let container = container.clone();
+                let sid = session_id.clone();
 
                 async move {
-                    let name = config_clone.name().to_string();
+                    let name = config.name().to_string();
 
-                    if agent_ref
-                        .extension_manager
-                        .is_extension_enabled(&name)
-                        .await
-                    {
+                    if ext_manager.is_extension_enabled(&name).await {
                         tracing::debug!("Extension {} already loaded, skipping", name);
                         return ExtensionLoadResult {
                             name,
@@ -1465,8 +1464,8 @@ impl Agent {
                         };
                     }
 
-                    match agent_ref
-                        .add_extension_inner(config_clone, &session_id_clone)
+                    match ext_manager
+                        .add_extension(config, working_dir, container.as_ref(), Some(&sid))
                         .await
                     {
                         Ok(_) => ExtensionLoadResult {
@@ -7206,5 +7205,92 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         assert!(permission_result.needs_approval.is_empty());
         assert!(permission_result.denied.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_mcp_client_startup_timeout_load_extensions_from_session_runs_in_parallel() {
+        let _guard = env_lock::lock_env([("GOOSE_EXTENSION_STARTUP_TIMEOUT", Some("1"))]);
+        let agent = Arc::new(Agent::new());
+        let session_manager = agent.config.session_manager.clone();
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let session = session_manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "test-parallel-load".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .expect("create session");
+
+        let ext1 = ExtensionConfig::Stdio {
+            name: "slow-1".to_string(),
+            description: "slow ext 1".to_string(),
+            cmd: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 600 & wait".to_string()],
+            envs: crate::agents::extension::Envs::default(),
+            env_keys: vec![],
+            timeout: None,
+            cwd: None,
+            bundled: Some(false),
+            available_tools: vec![],
+        };
+        let ext2 = ExtensionConfig::Stdio {
+            name: "slow-2".to_string(),
+            description: "slow ext 2".to_string(),
+            cmd: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 600 & wait".to_string()],
+            envs: crate::agents::extension::Envs::default(),
+            env_keys: vec![],
+            timeout: None,
+            cwd: None,
+            bundled: Some(false),
+            available_tools: vec![],
+        };
+
+        let mut extension_data = session.extension_data.clone();
+        let extensions_state = EnabledExtensionsState::new(vec![ext1, ext2]);
+        extensions_state
+            .to_extension_data(&mut extension_data)
+            .expect("to extension data");
+
+        session_manager
+            .update(&session.id)
+            .extension_data(extension_data)
+            .apply()
+            .await
+            .expect("update session");
+
+        let session = session_manager
+            .get_session(&session.id, false)
+            .await
+            .expect("get updated session");
+
+        let start = std::time::Instant::now();
+        let results = agent.load_extensions_from_session(&session).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].success);
+        assert!(!results[1].success);
+        assert!(results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("GOOSE_EXTENSION_STARTUP_TIMEOUT"));
+        assert!(results[1]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("GOOSE_EXTENSION_STARTUP_TIMEOUT"));
+
+        // If serial, 1s + 1s = ~2s. If parallel, max(1s, 1s) = ~1s.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1800),
+            "extensions should load in parallel (~1s), but took {:?}",
+            elapsed
+        );
     }
 }
