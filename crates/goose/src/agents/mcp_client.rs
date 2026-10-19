@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: time out MCP server startup (GOOSE_EXTENSION_STARTUP_TIMEOUT, default 25s).
+// Modified by Jonathan Mohrbacher, 2026: time out MCP server startup (GOOSE_EXTENSION_STARTUP_TIMEOUT, default 25s, 0 treated as default).
 
 use crate::action_required_manager::{ActionRequiredManager, ElicitationOutcome};
 use crate::agents::tool_execution::ToolCallContext;
@@ -498,14 +498,25 @@ pub(crate) struct ConnectContext {
     pub tools_version: Arc<AtomicU64>,
 }
 
+pub(crate) fn resolve_startup_timeout_from_config(
+    override_timeout: Option<Duration>,
+    config_timeout: Option<u64>,
+) -> Duration {
+    override_timeout
+        .filter(|d| !d.is_zero())
+        .or_else(|| {
+            config_timeout
+                .filter(|seconds| *seconds > 0)
+                .map(Duration::from_secs)
+        })
+        .unwrap_or_else(|| Duration::from_secs(crate::config::DEFAULT_EXTENSION_STARTUP_TIMEOUT))
+}
+
 pub(crate) fn resolve_startup_timeout(override_timeout: Option<Duration>) -> Duration {
-    override_timeout.unwrap_or_else(|| {
-        Duration::from_secs(
-            Config::global()
-                .get_goose_extension_startup_timeout()
-                .unwrap_or(crate::config::DEFAULT_EXTENSION_STARTUP_TIMEOUT),
-        )
-    })
+    resolve_startup_timeout_from_config(
+        override_timeout,
+        Config::global().get_goose_extension_startup_timeout().ok(),
+    )
 }
 
 fn format_startup_timeout(d: Duration) -> String {
@@ -1537,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_startup_timeout() {
+    fn test_mcp_client_startup_timeout_format() {
         assert_eq!(format_startup_timeout(Duration::from_secs(25)), "25s");
         assert_eq!(format_startup_timeout(Duration::from_secs(1)), "1s");
         assert_eq!(format_startup_timeout(Duration::from_millis(500)), "500ms");
@@ -1545,16 +1556,45 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_startup_timeout() {
+    fn test_mcp_client_startup_timeout_resolve() {
+        let default_timeout = Duration::from_secs(crate::config::DEFAULT_EXTENSION_STARTUP_TIMEOUT);
+
+        // Explicit non-zero override takes precedence
         assert_eq!(
-            resolve_startup_timeout(Some(Duration::from_secs(42))),
+            resolve_startup_timeout_from_config(Some(Duration::from_secs(42)), Some(10)),
             Duration::from_secs(42)
         );
-        if std::env::var_os("GOOSE_EXTENSION_STARTUP_TIMEOUT").is_none() {
-            assert_eq!(
-                resolve_startup_timeout(None),
-                Duration::from_secs(crate::config::DEFAULT_EXTENSION_STARTUP_TIMEOUT)
-            );
-        }
+
+        // Zero override falls back to config timeout or default
+        assert_eq!(
+            resolve_startup_timeout_from_config(Some(Duration::ZERO), Some(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            resolve_startup_timeout_from_config(Some(Duration::ZERO), Some(0)),
+            default_timeout
+        );
+        assert_eq!(
+            resolve_startup_timeout_from_config(Some(Duration::ZERO), None),
+            default_timeout
+        );
+
+        // When override is None, positive config timeout is used
+        assert_eq!(
+            resolve_startup_timeout_from_config(None, Some(15)),
+            Duration::from_secs(15)
+        );
+
+        // Zero config timeout (GOOSE_EXTENSION_STARTUP_TIMEOUT=0) falls back to default 25s
+        assert_eq!(
+            resolve_startup_timeout_from_config(None, Some(0)),
+            default_timeout
+        );
+
+        // None config timeout falls back to default 25s
+        assert_eq!(
+            resolve_startup_timeout_from_config(None, None),
+            default_timeout
+        );
     }
 }
