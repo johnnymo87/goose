@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_GLOBAL_SKILLS=false drops the home and config skill roots from discovery and path resolution.
 //! Everything specific to skills: filesystem discovery (`SKILL.md` walking +
 //! built-ins) and the runtime MCP client (`client` submodule). User-facing
 //! CRUD lives in `crate::sources`, which generalizes across source types.
@@ -213,9 +214,34 @@ fn is_lexical_project_plugin_path(path: &Path) -> bool {
     })
 }
 
-fn inferred_discoverable_skill_root(path: &Path) -> Option<PathBuf> {
-    let canonical_path = canonicalize_or_original(path);
+/// `GOOSE_GLOBAL_SKILLS` (local patch). Unset or `true`: upstream behaviour. `false`: only
+/// project-scoped skill directories are used; the roots under `$HOME` and the config dir, and
+/// user-scope plugin skill dirs, are neither scanned nor resolvable by path. For a process that
+/// must see only its own project's skills, such as an unattended recipe run from a dedicated
+/// directory on a host whose interactive sessions keep a large global library.
+///
+/// Any other value (including empty or non-UTF-8) is treated as `false`, with a warning: a process
+/// that sets the variable at all is asking for isolation, and a typo must not silently give it the
+/// full host library. The cost is the other direction -- a stray `GOOSE_GLOBAL_SKILLS=1` in an
+/// interactive shell hides that shell's global skills -- so set it only where isolation is meant.
+///
+/// Read from the environment only, not from config.yaml: it is a per-process decision. Tests that
+/// assert on global skills should lock it unset (see the tests below).
+pub fn global_skills_enabled() -> bool {
+    match std::env::var_os("GOOSE_GLOBAL_SKILLS") {
+        None => true,
+        Some(raw) => match raw.to_str().map(str::trim) {
+            Some("true") => true,
+            Some("false") => false,
+            other => {
+                warn!("GOOSE_GLOBAL_SKILLS={other:?} is not 'true' or 'false'; treating it as 'false'");
+                false
+            }
+        },
+    }
+}
 
+fn global_skill_roots() -> Vec<PathBuf> {
     let mut global_roots = Vec::new();
     if let Some(global_root) = global_skills_dir() {
         global_roots.push(global_root);
@@ -226,14 +252,35 @@ fn inferred_discoverable_skill_root(path: &Path) -> Option<PathBuf> {
         global_roots.push(home.join(".config").join("agents").join("skills"));
     }
     global_roots.extend(installed_plugin_skill_dirs());
+    global_roots
+}
 
-    for root in global_roots {
+fn inferred_discoverable_skill_root(path: &Path) -> Option<PathBuf> {
+    let canonical_path = canonicalize_or_original(path);
+
+    if !global_skills_enabled() {
+        // `~/.agents/skills` also has the generic `<dir>/.agents/skills` project shape matched
+        // below, so skipping the global roots is not enough: refuse anything under them outright.
+        let under_global = global_skill_roots()
+            .iter()
+            .any(|root| canonical_path.starts_with(canonicalize_or_original(root)));
+        if under_global {
+            return None;
+        }
+        return project_skill_root_ancestor(&canonical_path);
+    }
+
+    for root in global_skill_roots() {
         let canonical_root = canonicalize_or_original(&root);
         if canonical_path.starts_with(&canonical_root) {
             return Some(canonical_root);
         }
     }
 
+    project_skill_root_ancestor(&canonical_path)
+}
+
+fn project_skill_root_ancestor(canonical_path: &Path) -> Option<PathBuf> {
     canonical_path.ancestors().find_map(|ancestor| {
         let parent = ancestor.parent()?;
         let is_project_skills_root = ancestor.file_name().and_then(|name| name.to_str())
@@ -438,6 +485,10 @@ fn all_skill_dirs_with_config(working_dir: Option<&Path>, config: &Config) -> Ve
                 preserve_path: true,
             }),
     );
+
+    if !global_skills_enabled() {
+        dirs.retain(|dir| !dir.is_global);
+    }
 
     dirs
 }
@@ -1218,5 +1269,90 @@ mod tests {
 
         crate::sources::delete_source(SourceType::Skill, &skill.path).unwrap();
         assert!(!skill_dir.exists());
+    }
+
+    // GOOSE_GLOBAL_SKILLS (local patch): a process that must see only its project's skills, such
+    // as an unattended recipe run from a dedicated directory, can turn the home and config skill
+    // roots off.
+    fn global_skills_fixture() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        let path_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_test_skill(&project.path().join(".agents/skills/project-skill"), "project-skill", "p");
+        write_test_skill(&home.path().join(".agents/skills/home-agents"), "home-agents", "h");
+        write_test_skill(&home.path().join(".claude/skills/home-claude"), "home-claude", "h");
+        write_test_skill(
+            &home.path().join(".config/agents/skills/home-config-agents"),
+            "home-config-agents",
+            "h",
+        );
+        write_test_skill(&path_root.path().join("config/skills/config-dir"), "config-dir", "h");
+        (home, path_root, project)
+    }
+
+    fn discovered_names(knob: Option<&str>) -> Vec<String> {
+        let (home, path_root, project) = global_skills_fixture();
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        let _guard = env_lock::lock_env([
+            ("HOME", home.path().to_str()),
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+            ("GOOSE_GLOBAL_SKILLS", knob),
+        ]);
+        let mut names: Vec<String> = discover_skills_with_config(Some(project.path()), &config)
+            .into_iter()
+            .filter(|s| s.source_type != SourceType::BuiltinSkill)
+            .map(|s| s.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn global_skill_dirs_are_scanned_by_default() {
+        let all = vec![
+            "config-dir",
+            "home-agents",
+            "home-claude",
+            "home-config-agents",
+            "project-skill",
+        ];
+        assert_eq!(discovered_names(None), all);
+        assert_eq!(discovered_names(Some("true")), all);
+    }
+
+    #[test]
+    fn global_skills_false_scans_only_project_dirs() {
+        assert_eq!(discovered_names(Some("false")), vec!["project-skill"]);
+    }
+
+    #[test]
+    fn unrecognised_global_skills_value_fails_toward_project_only() {
+        // Anyone setting the variable is asking for isolation; a typo must not silently undo it.
+        assert_eq!(discovered_names(Some("flase")), vec!["project-skill"]);
+        assert_eq!(discovered_names(Some("")), vec!["project-skill"]);
+    }
+
+    #[test]
+    fn global_skills_false_also_refuses_path_resolution_into_home_roots() {
+        let (home, path_root, _project) = global_skills_fixture();
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        let home_skill = home.path().join(".agents/skills/home-agents");
+        let config_skill = path_root.path().join("config/skills/config-dir");
+        let resolve = |knob: Option<&str>, path: &Path| {
+            let _guard = env_lock::lock_env([
+                ("HOME", home.path().to_str()),
+                ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+                ("PLUGINS", None),
+                ("GOOSE_GLOBAL_SKILLS", knob),
+            ]);
+            resolve_discoverable_skill_dir_with_config(path.to_str().unwrap(), &config).is_ok()
+        };
+        assert!(resolve(None, &home_skill));
+        assert!(resolve(None, &config_skill));
+        // ~/.agents/skills also matches the generic "<anything>/.agents/skills" project shape, so
+        // dropping the global roots alone would let it back in through that fallback.
+        assert!(!resolve(Some("false"), &home_skill));
+        assert!(!resolve(Some("false"), &config_skill));
     }
 }
