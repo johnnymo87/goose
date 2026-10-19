@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: pass startup_timeout in ConnectContext.
+
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use futures::Stream;
@@ -707,6 +709,7 @@ impl ExtensionManager {
         let tools_version = Arc::new(AtomicU64::new(0));
         let ctx = |timeout: Option<u64>, working_dir: PathBuf| ConnectContext {
             timeout: Duration::from_secs(resolve_timeout(timeout)),
+            startup_timeout: None,
             client_name: self.client_name.clone(),
             capabilities: self.mcp_client_capabilities(),
             working_dir,

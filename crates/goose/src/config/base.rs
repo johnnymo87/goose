@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_EXTENSION_STARTUP_TIMEOUT config param.
+
 use crate::config::paths::Paths;
 use crate::config::GooseMode;
 use crate::providers::private_file::{private_file_target_path, write_private_file};
@@ -1397,6 +1399,7 @@ impl Config {
 }
 
 config_value!(GOOSE_DEFAULT_EXTENSION_TIMEOUT, u64);
+config_value!(GOOSE_EXTENSION_STARTUP_TIMEOUT, u64);
 
 fn find_workspace_or_exe_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
