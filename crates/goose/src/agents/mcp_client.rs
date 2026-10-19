@@ -1,5 +1,8 @@
+// Modified by Jonathan Mohrbacher, 2026: time out MCP server startup (GOOSE_EXTENSION_STARTUP_TIMEOUT, default 25s, 0 treated as default).
+
 use crate::action_required_manager::{ActionRequiredManager, ElicitationOutcome};
 use crate::agents::tool_execution::ToolCallContext;
+use crate::config::Config;
 use crate::session_context::{SESSION_ID_HEADER, TOOL_CALL_REQUEST_ID_HEADER, WORKING_DIR_HEADER};
 #[expect(deprecated)]
 use rmcp::model::{
@@ -486,12 +489,44 @@ impl std::fmt::Debug for GooseMcpClientCapabilities {
 #[derive(Clone)]
 pub(crate) struct ConnectContext {
     pub timeout: Duration,
+    pub startup_timeout: Option<Duration>,
     pub client_name: String,
     pub capabilities: GooseMcpClientCapabilities,
     pub working_dir: PathBuf,
     pub docker_container: Option<String>,
     pub action_required: Arc<ActionRequiredManager>,
     pub tools_version: Arc<AtomicU64>,
+}
+
+pub(crate) fn resolve_startup_timeout_from_config(
+    override_timeout: Option<Duration>,
+    config_timeout: Option<u64>,
+) -> Duration {
+    override_timeout
+        .filter(|d| !d.is_zero())
+        .or_else(|| {
+            config_timeout
+                .filter(|seconds| *seconds > 0)
+                .map(Duration::from_secs)
+        })
+        .unwrap_or_else(|| Duration::from_secs(crate::config::DEFAULT_EXTENSION_STARTUP_TIMEOUT))
+}
+
+pub(crate) fn resolve_startup_timeout(override_timeout: Option<Duration>) -> Duration {
+    resolve_startup_timeout_from_config(
+        override_timeout,
+        Config::global().get_goose_extension_startup_timeout().ok(),
+    )
+}
+
+fn format_startup_timeout(d: Duration) -> String {
+    if d.subsec_millis() == 0 {
+        format!("{}s", d.as_secs())
+    } else if d.as_secs() == 0 {
+        format!("{}ms", d.as_millis())
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
+    }
 }
 
 /// The MCP client is the interface for MCP operations.
@@ -514,6 +549,7 @@ impl McpClient {
     {
         let ConnectContext {
             timeout,
+            startup_timeout,
             client_name,
             capabilities,
             working_dir,
@@ -521,6 +557,7 @@ impl McpClient {
             action_required,
             tools_version,
         } = ctx;
+        let startup_timeout = resolve_startup_timeout(startup_timeout);
         let notification_subscribers =
             Arc::new(Mutex::new(Vec::<mpsc::Sender<ServerNotification>>::new()));
 
@@ -532,19 +569,33 @@ impl McpClient {
             action_required,
             tools_version,
         );
-        let client: rmcp::service::RunningService<rmcp::RoleClient, GooseClient> =
-            if let Some(protocol_version) = capabilities.protocol_version {
-                let lifecycle = if protocol_version >= ProtocolVersion::STANDARD_HEADERS {
-                    ClientLifecycleMode::Discover {
-                        preferred_versions: vec![protocol_version],
-                    }
-                } else {
-                    ClientLifecycleMode::Initialize
-                };
-                client.serve_with_lifecycle(transport, lifecycle).await?
+        let client: rmcp::service::RunningService<rmcp::RoleClient, GooseClient> = if let Some(
+            protocol_version,
+        ) =
+            capabilities.protocol_version
+        {
+            let lifecycle = if protocol_version >= ProtocolVersion::STANDARD_HEADERS {
+                ClientLifecycleMode::Discover {
+                    preferred_versions: vec![protocol_version],
+                }
             } else {
-                client
-                    .serve_with_lifecycle(
+                ClientLifecycleMode::Initialize
+            };
+            tokio::time::timeout(
+                    startup_timeout,
+                    client.serve_with_lifecycle(transport, lifecycle),
+                )
+                .await
+                .map_err(|_| {
+                    Box::new(ClientInitializeError::ConnectionClosed(format!(
+                        "MCP server did not finish initializing within {} (GOOSE_EXTENSION_STARTUP_TIMEOUT)",
+                        format_startup_timeout(startup_timeout)
+                    )))
+                })??
+        } else {
+            tokio::time::timeout(
+                    startup_timeout,
+                    client.serve_with_lifecycle(
                         transport,
                         ClientLifecycleMode::Auto {
                             preferred_versions: vec![
@@ -553,9 +604,16 @@ impl McpClient {
                             ],
                             legacy_version: Some(ProtocolVersion::V_2025_11_25),
                         },
-                    )
-                    .await?
-            };
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    Box::new(ClientInitializeError::ConnectionClosed(format!(
+                        "MCP server did not finish initializing within {} (GOOSE_EXTENSION_STARTUP_TIMEOUT)",
+                        format_startup_timeout(startup_timeout)
+                    )))
+                })??
+        };
         let server_info = client.peer_info().map(|info| {
             let mut initialize_result = InitializeResult::new(info.capabilities.clone())
                 .with_protocol_version(info.protocol_version.clone());
@@ -1367,5 +1425,176 @@ mod tests {
             received,
             ServerNotification::ProgressNotification(_)
         ));
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: i32) -> bool {
+        let res = unsafe { libc::kill(pid, 0) };
+        if res != 0 {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if let Some((_, after_name)) = stat.rsplit_once(") ") {
+                    if let Some(state) = after_name.chars().next() {
+                        return state != 'Z' && state != 'X';
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    async fn assert_startup_timeout_kills_child(protocol_version: Option<ProtocolVersion>) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp_dir.path().join("pid");
+
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!("echo $$ > \"{}\" && exec sleep 600", pid_path.display()),
+        ]);
+
+        let (transport, _stderr) = crate::subprocess::spawn_long_lived_mcp_subprocess(command)
+            .await
+            .expect("spawn long lived mcp subprocess");
+
+        let ctx = ConnectContext {
+            timeout: Duration::from_secs(30),
+            startup_timeout: Some(Duration::from_millis(500)),
+            client_name: "test".to_string(),
+            capabilities: GooseMcpClientCapabilities {
+                protocol_version,
+                ..Default::default()
+            },
+            working_dir: temp_dir.path().to_path_buf(),
+            docker_container: None,
+            action_required: Arc::new(ActionRequiredManager::new()),
+            tools_version: Arc::new(AtomicU64::new(0)),
+        };
+
+        // Give the shell a moment to write its pid file
+        let mut pid = None;
+        for _ in 0..50 {
+            if let Ok(content) = std::fs::read_to_string(&pid_path) {
+                if let Ok(parsed) = content.trim().parse::<i32>() {
+                    pid = Some(parsed);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("child process should have written its pid");
+        assert!(
+            process_is_alive(pid),
+            "child process {pid} should initially be alive"
+        );
+
+        let start = std::time::Instant::now();
+        let connect_res =
+            tokio::time::timeout(Duration::from_secs(3), McpClient::connect(transport, ctx))
+                .await
+                .expect("McpClient::connect should have timed out within 500ms, not hung");
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "connect took too long: {:?}",
+            elapsed
+        );
+
+        let err = match connect_res {
+            Ok(_) => panic!("connect should fail due to startup timeout, but succeeded"),
+            Err(e) => e,
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("MCP server did not finish initializing within"),
+            "error message should mention initialization timeout, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("GOOSE_EXTENSION_STARTUP_TIMEOUT"),
+            "error message should mention GOOSE_EXTENSION_STARTUP_TIMEOUT, got: {err_msg}"
+        );
+
+        // Verify that the child process is killed after timeout drops the transport
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut still_alive = true;
+        while std::time::Instant::now() < deadline {
+            if !process_is_alive(pid) {
+                still_alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !still_alive,
+            "child process {pid} should be terminated after startup timeout"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_mcp_client_startup_timeout_auto_lifecycle() {
+        assert_startup_timeout_kills_child(None).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_mcp_client_startup_timeout_discover_lifecycle() {
+        assert_startup_timeout_kills_child(Some(ProtocolVersion::STANDARD_HEADERS)).await;
+    }
+
+    #[test]
+    fn test_mcp_client_startup_timeout_format() {
+        assert_eq!(format_startup_timeout(Duration::from_secs(25)), "25s");
+        assert_eq!(format_startup_timeout(Duration::from_secs(1)), "1s");
+        assert_eq!(format_startup_timeout(Duration::from_millis(500)), "500ms");
+        assert_eq!(format_startup_timeout(Duration::from_millis(1500)), "1.5s");
+    }
+
+    #[test]
+    fn test_mcp_client_startup_timeout_resolve() {
+        let default_timeout = Duration::from_secs(crate::config::DEFAULT_EXTENSION_STARTUP_TIMEOUT);
+
+        // Explicit non-zero override takes precedence
+        assert_eq!(
+            resolve_startup_timeout_from_config(Some(Duration::from_secs(42)), Some(10)),
+            Duration::from_secs(42)
+        );
+
+        // Zero override falls back to config timeout or default
+        assert_eq!(
+            resolve_startup_timeout_from_config(Some(Duration::ZERO), Some(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            resolve_startup_timeout_from_config(Some(Duration::ZERO), Some(0)),
+            default_timeout
+        );
+        assert_eq!(
+            resolve_startup_timeout_from_config(Some(Duration::ZERO), None),
+            default_timeout
+        );
+
+        // When override is None, positive config timeout is used
+        assert_eq!(
+            resolve_startup_timeout_from_config(None, Some(15)),
+            Duration::from_secs(15)
+        );
+
+        // Zero config timeout (GOOSE_EXTENSION_STARTUP_TIMEOUT=0) falls back to default 25s
+        assert_eq!(
+            resolve_startup_timeout_from_config(None, Some(0)),
+            default_timeout
+        );
+
+        // None config timeout falls back to default 25s
+        assert_eq!(
+            resolve_startup_timeout_from_config(None, None),
+            default_timeout
+        );
     }
 }

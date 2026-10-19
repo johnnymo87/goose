@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: DEFAULT_EXTENSION_STARTUP_TIMEOUT default 25s.
+
 use super::base::Config;
 use crate::agents::extension::PLATFORM_EXTENSIONS;
 use crate::agents::ExtensionConfig;
@@ -8,6 +10,7 @@ use tracing::{info, warn};
 
 pub const DEFAULT_EXTENSION: &str = "developer";
 pub const DEFAULT_EXTENSION_TIMEOUT: u64 = 300;
+pub const DEFAULT_EXTENSION_STARTUP_TIMEOUT: u64 = 25;
 pub const DEFAULT_EXTENSION_DESCRIPTION: &str = "";
 pub const DEFAULT_DISPLAY_NAME: &str = "Developer";
 const EXTENSIONS_CONFIG_KEY: &str = "extensions";

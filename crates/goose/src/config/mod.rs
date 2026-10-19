@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: export DEFAULT_EXTENSION_STARTUP_TIMEOUT.
+
 pub mod base;
 pub mod declarative_providers;
 mod experiments;
@@ -28,6 +30,7 @@ pub use signup_tetrate::configure_tetrate;
 pub use extensions::DEFAULT_DISPLAY_NAME;
 pub use extensions::DEFAULT_EXTENSION;
 pub use extensions::DEFAULT_EXTENSION_DESCRIPTION;
+pub use extensions::DEFAULT_EXTENSION_STARTUP_TIMEOUT;
 pub use extensions::DEFAULT_EXTENSION_TIMEOUT;
 pub use providers::{
     clear_active_provider, get_active_model, get_active_provider, get_provider_entry,

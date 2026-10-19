@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: ProcessExit Display includes source error.
+
 use std::collections::HashMap;
 
 use crate::config;
@@ -17,7 +19,7 @@ pub use crate::agents::platform_extensions::{
 };
 
 #[derive(Error, Debug)]
-#[error("process quit before initialization: stderr = {stderr}")]
+#[error("process quit before initialization: {source}; stderr = {stderr}")]
 pub struct ProcessExit {
     stderr: String,
     #[source]
@@ -1205,5 +1207,24 @@ timeout: 300",
             .map(|(k, v)| (k.to_string(), v.to_string())),
         );
         assert_eq!(substitute_env_vars(input, &env_map), expected);
+    }
+
+    #[test]
+    fn test_mcp_client_startup_timeout_process_exit_display_includes_source() {
+        let source = Box::new(ClientInitializeError::ConnectionClosed(
+            "MCP server did not finish initializing within 25s (GOOSE_EXTENSION_STARTUP_TIMEOUT)"
+                .to_string(),
+        ));
+        let process_exit = ProcessExit::new("child exited", source);
+        let error = ExtensionError::from(process_exit);
+        let msg = error.to_string();
+        assert!(
+            msg.contains("GOOSE_EXTENSION_STARTUP_TIMEOUT"),
+            "ExtensionError::to_string() should contain GOOSE_EXTENSION_STARTUP_TIMEOUT, got: {msg}"
+        );
+        assert!(
+            msg.contains("child exited"),
+            "ExtensionError::to_string() should contain stderr, got: {msg}"
+        );
     }
 }

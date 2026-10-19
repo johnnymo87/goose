@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: test_ctx sets startup_timeout.
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -693,6 +695,7 @@ mod tests {
     fn test_ctx(working_dir: &std::path::Path) -> ConnectContext {
         ConnectContext {
             timeout: Duration::from_secs(5),
+            startup_timeout: None,
             client_name: "goose-test".to_string(),
             capabilities: GooseMcpClientCapabilities {
                 mcpui: false,
