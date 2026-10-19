@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: pass startup_timeout in ConnectContext.
+// Modified by Jonathan Mohrbacher, 2026: pass startup_timeout in ConnectContext; stdio startup timeout test.
 
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
@@ -2044,6 +2044,46 @@ mod tests {
         assert_eq!(
             recover_mangled_tool_name("platform.manage_schedule", tools.iter().copied()).as_deref(),
             Some("platform__manage_schedule")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_mcp_client_startup_timeout_stdio_spawn_error_contains_timeout_message() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp_dir.path().join("pid");
+
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!("echo $$ > \"{}\" && exec sleep 600", pid_path.display()),
+        ]);
+
+        let ctx = ConnectContext {
+            timeout: Duration::from_secs(30),
+            startup_timeout: Some(Duration::from_millis(500)),
+            client_name: "test".to_string(),
+            capabilities: GooseMcpClientCapabilities::default(),
+            working_dir: temp_dir.path().to_path_buf(),
+            docker_container: None,
+            action_required: Arc::new(crate::action_required_manager::ActionRequiredManager::new()),
+            tools_version: Arc::new(AtomicU64::new(0)),
+        };
+
+        let result = stdio::spawn(command, ctx).await;
+        let err = match result {
+            Ok(_) => panic!("stdio::spawn should fail due to startup timeout"),
+            Err(e) => e,
+        };
+
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("GOOSE_EXTENSION_STARTUP_TIMEOUT"),
+            "stdio::spawn ExtensionError string must contain GOOSE_EXTENSION_STARTUP_TIMEOUT, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("process quit before initialization"),
+            "stdio::spawn ExtensionError string must contain process quit prefix, got: {err_msg}"
         );
     }
 }
