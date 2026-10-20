@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_SUBAGENT_ROLES_DIR is scanned first so local sources cannot shadow a role.
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::final_output_tool::FinalOutputTool;
 use crate::agents::mcp_client::{Error, McpClientTrait};
@@ -374,6 +375,10 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
     let home = dirs::home_dir();
     let config = Paths::config_dir();
 
+    if let Some(dir) = subagent_roles_dir() {
+        scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
+    }
+
     let local_recipe_dirs: Vec<PathBuf> = vec![
         working_dir.join(".goose/recipes"),
         working_dir.join(".agents/recipes"),
@@ -512,6 +517,17 @@ fn current_epoch_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Directory of operator-managed role recipes (fork patch). Scanned before every
+/// other source so a repo's `.claude/agents/<name>.md` or `.goose/recipes/<name>.yaml`
+/// cannot shadow a role. Unset/empty = upstream behaviour.
+fn subagent_roles_dir() -> Option<PathBuf> {
+    Config::global()
+        .get_param::<String>("GOOSE_SUBAGENT_ROLES_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Get maximum number of concurrent background tasks
@@ -4716,5 +4732,59 @@ You review code."#;
             .await
             .unwrap();
         assert!(extract_text(&result.content[0]).contains("final output"));
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_policy_roles_dir_wins_over_local_sources() {
+        let roles = TempDir::new().unwrap();
+        let wd = TempDir::new().unwrap();
+        fs::write(
+            roles.path().join("code-reviewer.yaml"),
+            "version: 1.0.0\ntitle: Role\ndescription: global role\ninstructions: role body\n",
+        )
+        .unwrap();
+        fs::create_dir_all(wd.path().join(".claude/agents")).unwrap();
+        fs::write(
+            wd.path().join(".claude/agents/cr.md"),
+            "---\nname: code-reviewer\ndescription: local impostor\n---\nimpostor",
+        )
+        .unwrap();
+        fs::create_dir_all(wd.path().join(".goose/recipes")).unwrap();
+        fs::write(
+            wd.path().join(".goose/recipes/code-reviewer.yaml"),
+            "version: 1.0.0\ntitle: X\ndescription: local recipe impostor\ninstructions: x\n",
+        )
+        .unwrap();
+        let roles_dir: &'static str =
+            Box::leak(roles.path().to_str().unwrap().to_string().into_boxed_str());
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_ROLES_DIR", Some(roles_dir))]);
+
+        let sources = discover_filesystem_sources(wd.path());
+        let hits: Vec<_> = sources
+            .iter()
+            .filter(|s| s.name == "code-reviewer")
+            .collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].description, "global role");
+        assert!(hits[0]
+            .path
+            .starts_with(roles.path().canonicalize().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_policy_roles_dir_unset_keeps_upstream_order() {
+        let wd = TempDir::new().unwrap();
+        fs::create_dir_all(wd.path().join(".claude/agents")).unwrap();
+        fs::write(
+            wd.path().join(".claude/agents/cr.md"),
+            "---\nname: code-reviewer\ndescription: local agent\n---\nbody",
+        )
+        .unwrap();
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_ROLES_DIR", None::<&str>)]);
+        let sources = discover_filesystem_sources(wd.path());
+        let hit = sources.iter().find(|s| s.name == "code-reviewer").unwrap();
+        assert_eq!(hit.description, "local agent");
     }
 }
