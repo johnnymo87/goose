@@ -549,7 +549,12 @@ pub(crate) fn subagent_default_recipe_path() -> Option<String> {
         .map(|s| shellexpand::tilde(&s).into_owned())
 }
 
-fn unscoped_subagent_extensions() -> anyhow::Result<Option<Vec<ExtensionConfig>>> {
+struct UnscopedSubagentDefaults {
+    extensions: Vec<ExtensionConfig>,
+    instructions: Option<String>,
+}
+
+fn unscoped_subagent_defaults() -> anyhow::Result<Option<UnscopedSubagentDefaults>> {
     let Some(path) = subagent_default_recipe_path() else {
         return Ok(None);
     };
@@ -561,10 +566,11 @@ fn unscoped_subagent_extensions() -> anyhow::Result<Option<Vec<ExtensionConfig>>
     let declared = recipe.extensions.ok_or_else(|| {
         anyhow::anyhow!("GOOSE_SUBAGENT_DEFAULT_RECIPE: {path} declares no extensions")
     })?;
-    Ok(Some(resolve_extensions_for_new_session(
-        Some(&declared),
-        None,
-    )))
+    let extensions = resolve_extensions_for_new_session(Some(&declared), None);
+    Ok(Some(UnscopedSubagentDefaults {
+        extensions,
+        instructions: recipe.instructions,
+    }))
 }
 
 /// Get maximum number of concurrent background tasks
@@ -1407,12 +1413,12 @@ impl SummonClient {
             return Ok(CallToolResult::success(content).with_meta(Some(meta)));
         }
 
-        let recipe = self
+        let mut recipe = self
             .build_delegate_recipe(&params, session_id, working_dir)
             .await?;
 
         let task_config = self
-            .build_task_config(&params, &recipe, &session)
+            .build_task_config(&params, &mut recipe, &session)
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
@@ -1483,7 +1489,7 @@ impl SummonClient {
             .build_delegate_recipe(&params, &parent.id, &parent.working_dir)
             .await?;
         let task_config = self
-            .build_task_config(&params, &recipe, parent)
+            .build_task_config(&params, &mut recipe, parent)
             .await
             .map_err(|e| format!("Failed to build task config: {e}"))?;
         crate::providers::get_from_registry(task_config.provider.get_name())
@@ -1776,15 +1782,28 @@ impl SummonClient {
     async fn build_task_config(
         &self,
         params: &DelegateParams,
-        recipe: &Recipe,
+        recipe: &mut Recipe,
         session: &crate::session::Session,
     ) -> Result<TaskConfig, anyhow::Error> {
         let mut extensions = match recipe.extensions.as_deref() {
             // Port of upstream #12938 (delegation half): a delegated recipe's
             // declared extensions replace the parent's.
             Some(declared) => resolve_extensions_for_new_session(Some(declared), None),
-            None => match unscoped_subagent_extensions()? {
-                Some(defaults) => defaults,
+            None => match unscoped_subagent_defaults()? {
+                Some(defaults) => {
+                    if let Some(default_instructions) = defaults.instructions {
+                        if !default_instructions.is_empty() {
+                            let combined = match &recipe.instructions {
+                                Some(existing) if !existing.is_empty() => {
+                                    format!("{default_instructions}\n\n{existing}")
+                                }
+                                _ => default_instructions,
+                            };
+                            recipe.instructions = Some(combined);
+                        }
+                    }
+                    defaults.extensions
+                }
                 None => EnabledExtensionsState::extensions_or_default(
                     Some(&session.extension_data),
                     Config::global(),
@@ -2166,12 +2185,12 @@ impl SummonClient {
         }
 
         let working_dir = session.working_dir.clone();
-        let recipe = self
+        let mut recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
 
         let task_config = self
-            .build_task_config(&params, &recipe, &session)
+            .build_task_config(&params, &mut recipe, &session)
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
@@ -3409,7 +3428,7 @@ You review code."#;
         };
 
         let task_config = client
-            .build_task_config(&params, &empty_recipe(), &session)
+            .build_task_config(&params, &mut empty_recipe(), &session)
             .await
             .unwrap();
 
@@ -4912,7 +4931,7 @@ You review code."#;
             ..Default::default()
         };
         Ok(client
-            .build_task_config(&params, &recipe, &session)
+            .build_task_config(&params, &mut recipe, &session)
             .await?
             .extensions)
     }
@@ -5045,5 +5064,63 @@ You review code."#;
 
         let got = subagent_policy_resolve(None, None).await.unwrap();
         assert_eq!(got, vec![subagent_policy_platform("developer", &["tree"])]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_unscoped_delegate_gets_default_recipe_instructions() {
+        let d = TempDir::new().unwrap();
+        let p = subagent_policy_write_default(
+            &d,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: READ-ONLY DELEGATE\nextensions:\n  - type: platform\n    name: developer\n",
+        );
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+
+        let parent_provider = providers::create("openai", Vec::new()).await.unwrap();
+        let mut context = create_test_context();
+        context.provider = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&parent_provider))));
+        let client = SummonClient::new(context).unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let session = crate::session::Session {
+            provider_name: Some(parent_provider.get_name().to_string()),
+            model_config: Some(goose_providers::model::ModelConfig::new("test-model")),
+            working_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let params = DelegateParams {
+            provider: Some(parent_provider.get_name().to_string()),
+            model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+
+        // 1. Ad-hoc delegate (declares no extensions): effective instructions contain default instructions
+        let mut adhoc_recipe = empty_recipe();
+        client
+            .build_task_config(&params, &mut adhoc_recipe, &session)
+            .await
+            .unwrap();
+        assert!(
+            adhoc_recipe
+                .instructions
+                .as_deref()
+                .unwrap_or_default()
+                .contains("READ-ONLY DELEGATE"),
+            "ad-hoc delegate instructions should contain default recipe instructions"
+        );
+
+        // 2. Declared-extensions recipe: instructions do NOT contain default instructions
+        let mut declared_recipe = empty_recipe();
+        declared_recipe.extensions = Some(vec![subagent_policy_platform("developer", &[])]);
+        declared_recipe.instructions = Some("CUSTOM INSTRUCTIONS".to_string());
+
+        client
+            .build_task_config(&params, &mut declared_recipe, &session)
+            .await
+            .unwrap();
+        assert_eq!(
+            declared_recipe.instructions.as_deref(),
+            Some("CUSTOM INSTRUCTIONS"),
+            "declared-extensions recipe instructions should not be modified by default recipe"
+        );
     }
 }
