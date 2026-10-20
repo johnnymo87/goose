@@ -262,6 +262,7 @@ fn scan_recipes_from_dir(
     dir: &Path,
     kind: SourceType,
     suppress_config_warnings: bool,
+    mark_seen_on_error: bool,
     sources: &mut Vec<SourceEntry>,
     seen: &mut std::collections::HashSet<String>,
 ) {
@@ -295,6 +296,9 @@ fn scan_recipes_from_dir(
         let content = match crate::skills::read_source_file(&source_dir, Path::new(&file_name)) {
             Ok(content) => content,
             Err(error) => {
+                if mark_seen_on_error {
+                    seen.insert(name);
+                }
                 warn!("Failed to read recipe {}: {}", path.display(), error);
                 continue;
             }
@@ -316,6 +320,9 @@ fn scan_recipes_from_dir(
                 });
             }
             Err(e) => {
+                if mark_seen_on_error {
+                    seen.insert(name);
+                }
                 // The working directory commonly contains project config like package.json
                 // and tsconfig.json, which parse as valid JSON but lack Recipe fields. In that
                 // case treat them as "not a recipe" rather than warning. Dedicated recipe
@@ -377,7 +384,14 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
 
     if let Some(dir) = subagent_roles_dir() {
         if dir.is_dir() {
-            scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
+            scan_recipes_from_dir(
+                &dir,
+                SourceType::Recipe,
+                false,
+                true,
+                &mut sources,
+                &mut seen,
+            );
         } else {
             tracing::warn!(
                 "GOOSE_SUBAGENT_ROLES_DIR: path '{}' is not a directory",
@@ -429,12 +443,20 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
         working_dir,
         SourceType::Recipe,
         true,
+        false,
         &mut sources,
         &mut seen,
     );
 
     for dir in local_recipe_dirs {
-        scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
+        scan_recipes_from_dir(
+            &dir,
+            SourceType::Recipe,
+            false,
+            false,
+            &mut sources,
+            &mut seen,
+        );
     }
 
     for dir in local_agent_dirs {
@@ -442,7 +464,14 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
     }
 
     for dir in global_recipe_dirs {
-        scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
+        scan_recipes_from_dir(
+            &dir,
+            SourceType::Recipe,
+            false,
+            false,
+            &mut sources,
+            &mut seen,
+        );
     }
 
     for dir in global_agent_dirs {
@@ -2927,6 +2956,7 @@ You review code."#;
             temp_dir.path(),
             SourceType::Recipe,
             true,
+            false,
             &mut sources,
             &mut seen,
         );
@@ -2957,6 +2987,7 @@ You review code."#;
         scan_recipes_from_dir(
             temp_dir.path(),
             SourceType::Recipe,
+            false,
             false,
             &mut sources,
             &mut seen,
@@ -5179,5 +5210,38 @@ You review code."#;
                 "set description should inform model where write work goes"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_policy_roles_dir_invalid_recipe_fails_closed_without_shadowing() {
+        let roles = TempDir::new().unwrap();
+        let wd = TempDir::new().unwrap();
+        // Invalid YAML in the roles dir
+        fs::write(
+            roles.path().join("code-reviewer.yaml"),
+            "not: [a, valid: recipe",
+        )
+        .unwrap();
+
+        // Local impostor in .claude/agents
+        fs::create_dir_all(wd.path().join(".claude/agents")).unwrap();
+        fs::write(
+            wd.path().join(".claude/agents/cr.md"),
+            "---\nname: code-reviewer\ndescription: local impostor\n---\nimpostor",
+        )
+        .unwrap();
+
+        let roles_dir: &'static str =
+            Box::leak(roles.path().to_str().unwrap().to_string().into_boxed_str());
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_ROLES_DIR", Some(roles_dir))]);
+
+        let sources = discover_filesystem_sources(wd.path());
+        let hit = sources.iter().find(|s| s.name == "code-reviewer");
+        assert!(
+            hit.is_none(),
+            "invalid role in roles dir must fail closed and block local impostor, but found: {:?}",
+            hit
+        );
     }
 }
