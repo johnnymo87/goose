@@ -2501,6 +2501,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn foreground_delegate_persists_child_and_scheduling_marker() {
         let temp_dir = TempDir::new().unwrap();
         let child_dir = temp_dir.path().join("child");
@@ -3386,6 +3387,7 @@ You review code."#;
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_build_task_config_recreates_registered_parent_provider() {
         let temp_dir = TempDir::new().unwrap();
         let parent_provider = providers::create("openai", Vec::new()).await.unwrap();

@@ -1,9 +1,10 @@
+// Modified by Jonathan Mohrbacher, 2026: with GOOSE_SUBAGENT_DEFAULT_RECIPE set, a subagent extension that fails to start fails the delegate.
 use crate::{
     agents::{
         final_output_tool::FinalOutputTool,
         state_machine::{trailing_error, MAX_TURNS_MESSAGE},
         subagent_task_config::TaskConfig,
-        Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig,
+        Agent, AgentConfig, AgentEvent, ExtensionConfig, GoosePlatform, SessionConfig,
     },
     config::permission::PermissionManager,
     conversation::{
@@ -124,12 +125,9 @@ pub(crate) async fn from_foreground_subagent_session(
     config.is_subagent = true;
     let agent = Agent::with_config(config);
     *agent.provider.lock().await = Some(provider);
-    for extension in extensions {
-        let name = extension.name();
-        if let Err(e) = agent.add_extension_inner(extension, session_id).await {
-            debug!("Failed to add extension '{}' to subagent: {}", name, e);
-        }
-    }
+    let strict =
+        crate::agents::platform_extensions::summon::subagent_default_recipe_path().is_some();
+    add_subagent_extensions(&agent, extensions, session_id, strict).await?;
 
     let subagent_prompt = build_subagent_prompt(
         &agent,
@@ -146,6 +144,29 @@ pub(crate) async fn from_foreground_subagent_session(
         retry_config: recipe.retry.clone(),
     };
     Ok((agent, session_config))
+}
+
+/// Fork patch: with GOOSE_SUBAGENT_DEFAULT_RECIPE set (the subagent policy), an
+/// extension the subagent was given but could not start is an error -- a reviewer
+/// whose ro-shell failed must not run on with no shell and report anyway.
+async fn add_subagent_extensions(
+    agent: &Agent,
+    extensions: Vec<ExtensionConfig>,
+    session_id: &str,
+    strict: bool,
+) -> Result<()> {
+    for extension in extensions {
+        let name = extension.name();
+        if let Err(e) = agent.add_extension_inner(extension, session_id).await {
+            if strict {
+                return Err(anyhow!(
+                    "Failed to start extension '{name}' for subagent: {e}"
+                ));
+            }
+            debug!("Failed to add extension '{}' to subagent: {}", name, e);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) enum SubagentOutcome {
@@ -361,13 +382,17 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to set provider on sub agent: {}", e))?;
 
+        let strict =
+            crate::agents::platform_extensions::summon::subagent_default_recipe_path().is_some();
         for extension in &task_config.extensions {
+            let name = extension.name();
             if let Err(e) = agent.add_extension(extension.clone(), &session_id).await {
-                debug!(
-                    "Failed to add extension '{}' to subagent: {}",
-                    extension.name(),
-                    e
-                );
+                if strict {
+                    return Err(anyhow!(
+                        "Failed to start extension '{name}' for subagent: {e}"
+                    ));
+                }
+                debug!("Failed to add extension '{}' to subagent: {}", name, e);
             }
         }
 
@@ -530,6 +555,7 @@ pub fn create_tool_notification(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::{create_tool_notification, failure_reason, SUBAGENT_TOOL_REQUEST_TYPE};
     use crate::agents::state_machine::MAX_TURNS_MESSAGE;
     use crate::conversation::message::{Message, MessageContent};
@@ -606,5 +632,39 @@ mod tests {
         for (messages, expected) in cases {
             assert_eq!(failure_reason(&messages), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn subagent_policy_strict_extension_failure_is_an_error() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+        let agent = Agent::with_config(AgentConfig::new(
+            session_manager,
+            PermissionManager::instance(),
+            None,
+            crate::config::GooseMode::default(),
+            true,
+            GoosePlatform::GooseCli,
+        ));
+        let bad = crate::config::ExtensionConfig::Stdio {
+            name: "ro-shell".into(),
+            description: String::new(),
+            cmd: "/nonexistent/ro-shell".into(),
+            args: vec![],
+            envs: Default::default(),
+            env_keys: vec![],
+            timeout: Some(5),
+            cwd: None,
+            bundled: None,
+            available_tools: vec![],
+        };
+        assert!(
+            add_subagent_extensions(&agent, vec![bad.clone()], "s1", true)
+                .await
+                .is_err()
+        );
+        assert!(add_subagent_extensions(&agent, vec![bad], "s1", false)
+            .await
+            .is_ok());
     }
 }
