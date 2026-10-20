@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: self-compaction failures are reported as turn errors.
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
@@ -825,6 +826,11 @@ async fn test_failed_compaction_allows_retry_when_steer_continues_run_self_compa
             .any(|m| m.as_concat_text() == "done after retry"),
         "Final text after retry must be in DB"
     );
+    assert_eq!(
+        ctx.agent.take_turn_error(&ctx.session.id).await,
+        None,
+        "a failed compaction the steer recovered from is not a turn error"
+    );
 
     Ok(())
 }
@@ -1017,6 +1023,13 @@ async fn test_summary_provider_error_self_compact() -> Result<()> {
         .iter()
         .any(|m| m.as_concat_text().contains("mock summary")));
 
+    let turn_error = ctx.agent.take_turn_error(&ctx.session.id).await;
+    assert_eq!(
+        turn_error.as_ref().map(|e| e.kind),
+        Some(goose::agents::turn_error::TurnErrorKind::SelfCompact)
+    );
+    assert!(turn_error.unwrap().message.contains("provider broke"));
+
     Ok(())
 }
 
@@ -1081,6 +1094,11 @@ async fn test_cancel_during_summary_self_compact() -> Result<()> {
         .messages()
         .iter()
         .any(|m| m.as_concat_text() == "Cancel prompt R"));
+    assert_eq!(
+        ctx.agent.take_turn_error(&ctx.session.id).await,
+        None,
+        "a cancelled self-compaction is not a turn error"
+    );
 
     Ok(())
 }

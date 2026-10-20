@@ -764,15 +764,26 @@ fn build_prompt_usage(session: &Session) -> Option<Usage> {
     Some(Usage::new(total, input, output))
 }
 
-/// `_meta.goose.turnError` for a turn that ended in failure. A cancelled turn
-/// was stopped by the user, so whatever failed on the way out is not reported.
-fn turn_error_meta(was_cancelled: bool, turn_error: Option<TurnError>) -> Option<Meta> {
-    let turn_error = turn_error.filter(|_| !was_cancelled)?;
-    let mut goose = serde_json::Map::new();
-    goose.insert("turnError".to_string(), turn_error.to_meta_value());
-    let mut meta = Meta::new();
-    meta.insert("goose".to_string(), serde_json::Value::Object(goose));
-    Some(meta)
+/// Adds `_meta.goose.turnError` for a turn that ended in failure, keeping
+/// any other `_meta`. A cancelled turn was stopped by the user, so whatever
+/// failed on the way out is not reported.
+fn with_turn_error(
+    mut response: PromptResponse,
+    was_cancelled: bool,
+    turn_error: Option<TurnError>,
+) -> PromptResponse {
+    let Some(turn_error) = turn_error.filter(|_| !was_cancelled) else {
+        return response;
+    };
+    let goose = response
+        .meta
+        .get_or_insert_with(Meta::new)
+        .entry("goose")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(goose) = goose.as_object_mut() {
+        goose.insert("turnError".to_string(), turn_error.to_meta_value());
+    }
+    response
 }
 
 fn prompt_stop_reason(was_cancelled: bool, output_token_limit_reached: bool) -> StopReason {
@@ -2413,10 +2424,7 @@ impl GooseAcpAgent {
         if let Some(usage) = build_prompt_usage(&session) {
             response = response.usage(usage);
         }
-        if let Some(meta) = turn_error_meta(outcome.was_cancelled, turn_error) {
-            response = response.meta(meta);
-        }
-        Ok(response)
+        Ok(with_turn_error(response, outcome.was_cancelled, turn_error))
     }
 
     async fn on_steer_session(
@@ -3633,14 +3641,30 @@ print(\"hello, world\")
         use crate::agents::turn_error::{TurnError, TurnErrorKind};
 
         let error = || Some(TurnError::new(TurnErrorKind::Network, "connection reset"));
+        let meta = |response: PromptResponse| response.meta.map(serde_json::Value::Object);
+        let response = || PromptResponse::new(StopReason::EndTurn);
         assert_eq!(
-            turn_error_meta(false, error()).map(serde_json::Value::Object),
+            meta(with_turn_error(response(), false, error())),
             Some(serde_json::json!({
                 "goose": { "turnError": { "kind": "network", "message": "connection reset" } }
             }))
         );
-        assert_eq!(turn_error_meta(true, error()), None);
-        assert_eq!(turn_error_meta(false, None), None);
+        assert_eq!(meta(with_turn_error(response(), true, error())), None);
+        assert_eq!(meta(with_turn_error(response(), false, None)), None);
+
+        let mut existing = Meta::new();
+        existing.insert("other".into(), serde_json::json!(1));
+        existing.insert("goose".into(), serde_json::json!({ "kept": true }));
+        assert_eq!(
+            meta(with_turn_error(response().meta(existing), false, error())),
+            Some(serde_json::json!({
+                "other": 1,
+                "goose": {
+                    "kept": true,
+                    "turnError": { "kind": "network", "message": "connection reset" }
+                }
+            }))
+        );
     }
 
     #[test]

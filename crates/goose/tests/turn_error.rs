@@ -415,14 +415,13 @@ async fn turn_error_cleared_when_a_steer_recovers_the_turn() -> Result<()> {
 }
 
 #[tokio::test]
-async fn turn_error_from_an_earlier_turn_is_reset_by_the_next_turn() -> Result<()> {
+async fn turn_error_cleared_when_a_goal_nudge_recovers_the_turn() -> Result<()> {
     let harness = Harness::new(ScriptedProvider::new(vec![
         Step::Fail(ProviderError::NetworkError("connection reset".into())),
-        Step::Text("fine now"),
+        Step::Text("goal met"),
     ]))
     .await?;
-    harness.run("first", harness.config(), false).await?;
-    assert_eq!(harness.turn("second").await?, None);
+    assert_eq!(harness.turn("/goal finish the task").await?, None);
     Ok(())
 }
 

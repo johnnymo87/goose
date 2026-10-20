@@ -42,11 +42,11 @@ impl TurnError {
     }
 
     pub fn to_meta_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+        serde_json::json!({ "kind": self.kind, "message": self.message })
     }
 }
 
-fn truncate_message(message: String) -> String {
+fn truncate_message(mut message: String) -> String {
     if message.len() <= TURN_ERROR_MESSAGE_MAX_BYTES {
         return message;
     }
@@ -54,7 +54,9 @@ fn truncate_message(message: String) -> String {
     while !message.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{TRUNCATION_MARKER}", &message[..end])
+    message.truncate(end);
+    message.push_str(TRUNCATION_MARKER);
+    message
 }
 
 /// The state machine ends a failed turn on a trailing error message; recipe
