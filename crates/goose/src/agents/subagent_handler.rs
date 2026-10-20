@@ -638,6 +638,15 @@ mod tests {
     async fn subagent_policy_strict_extension_failure_is_an_error() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+        let session = session_manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "test-session".to_string(),
+                SessionType::SubAgent,
+                crate::config::GooseMode::Auto,
+            )
+            .await
+            .unwrap();
         let agent = Agent::with_config(AgentConfig::new(
             session_manager,
             PermissionManager::instance(),
@@ -646,6 +655,19 @@ mod tests {
             true,
             GoosePlatform::GooseCli,
         ));
+        let good = crate::config::ExtensionConfig::Platform {
+            name: "developer".into(),
+            description: String::new(),
+            display_name: None,
+            bundled: None,
+            available_tools: vec![],
+        };
+        assert!(
+            add_subagent_extensions(&agent, vec![good], &session.id, true)
+                .await
+                .is_ok(),
+            "valid extension should succeed in strict mode"
+        );
         let bad = crate::config::ExtensionConfig::Stdio {
             name: "ro-shell".into(),
             description: String::new(),
@@ -659,12 +681,14 @@ mod tests {
             available_tools: vec![],
         };
         assert!(
-            add_subagent_extensions(&agent, vec![bad.clone()], "s1", true)
+            add_subagent_extensions(&agent, vec![bad.clone()], &session.id, true)
                 .await
                 .is_err()
         );
-        assert!(add_subagent_extensions(&agent, vec![bad], "s1", false)
-            .await
-            .is_ok());
+        assert!(
+            add_subagent_extensions(&agent, vec![bad], &session.id, false)
+                .await
+                .is_ok()
+        );
     }
 }

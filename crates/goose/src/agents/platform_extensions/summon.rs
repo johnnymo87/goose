@@ -546,6 +546,7 @@ pub(crate) fn subagent_default_recipe_path() -> Option<String> {
         .get_param::<String>("GOOSE_SUBAGENT_DEFAULT_RECIPE")
         .ok()
         .filter(|s| !s.is_empty())
+        .map(|s| shellexpand::tilde(&s).into_owned())
 }
 
 fn unscoped_subagent_extensions() -> anyhow::Result<Option<Vec<ExtensionConfig>>> {
@@ -5016,5 +5017,33 @@ You review code."#;
         let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
         let err = subagent_policy_resolve(None, None).await.unwrap_err();
         assert!(err.to_string().contains("declares no extensions"), "{err}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_default_recipe_tilde_expanded() {
+        let fake_home = TempDir::new().unwrap();
+        let unscoped_path = fake_home.path().join("unscoped.yaml");
+        fs::write(
+            &unscoped_path,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: u\nextensions:\n  - type: platform\n    name: developer\n    available_tools: [tree]\n",
+        )
+        .unwrap();
+
+        let home_str: &'static str = Box::leak(
+            fake_home
+                .path()
+                .to_str()
+                .unwrap()
+                .to_string()
+                .into_boxed_str(),
+        );
+        let _env = env_lock::lock_env([
+            ("HOME", Some(home_str)),
+            ("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some("~/unscoped.yaml")),
+        ]);
+
+        let got = subagent_policy_resolve(None, None).await.unwrap();
+        assert_eq!(got, vec![subagent_policy_platform("developer", &["tree"])]);
     }
 }
