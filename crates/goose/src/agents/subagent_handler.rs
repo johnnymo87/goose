@@ -127,7 +127,10 @@ pub(crate) async fn from_foreground_subagent_session(
     *agent.provider.lock().await = Some(provider);
     let strict =
         crate::agents::platform_extensions::summon::subagent_default_recipe_path().is_some();
-    add_subagent_extensions(&agent, extensions, session_id, strict).await?;
+    add_subagent_extensions(extensions, strict, |ext| {
+        agent.add_extension_inner(ext, session_id)
+    })
+    .await?;
 
     let subagent_prompt = build_subagent_prompt(
         &agent,
@@ -149,15 +152,19 @@ pub(crate) async fn from_foreground_subagent_session(
 /// Fork patch: with GOOSE_SUBAGENT_DEFAULT_RECIPE set (the subagent policy), an
 /// extension the subagent was given but could not start is an error -- a reviewer
 /// whose ro-shell failed must not run on with no shell and report anyway.
-async fn add_subagent_extensions(
-    agent: &Agent,
-    extensions: Vec<ExtensionConfig>,
-    session_id: &str,
+async fn add_subagent_extensions<F, Fut, E>(
+    extensions: impl IntoIterator<Item = ExtensionConfig>,
     strict: bool,
-) -> Result<()> {
+    mut add_fn: F,
+) -> Result<()>
+where
+    F: FnMut(ExtensionConfig) -> Fut,
+    Fut: Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
     for extension in extensions {
         let name = extension.name();
-        if let Err(e) = agent.add_extension_inner(extension, session_id).await {
+        if let Err(e) = add_fn(extension).await {
             if strict {
                 return Err(anyhow!(
                     "Failed to start extension '{name}' for subagent: {e}"
@@ -384,17 +391,10 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
 
         let strict =
             crate::agents::platform_extensions::summon::subagent_default_recipe_path().is_some();
-        for extension in &task_config.extensions {
-            let name = extension.name();
-            if let Err(e) = agent.add_extension(extension.clone(), &session_id).await {
-                if strict {
-                    return Err(anyhow!(
-                        "Failed to start extension '{name}' for subagent: {e}"
-                    ));
-                }
-                debug!("Failed to add extension '{}' to subagent: {}", name, e);
-            }
-        }
+        add_subagent_extensions(task_config.extensions.clone(), strict, |ext| {
+            agent.add_extension(ext, &session_id)
+        })
+        .await?;
 
         let has_response_schema = recipe.response.is_some();
         agent
@@ -561,6 +561,7 @@ mod tests {
     use crate::conversation::message::{Message, MessageContent};
     use rmcp::model::{CallToolRequestParams, ServerNotification};
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
     #[expect(deprecated)]
@@ -663,9 +664,10 @@ mod tests {
             available_tools: vec![],
         };
         assert!(
-            add_subagent_extensions(&agent, vec![good], &session.id, true)
-                .await
-                .is_ok(),
+            add_subagent_extensions(vec![good], true, |ext| agent
+                .add_extension_inner(ext, &session.id))
+            .await
+            .is_ok(),
             "valid extension should succeed in strict mode"
         );
         let bad = crate::config::ExtensionConfig::Stdio {
@@ -680,15 +682,109 @@ mod tests {
             bundled: None,
             available_tools: vec![],
         };
+        assert!(add_subagent_extensions(vec![bad.clone()], true, |ext| agent
+            .add_extension_inner(ext, &session.id))
+        .await
+        .is_err());
         assert!(
-            add_subagent_extensions(&agent, vec![bad.clone()], &session.id, true)
-                .await
-                .is_err()
+            add_subagent_extensions(vec![bad.clone()], false, |ext| agent
+                .add_extension_inner(ext, &session.id))
+            .await
+            .is_ok()
         );
-        assert!(
-            add_subagent_extensions(&agent, vec![bad], &session.id, false)
-                .await
-                .is_ok()
-        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_get_agent_messages_strict_extension_failure() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+        let session = session_manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "test-session".to_string(),
+                SessionType::SubAgent,
+                crate::config::GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let parent_provider = crate::providers::create("openai", Vec::new())
+            .await
+            .unwrap();
+        let model_config = goose_providers::model::ModelConfig::new("test-model");
+        let bad = crate::config::ExtensionConfig::Stdio {
+            name: "ro-shell".into(),
+            description: String::new(),
+            cmd: "/nonexistent/ro-shell".into(),
+            args: vec![],
+            envs: Default::default(),
+            env_keys: vec![],
+            timeout: Some(5),
+            cwd: None,
+            bundled: None,
+            available_tools: vec![],
+        };
+        let make_params = || SubagentRunParams {
+            config: AgentConfig::new(
+                session_manager.clone(),
+                PermissionManager::instance(),
+                None,
+                crate::config::GooseMode::Auto,
+                true,
+                GoosePlatform::GooseCli,
+            ),
+            recipe: Recipe::builder()
+                .version("1.0.0")
+                .title("T")
+                .description("T")
+                .instructions("test instructions")
+                .build()
+                .unwrap(),
+            task_config: TaskConfig::new(
+                parent_provider.clone(),
+                model_config.clone(),
+                &session.id,
+                temp_dir.path(),
+                vec![bad.clone()],
+            ),
+            return_last_only: true,
+            session_id: session.id.clone(),
+            cancellation_token: None,
+            on_message: None,
+            notification_tx: None,
+        };
+
+        // 1. With GOOSE_SUBAGENT_DEFAULT_RECIPE set (strict mode): fails mentioning "Failed to start extension"
+        {
+            let d = tempfile::TempDir::new().unwrap();
+            let p = d.path().join("unscoped.yaml");
+            std::fs::write(
+                &p,
+                "version: 1.0.0\ntitle: U\ndescription: U\nextensions:\n  - type: platform\n    name: developer\n",
+            )
+            .unwrap();
+            let p_str: &'static str = Box::leak(p.to_str().unwrap().to_string().into_boxed_str());
+            let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p_str))]);
+
+            let err = get_agent_messages(make_params()).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Failed to start extension 'ro-shell' for subagent"),
+                "strict mode should fail with extension start error, got: {err}"
+            );
+        }
+
+        // 2. Unset: no error from that cause
+        {
+            let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+
+            let res = get_agent_messages(make_params()).await;
+            if let Err(err) = res {
+                assert!(
+                    !err.to_string().contains("Failed to start extension"),
+                    "non-strict mode should not fail with extension start error, got: {err}"
+                );
+            }
+        }
     }
 }
