@@ -805,21 +805,29 @@ impl SummonClient {
             }
         });
 
+        let work_guidance = if subagent_default_recipe_path().is_some() {
+            "Delegates without a source (and agent .md sources that declare no extensions) are read-only.\n\
+             Write work must go to a source whose recipe grants write tools (e.g. an implementer role)."
+        } else {
+            "Work (writes): partition files strictly - no two delegates touch the same file."
+        };
+
         Tool::new(
             "delegate",
-            "Delegate a task to a subagent that runs independently with its own context.\n\n\
-             Modes:\n\
-             1. Ad-hoc: Provide `instructions` for a custom task\n\
-             2. Source-based: Provide `source` name to run a subrecipe, recipe, or agent\n\
-             3. Combined: Pair a source with a task (e.g., source: \"deploy\", instructions: \"deploy to staging\")\n\n\
-             Effective Delegation:\n\
-             - Delegates know only instructions + source content\n\
-             - Delegates cannot coordinate. Same-file work = conflicts.\n\
-             - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
-             Research (read-only): parallelize freely - delegates explore and report back.\n\
-             Work (writes): partition files strictly - no two delegates touch the same file.\n\n\
-             Decompose → async delegates → load(taskId) for each → synthesize."
-                .to_string(),
+            format!(
+                "Delegate a task to a subagent that runs independently with its own context.\n\n\
+                 Modes:\n\
+                 1. Ad-hoc: Provide `instructions` for a custom task\n\
+                 2. Source-based: Provide `source` name to run a subrecipe, recipe, or agent\n\
+                 3. Combined: Pair a source with a task (e.g., source: \"deploy\", instructions: \"deploy to staging\")\n\n\
+                 Effective Delegation:\n\
+                 - Delegates know only instructions + source content\n\
+                 - Delegates cannot coordinate. Same-file work = conflicts.\n\
+                 - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
+                 Research (read-only): parallelize freely - delegates explore and report back.\n\
+                 {work_guidance}\n\n\
+                 Decompose → async delegates → load(taskId) for each → synthesize."
+            ),
             schema.as_object().unwrap().clone(),
         )
     }
@@ -5122,5 +5130,54 @@ You review code."#;
             Some("CUSTOM INSTRUCTIONS"),
             "declared-extensions recipe instructions should not be modified by default recipe"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_delegate_tool_description_reflects_default_recipe() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        // 1. Unset: upstream text
+        {
+            let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+            let tool = client.create_delegate_tool();
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains("Work (writes): partition files strictly"),
+                "unset description should match upstream"
+            );
+            assert!(
+                !desc.contains("are read-only"),
+                "unset description should not mention read-only defaults"
+            );
+        }
+
+        // 2. Set: notes that delegates without a source are read-only
+        {
+            let d = TempDir::new().unwrap();
+            let p = subagent_policy_write_default(
+                &d,
+                "version: 1.0.0\ntitle: U\ndescription: U\nextensions:\n  - type: platform\n    name: developer\n",
+            );
+            let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+            let tool = client.create_delegate_tool();
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                !desc.contains("Work (writes): partition files strictly"),
+                "set description should replace the upstream write guidance"
+            );
+            assert!(
+                desc.contains(
+                    "Delegates without a source (and agent .md sources that declare no extensions) are read-only"
+                ),
+                "set description should inform model that unscoped delegates are read-only"
+            );
+            assert!(
+                desc.contains(
+                    "Write work must go to a source whose recipe grants write tools (e.g. an implementer role)"
+                ),
+                "set description should inform model where write work goes"
+            );
+        }
     }
 }
