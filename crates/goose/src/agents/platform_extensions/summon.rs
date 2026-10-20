@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: GOOSE_SUBAGENT_ROLES_DIR is scanned first so local sources cannot shadow a role.
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_SUBAGENT_ROLES_DIR is scanned first so local sources cannot shadow a role; recipe declared extensions replace parent (port of #12938).
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::final_output_tool::FinalOutputTool;
 use crate::agents::mcp_client::{Error, McpClientTrait};
@@ -7,7 +7,7 @@ use crate::agents::subagent_task_config::{TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS
 use crate::agents::tool_execution::{ToolCallContext, ToolCallNotificationEmitter};
 use crate::agents::AgentConfig;
 use crate::config::paths::Paths;
-use crate::config::{Config, GooseMode};
+use crate::config::{resolve_extensions_for_new_session, Config, GooseMode};
 use crate::conversation::message::Message;
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
@@ -727,7 +727,7 @@ impl SummonClient {
                 "extensions": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Extensions to enable. Omit to inherit all, empty array for none."
+                    "description": "Restrict extensions by name. Omit to use the source recipe's declared extensions, or inherit the parent's if none are declared. Empty array for none."
                 },
                 "provider": {
                     "type": "string",
@@ -1742,10 +1742,15 @@ impl SummonClient {
         recipe: &Recipe,
         session: &crate::session::Session,
     ) -> Result<TaskConfig, anyhow::Error> {
-        let mut extensions = EnabledExtensionsState::extensions_or_default(
-            Some(&session.extension_data),
-            Config::global(),
-        );
+        let mut extensions = match recipe.extensions.as_deref() {
+            // Port of upstream #12938 (delegation half): a delegated recipe's
+            // declared extensions replace the parent's.
+            Some(declared) => resolve_extensions_for_new_session(Some(declared), None),
+            None => EnabledExtensionsState::extensions_or_default(
+                Some(&session.extension_data),
+                Config::global(),
+            ),
+        };
 
         if let Some(filter) = &params.extensions {
             if filter.is_empty() {
@@ -2406,6 +2411,7 @@ fn resolve_working_dir(parent_dir: &Path, requested: &str) -> Result<PathBuf, an
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ExtensionConfig;
     use crate::conversation::message::{Message, MessageContent};
     use futures::StreamExt;
     use serial_test::serial;
@@ -4786,5 +4792,90 @@ You review code."#;
         let sources = discover_filesystem_sources(wd.path());
         let hit = sources.iter().find(|s| s.name == "code-reviewer").unwrap();
         assert_eq!(hit.description, "local agent");
+    }
+
+    fn subagent_policy_platform(name: &str, tools: &[&str]) -> ExtensionConfig {
+        ExtensionConfig::Platform {
+            name: name.to_string(),
+            description: String::new(),
+            display_name: None,
+            bundled: None,
+            available_tools: tools.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    async fn subagent_policy_resolve(
+        declared: Option<Vec<ExtensionConfig>>,
+        filter: Option<Vec<&str>>,
+    ) -> anyhow::Result<Vec<ExtensionConfig>> {
+        let temp_dir = TempDir::new().unwrap();
+        let parent_provider = providers::create("openai", Vec::new()).await.unwrap();
+        let mut context = create_test_context();
+        context.provider = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&parent_provider))));
+        let client = SummonClient::new(context).unwrap();
+        let mut session = crate::session::Session {
+            provider_name: Some(parent_provider.get_name().to_string()),
+            model_config: Some(goose_providers::model::ModelConfig::new("test-model")),
+            working_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        EnabledExtensionsState::new(vec![
+            subagent_policy_platform("summon", &[]),
+            subagent_policy_platform("developer", &[]),
+        ])
+        .to_extension_data(&mut session.extension_data)
+        .unwrap();
+        let mut recipe = empty_recipe();
+        recipe.extensions = declared;
+        let params = DelegateParams {
+            extensions: filter.map(|f| f.into_iter().map(String::from).collect()),
+            provider: Some(parent_provider.get_name().to_string()),
+            model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+        Ok(client
+            .build_task_config(&params, &recipe, &session)
+            .await?
+            .extensions)
+    }
+
+    fn names(exts: &[ExtensionConfig]) -> Vec<String> {
+        exts.iter().map(|e| e.name()).collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_declared_extensions_replace_parent() {
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+        let declared = vec![
+            subagent_policy_platform("developer", &["tree", "read_image"]),
+            subagent_policy_platform("todo", &[]),
+        ];
+        let got = subagent_policy_resolve(Some(declared.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(got, declared); // available_tools preserved, summon NOT inherited
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_filter_only_narrows_declared() {
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+        let declared = vec![
+            subagent_policy_platform("developer", &["tree"]),
+            subagent_policy_platform("todo", &[]),
+        ];
+        let got = subagent_policy_resolve(Some(declared), Some(vec!["developer", "summon"]))
+            .await
+            .unwrap();
+        assert_eq!(got, vec![subagent_policy_platform("developer", &["tree"])]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_undeclared_inherits_parent_when_unconfigured() {
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+        let got = subagent_policy_resolve(None, None).await.unwrap();
+        assert_eq!(names(&got), vec!["summon", "developer"]);
     }
 }
