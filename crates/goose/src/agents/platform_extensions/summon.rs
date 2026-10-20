@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: GOOSE_SUBAGENT_ROLES_DIR is scanned first so local sources cannot shadow a role; recipe declared extensions replace parent (port of #12938).
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_SUBAGENT_ROLES_DIR is scanned first so local sources cannot shadow a role; recipe declared extensions replace parent (port of #12938); GOOSE_SUBAGENT_DEFAULT_RECIPE scopes delegates declaring no extensions.
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::final_output_tool::FinalOutputTool;
 use crate::agents::mcp_client::{Error, McpClientTrait};
@@ -7,7 +7,7 @@ use crate::agents::subagent_task_config::{TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS
 use crate::agents::tool_execution::{ToolCallContext, ToolCallNotificationEmitter};
 use crate::agents::AgentConfig;
 use crate::config::paths::Paths;
-use crate::config::{resolve_extensions_for_new_session, Config, GooseMode};
+use crate::config::{resolve_extensions_for_new_session, Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::Message;
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
@@ -528,6 +528,35 @@ fn subagent_roles_dir() -> Option<PathBuf> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
+}
+
+/// Fork patch: when set, a delegate whose recipe declares no extensions (ad-hoc
+/// tasks, agent `.md` files, undeclared sub-recipes) gets THIS recipe's
+/// extensions instead of inheriting the parent's. Fails closed: a set-but-broken
+/// value is an error, never a silent fallback to the parent's tools.
+pub(crate) fn subagent_default_recipe_path() -> Option<String> {
+    Config::global()
+        .get_param::<String>("GOOSE_SUBAGENT_DEFAULT_RECIPE")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn unscoped_subagent_extensions() -> anyhow::Result<Option<Vec<ExtensionConfig>>> {
+    let Some(path) = subagent_default_recipe_path() else {
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("GOOSE_SUBAGENT_DEFAULT_RECIPE: cannot read {path}: {e}"))?;
+    let recipe = Recipe::from_content(&content).map_err(|e| {
+        anyhow::anyhow!("GOOSE_SUBAGENT_DEFAULT_RECIPE: {path} is not a valid recipe: {e}")
+    })?;
+    let declared = recipe.extensions.ok_or_else(|| {
+        anyhow::anyhow!("GOOSE_SUBAGENT_DEFAULT_RECIPE: {path} declares no extensions")
+    })?;
+    Ok(Some(resolve_extensions_for_new_session(
+        Some(&declared),
+        None,
+    )))
 }
 
 /// Get maximum number of concurrent background tasks
@@ -1746,10 +1775,13 @@ impl SummonClient {
             // Port of upstream #12938 (delegation half): a delegated recipe's
             // declared extensions replace the parent's.
             Some(declared) => resolve_extensions_for_new_session(Some(declared), None),
-            None => EnabledExtensionsState::extensions_or_default(
-                Some(&session.extension_data),
-                Config::global(),
-            ),
+            None => match unscoped_subagent_extensions()? {
+                Some(defaults) => defaults,
+                None => EnabledExtensionsState::extensions_or_default(
+                    Some(&session.extension_data),
+                    Config::global(),
+                ),
+            },
         };
 
         if let Some(filter) = &params.extensions {
@@ -4877,5 +4909,67 @@ You review code."#;
         let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
         let got = subagent_policy_resolve(None, None).await.unwrap();
         assert_eq!(names(&got), vec!["summon", "developer"]);
+    }
+
+    fn subagent_policy_write_default(dir: &TempDir, body: &str) -> &'static str {
+        let p = dir.path().join("unscoped.yaml");
+        fs::write(&p, body).unwrap();
+        Box::leak(p.to_str().unwrap().to_string().into_boxed_str())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_unscoped_gets_default_recipe_extensions() {
+        let d = TempDir::new().unwrap();
+        let p = subagent_policy_write_default(
+            &d,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: u\nextensions:\n  - type: platform\n    name: developer\n    available_tools: [tree]\n",
+        );
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+        let got = subagent_policy_resolve(None, None).await.unwrap();
+        assert_eq!(got, vec![subagent_policy_platform("developer", &["tree"])]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_declared_recipe_ignores_default() {
+        let d = TempDir::new().unwrap();
+        let p = subagent_policy_write_default(
+            &d,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: u\nextensions:\n  - type: platform\n    name: todo\n",
+        );
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+        let declared = vec![subagent_policy_platform("developer", &[])];
+        let got = subagent_policy_resolve(Some(declared.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(got, declared);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_missing_default_recipe_fails_closed() {
+        let _env = env_lock::lock_env([(
+            "GOOSE_SUBAGENT_DEFAULT_RECIPE",
+            Some("/nonexistent/unscoped.yaml"),
+        )]);
+        let err = subagent_policy_resolve(None, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("GOOSE_SUBAGENT_DEFAULT_RECIPE"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_default_recipe_without_extensions_fails_closed() {
+        let d = TempDir::new().unwrap();
+        let p = subagent_policy_write_default(
+            &d,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: u\n",
+        );
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+        let err = subagent_policy_resolve(None, None).await.unwrap_err();
+        assert!(err.to_string().contains("declares no extensions"), "{err}");
     }
 }
