@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: GOOSE_SUBAGENT_ROLES_DIR is scanned first so local sources cannot shadow a role; recipe declared extensions replace parent (port of #12938); GOOSE_SUBAGENT_DEFAULT_RECIPE scopes delegates declaring no extensions.
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_SUBAGENT_ROLES_DIR (with ~ expansion) is scanned first so local sources cannot shadow a role; recipe declared extensions replace parent (port of #12938); GOOSE_SUBAGENT_DEFAULT_RECIPE scopes delegates declaring no extensions.
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::final_output_tool::FinalOutputTool;
 use crate::agents::mcp_client::{Error, McpClientTrait};
@@ -376,7 +376,14 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
     let config = Paths::config_dir();
 
     if let Some(dir) = subagent_roles_dir() {
-        scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
+        if dir.is_dir() {
+            scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
+        } else {
+            tracing::warn!(
+                "GOOSE_SUBAGENT_ROLES_DIR: path '{}' is not a directory",
+                dir.display()
+            );
+        }
     }
 
     let local_recipe_dirs: Vec<PathBuf> = vec![
@@ -527,7 +534,7 @@ fn subagent_roles_dir() -> Option<PathBuf> {
         .get_param::<String>("GOOSE_SUBAGENT_ROLES_DIR")
         .ok()
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+        .map(|s| PathBuf::from(&*shellexpand::tilde(&s)))
 }
 
 /// Fork patch: when set, a delegate whose recipe declares no extensions (ad-hoc
@@ -4824,6 +4831,42 @@ You review code."#;
         let sources = discover_filesystem_sources(wd.path());
         let hit = sources.iter().find(|s| s.name == "code-reviewer").unwrap();
         assert_eq!(hit.description, "local agent");
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_policy_roles_dir_tilde_expanded() {
+        let fake_home = TempDir::new().unwrap();
+        let roles_dir = fake_home.path().join("roles");
+        fs::create_dir_all(&roles_dir).unwrap();
+        fs::write(
+            roles_dir.join("code-reviewer.yaml"),
+            "version: 1.0.0\ntitle: Role\ndescription: global role\ninstructions: role body\n",
+        )
+        .unwrap();
+
+        let wd = TempDir::new().unwrap();
+        let home_str: &'static str = Box::leak(
+            fake_home
+                .path()
+                .to_str()
+                .unwrap()
+                .to_string()
+                .into_boxed_str(),
+        );
+        let _env = env_lock::lock_env([
+            ("HOME", Some(home_str)),
+            ("GOOSE_SUBAGENT_ROLES_DIR", Some("~/roles")),
+        ]);
+
+        let sources = discover_filesystem_sources(wd.path());
+        let hit = sources.iter().find(|s| s.name == "code-reviewer");
+        assert!(
+            hit.is_some(),
+            "code-reviewer role should be found with ~/roles"
+        );
+        let hit = hit.unwrap();
+        assert_eq!(hit.description, "global role");
     }
 
     fn subagent_policy_platform(name: &str, tools: &[&str]) -> ExtensionConfig {
