@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: with GOOSE_SUBAGENT_DEFAULT_RECIPE set, a subagent extension that fails to start fails the delegate.
+// Modified by Jonathan Mohrbacher, 2026: subagent policy: with GOOSE_SUBAGENT_DEFAULT_RECIPE set, an extension that fails to start fails the delegate.
 use crate::{
     agents::{
         final_output_tool::FinalOutputTool,

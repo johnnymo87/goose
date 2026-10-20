@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: GOOSE_SUBAGENT_ROLES_DIR (with ~ expansion) is scanned first so local sources cannot shadow a role; recipe declared extensions replace parent (port of #12938); GOOSE_SUBAGENT_DEFAULT_RECIPE scopes delegates declaring no extensions.
+// Modified by Jonathan Mohrbacher, 2026: subagent policy: GOOSE_SUBAGENT_ROLES_DIR (~ expanded) is scanned first; recipe declared extensions replace parent; GOOSE_SUBAGENT_DEFAULT_RECIPE scopes delegates declaring no extensions.
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::final_output_tool::FinalOutputTool;
 use crate::agents::mcp_client::{Error, McpClientTrait};
