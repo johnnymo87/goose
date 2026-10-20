@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test; self-compaction over ACP test; reload excludes self_compact_and_resume for recipe response schema.
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test; self-compaction over ACP test; reload excludes self_compact_and_resume for recipe response schema; session/prompt reports a failed turn in _meta.goose.turnError.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -2533,6 +2533,67 @@ async fn test_recipe_session_after_reload_never_lists_self_compact_and_resume() 
             tools_before_arr.len(),
             tools_after_arr.len(),
             "Tool list length must match before and after reload"
+        );
+    });
+}
+
+#[test]
+#[serial]
+fn test_prompt_turn_error_reports_a_failed_turn_in_meta() {
+    run_test(async move {
+        // The first prompt matches no exchange, so the mock answers 417 and the
+        // provider call fails; the second prompt succeeds.
+        let openai = OpenAiFixture::new(
+            vec![(
+                "what is 1+1".to_string(),
+                include_str!("acp_test_data/openai_basic.txt"),
+            )],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.clone();
+
+        let prompt = |text: &'static str| {
+            send_custom(
+                conn.cx(),
+                "session/prompt",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": text }],
+                }),
+            )
+        };
+
+        let failed = prompt("this prompt is not scripted").await.unwrap();
+        assert_eq!(
+            failed.get("stopReason").and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
+        let turn_error = failed
+            .pointer("/_meta/goose/turnError")
+            .unwrap_or_else(|| panic!("failed turn should carry turnError: {failed}"));
+        assert_eq!(
+            turn_error.get("kind").and_then(|k| k.as_str()),
+            Some("provider")
+        );
+        assert!(
+            turn_error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| !m.is_empty()),
+            "turnError should carry a message: {turn_error}"
+        );
+
+        let succeeded = prompt("what is 1+1").await.unwrap();
+        assert_eq!(
+            succeeded.get("stopReason").and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
+        assert!(
+            succeeded.pointer("/_meta/goose/turnError").is_none(),
+            "a clean turn must not carry turnError: {succeeded}"
         );
     });
 }

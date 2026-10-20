@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session.
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session; per-session turn-error slot set by failing turn paths.
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +44,7 @@ use crate::agents::state_machine::{
     ToolExecutionOperation, ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
+use crate::agents::turn_error::{turn_error_from_trailing_error, TurnError, TurnErrorKind};
 use crate::agents::types::{
     SessionConfig, SharedProvider, DEFAULT_ON_FAILURE_TIMEOUT_SECONDS,
     DEFAULT_RETRY_TIMEOUT_SECONDS,
@@ -305,6 +306,7 @@ pub struct Agent {
     pub(super) grind: Mutex<Option<String>>,
     steer_queues: Mutex<HashMap<String, SteerQueue>>,
     self_compact_runs: Mutex<HashSet<String>>,
+    turn_errors: Mutex<HashMap<String, TurnError>>,
 }
 
 fn ensure_message_event_id(event: AgentEvent) -> AgentEvent {
@@ -527,6 +529,7 @@ impl Agent {
             grind: Mutex::new(None),
             steer_queues: Mutex::new(HashMap::new()),
             self_compact_runs: Mutex::new(HashSet::new()),
+            turn_errors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -674,6 +677,23 @@ impl Agent {
 
     pub(super) async fn has_self_compacted_in_run(&self, session_id: &str) -> bool {
         self.self_compact_runs.lock().await.contains(session_id)
+    }
+
+    pub(super) async fn set_turn_error(&self, session_id: &str, error: TurnError) {
+        self.turn_errors
+            .lock()
+            .await
+            .insert(session_id.to_string(), error);
+    }
+
+    pub(super) async fn clear_turn_error(&self, session_id: &str) {
+        self.turn_errors.lock().await.remove(session_id);
+    }
+
+    /// Why the session's last turn ended in failure, if it did. Taking it
+    /// clears it, so each failure is reported once.
+    pub async fn take_turn_error(&self, session_id: &str) -> Option<TurnError> {
+        self.turn_errors.lock().await.remove(session_id)
     }
 
     pub(super) async fn record_self_compact_in_run(&self, session_id: &str) {
@@ -2307,7 +2327,11 @@ impl Agent {
                         }
                     }
                 };
-                result?;
+                let session = result?;
+                match session.conversation.as_ref().and_then(turn_error_from_trailing_error) {
+                    Some(error) => self.set_turn_error(&session_id, error).await,
+                    None => self.clear_turn_error(&session_id).await,
+                }
                 // Without this the drain below never ends: `run` only borrows the emitter.
                 drop(emit);
                 while let Some(event) = rx.recv().await {
@@ -2432,6 +2456,8 @@ impl Agent {
                 }
             }
         }
+
+        self.clear_turn_error(&session_config.id).await;
 
         if use_state_machine {
             tracing::info!("dispatching reply via experimental state machine");
@@ -2616,8 +2642,14 @@ impl Agent {
                     provider = %provider_name,
                     "Recipe declares structured response, but this provider can't receive the final_output tool; failing before inference"
                 );
+                let unsupported = structured_output_unsupported_message(provider_name);
+                self.set_turn_error(
+                    &session_config.id,
+                    TurnError::new(TurnErrorKind::Unsupported, unsupported.clone()),
+                )
+                .await;
                 let message = Message::assistant()
-                    .with_text(structured_output_unsupported_message(provider_name))
+                    .with_text(unsupported)
                     .with_generated_id_if_missing();
                 session_manager
                     .add_message(&session_config.id, &message)
@@ -2736,6 +2768,11 @@ impl Agent {
                         (compacted_conversation, session)
                     }
                     Err(e) => {
+                        self.set_turn_error(
+                            &session_config.id,
+                            TurnError::new(TurnErrorKind::ContextLength, format!("Compaction failed: {e}")),
+                        )
+                        .await;
                         yield AgentEvent::Message(
                             Message::assistant().with_text(
                                 format!("Ran into this error trying to compact: {e}.\n\nPlease try again or create a new session")
@@ -3043,6 +3080,13 @@ impl Agent {
                                 notice,
                                 is_cancelled,
                             } => {
+                                if !is_cancelled {
+                                    self.set_turn_error(
+                                        &session_config.id,
+                                        TurnError::new(TurnErrorKind::SelfCompact, notice.as_concat_text()),
+                                    )
+                                    .await;
+                                }
                                 conversation.push(notice.clone());
                                 yield AgentEvent::Message(notice);
                                 if !is_cancelled && self.has_pending_steers(&session_config.id).await {
@@ -3178,6 +3222,7 @@ impl Agent {
                 let mut did_recovery_compact_this_iteration = false;
                 let mut exit_chat = false;
                 let mut provider_errored = false;
+                let mut turn_error_cleared_this_iteration = false;
                 let mut provider_produced_content = false;
                 let mut provider_reached_output_token_limit = false;
                 let mut pending_final_output: Option<String> = None;
@@ -3210,6 +3255,10 @@ impl Agent {
                     match next {
                         Ok((response, usage)) => {
                             compaction_attempts = 0;
+                            if !turn_error_cleared_this_iteration {
+                                turn_error_cleared_this_iteration = true;
+                                self.clear_turn_error(&session_config.id).await;
+                            }
 
                             if let Some(ref usage) = usage {
                                 let enriched = self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), usage, None).await?;
@@ -3580,6 +3629,11 @@ impl Agent {
 
                             if compaction_attempts >= 2 {
                                 error!("Context limit exceeded after compaction - prompt too large");
+                                self.set_turn_error(
+                                    &session_config.id,
+                                    TurnError::new(TurnErrorKind::ContextLength, provider_err.to_string()),
+                                )
+                                .await;
                                 yield AgentEvent::Message(
                                     Message::assistant().with_system_notification(
                                         SystemNotificationType::InlineMessage,
@@ -3623,6 +3677,11 @@ impl Agent {
                                     #[cfg(feature = "telemetry")]
                                     crate::posthog::emit_error("compaction_failed", &e.to_string());
                                     error!("Compaction failed: {}", e);
+                                    self.set_turn_error(
+                                        &session_config.id,
+                                        TurnError::new(TurnErrorKind::ContextLength, format!("Compaction failed: {e}")),
+                                    )
+                                    .await;
                                     yield AgentEvent::Message(
                                         Message::assistant().with_text(
                                             format!("Ran into this error trying to compact: {e}.\n\nPlease try again or create a new session")
@@ -3663,6 +3722,11 @@ impl Agent {
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
 
+                            self.set_turn_error(
+                                &session_config.id,
+                                TurnError::new(TurnErrorKind::Refusal, provider_err.to_string()),
+                            )
+                            .await;
                             let category = category.as_deref().map(|c| format!("\n\nCategory: {c}")).unwrap_or_default();
                             yield AgentEvent::Message(Message::assistant().with_text(format!(
                                 "The provider refused this request.\n\n{details}{category}\n\nPlease start a new session to continue — resending this conversation is likely to be refused again."
@@ -3693,6 +3757,11 @@ impl Agent {
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
+                            self.set_turn_error(
+                                &session_config.id,
+                                TurnError::new(TurnErrorKind::Network, provider_err.to_string()),
+                            )
+                            .await;
                             yield AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("{provider_err}\n\nPlease resend your message to try again.")
@@ -3705,6 +3774,11 @@ impl Agent {
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
+                            self.set_turn_error(
+                                &session_config.id,
+                                TurnError::new(TurnErrorKind::Provider, provider_err.to_string()),
+                            )
+                            .await;
                             yield AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("Ran into this error: {provider_err}.\n\nPlease retry if you think this is a transient or recoverable error.")
@@ -3836,6 +3910,11 @@ impl Agent {
                                     } else {
                                         warn!("Provider returned an empty response after retries; ending turn");
                                         last_assistant_text = EMPTY_TURN_MESSAGE.to_string();
+                                        self.set_turn_error(
+                                            &session_config.id,
+                                            TurnError::new(TurnErrorKind::EmptyResponse, EMPTY_TURN_MESSAGE),
+                                        )
+                                        .await;
                                         let message = push_message_with_id(
                                             &mut messages_to_add,
                                             Message::assistant().with_text(EMPTY_TURN_MESSAGE),
@@ -3850,6 +3929,11 @@ impl Agent {
                                     // exit silently when retries are exhausted.
                                     let message = push_message_with_id(&mut messages_to_add, message);
                                     last_assistant_text = message.as_concat_text();
+                                    self.set_turn_error(
+                                        &session_config.id,
+                                        TurnError::new(TurnErrorKind::RetryExhausted, last_assistant_text.clone()),
+                                    )
+                                    .await;
                                     yield AgentEvent::Message(message);
                                     exit_chat = true;
                                 }
@@ -3858,6 +3942,11 @@ impl Agent {
                                 }
                                 Err(e) => {
                                     error!("Retry logic failed: {}", e);
+                                    self.set_turn_error(
+                                        &session_config.id,
+                                        TurnError::new(TurnErrorKind::RetryExhausted, format!("Retry logic encountered an error: {e}")),
+                                    )
+                                    .await;
                                     yield AgentEvent::Message(
                                         Message::assistant().with_text(
                                             format!("Retry logic encountered an error: {}", e)

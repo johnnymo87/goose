@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: session/prompt _meta.goose.maxTurns bounds the run.
+// Modified by Jonathan Mohrbacher, 2026: session/prompt _meta.goose.maxTurns bounds the run; session/prompt reports a failed turn in _meta.goose.turnError.
 use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 use crate::acp::fs::AcpTools;
@@ -16,6 +16,7 @@ use crate::agents::platform_extensions::developer::DeveloperClient;
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
 };
+use crate::agents::turn_error::TurnError;
 use crate::agents::{
     Agent, AgentConfig, ExtensionConfig, ExtensionLoadResult, GoosePlatform, SessionConfig,
 };
@@ -761,6 +762,28 @@ fn build_prompt_usage(session: &Session) -> Option<Usage> {
     let input = to_nonnegative_u64(session.usage.input_tokens).unwrap_or(0);
     let output = to_nonnegative_u64(session.usage.output_tokens).unwrap_or(0);
     Some(Usage::new(total, input, output))
+}
+
+/// Adds `_meta.goose.turnError` for a turn that ended in failure, keeping
+/// any other `_meta`. A cancelled turn was stopped by the user, so whatever
+/// failed on the way out is not reported.
+fn with_turn_error(
+    mut response: PromptResponse,
+    was_cancelled: bool,
+    turn_error: Option<TurnError>,
+) -> PromptResponse {
+    let Some(turn_error) = turn_error.filter(|_| !was_cancelled) else {
+        return response;
+    };
+    let goose = response
+        .meta
+        .get_or_insert_with(Meta::new)
+        .entry("goose")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(goose) = goose.as_object_mut() {
+        goose.insert("turnError".to_string(), turn_error.to_meta_value());
+    }
+    response
 }
 
 fn prompt_stop_reason(was_cancelled: bool, output_token_limit_reached: bool) -> StopReason {
@@ -2383,6 +2406,9 @@ impl GooseAcpAgent {
                 stream,
             )
             .await;
+        // Taken while this prompt still owns the run: once the run is cleared,
+        // another prompt can start on the same agent and reset the slot.
+        let turn_error = agent.take_turn_error(&session_id).await;
         self.clear_active_run(&session_id, &run_id).await;
         Self::send_active_run_update(cx, &args.session_id, None)?;
         let outcome = stream_result?;
@@ -2398,7 +2424,7 @@ impl GooseAcpAgent {
         if let Some(usage) = build_prompt_usage(&session) {
             response = response.usage(usage);
         }
-        Ok(response)
+        Ok(with_turn_error(response, outcome.was_cancelled, turn_error))
     }
 
     async fn on_steer_session(
@@ -3607,6 +3633,37 @@ print(\"hello, world\")
         assert_eq!(
             prompt_stop_reason(was_cancelled, output_token_limit_reached),
             expected
+        );
+    }
+
+    #[test]
+    fn test_turn_error_meta() {
+        use crate::agents::turn_error::{TurnError, TurnErrorKind};
+
+        let error = || Some(TurnError::new(TurnErrorKind::Network, "connection reset"));
+        let meta = |response: PromptResponse| response.meta.map(serde_json::Value::Object);
+        let response = || PromptResponse::new(StopReason::EndTurn);
+        assert_eq!(
+            meta(with_turn_error(response(), false, error())),
+            Some(serde_json::json!({
+                "goose": { "turnError": { "kind": "network", "message": "connection reset" } }
+            }))
+        );
+        assert_eq!(meta(with_turn_error(response(), true, error())), None);
+        assert_eq!(meta(with_turn_error(response(), false, None)), None);
+
+        let mut existing = Meta::new();
+        existing.insert("other".into(), serde_json::json!(1));
+        existing.insert("goose".into(), serde_json::json!({ "kept": true }));
+        assert_eq!(
+            meta(with_turn_error(response().meta(existing), false, error())),
+            Some(serde_json::json!({
+                "other": 1,
+                "goose": {
+                    "kept": true,
+                    "turnError": { "kind": "network", "message": "connection reset" }
+                }
+            }))
         );
     }
 
