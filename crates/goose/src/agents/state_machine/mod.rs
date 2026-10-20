@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: export retry failure message check for turn errors.
 //! Runs an ordered, re-entrant pipeline over persisted conversation state.
 //!
 //! Callers persist incoming messages, construct `Step`s from their own operations,
@@ -80,6 +81,7 @@ pub(super) use ops_llm::{GooseInferenceProvider, InferenceRunner};
 pub(super) use ops_maxturns::{MaxTurnsOperation, MAX_TURNS_MESSAGE};
 pub(super) use ops_project::ProjectOperation;
 pub(super) use ops_recipe::RecipeOperation;
+pub(crate) use ops_retry::is_retry_failure_message;
 pub(super) use ops_retry::RetryOperation;
 pub(super) use ops_skills::SkillOperation;
 pub(super) use ops_slash_command::SlashCommandOperation;

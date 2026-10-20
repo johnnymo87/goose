@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: self-compaction module.
+// Modified by Jonathan Mohrbacher, 2026: self-compaction module; turn-error module.
 mod agent;
 pub mod container;
 pub mod execute_commands;
@@ -27,6 +27,7 @@ mod tool_confirmation_coordinator;
 mod tool_confirmation_router;
 pub mod tool_execution;
 mod tool_schema_normalize;
+pub mod turn_error;
 pub mod types;
 pub mod validate_extensions;
 

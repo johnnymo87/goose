@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: retry failure messages are recognisable as turn errors.
 //! Decides whether a completed response should finish, continue, or retry the turn.
 
 use anyhow::{anyhow, Result};
@@ -20,10 +21,17 @@ use tokio::sync::Mutex;
 pub(super) const NUDGED: &str = "nudged";
 pub(super) const ATTEMPTS: &str = "attempts";
 
+const RETRY_ERROR_PREFIX: &str = "Retry logic encountered an error: ";
+const MAX_RETRIES_PREFIX: &str = "Maximum retry attempts (";
+
+pub(crate) fn is_retry_failure_message(message: &str) -> bool {
+    message.starts_with(RETRY_ERROR_PREFIX) || message.starts_with(MAX_RETRIES_PREFIX)
+}
+
 fn retry_error(error: &str) -> Message {
     Message::assistant().with_error(
         MessageErrorKind::Other,
-        format!("Retry logic encountered an error: {error}"),
+        format!("{RETRY_ERROR_PREFIX}{error}"),
     )
 }
 
@@ -252,7 +260,7 @@ impl Operation<Session, GooseEffect> for RetryOperation<'_> {
             let message = Message::assistant().with_error(
                 MessageErrorKind::Other,
                 format!(
-                    "Maximum retry attempts ({}) exceeded. Unable to complete the task successfully.",
+                    "{MAX_RETRIES_PREFIX}{}) exceeded. Unable to complete the task successfully.",
                     retry_config.max_retries
                 ),
             );

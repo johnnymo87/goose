@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: session/prompt _meta.goose.maxTurns bounds the run.
+// Modified by Jonathan Mohrbacher, 2026: session/prompt _meta.goose.maxTurns bounds the run; session/prompt reports a failed turn in _meta.goose.turnError.
 use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 use crate::acp::fs::AcpTools;
@@ -16,6 +16,7 @@ use crate::agents::platform_extensions::developer::DeveloperClient;
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
 };
+use crate::agents::turn_error::TurnError;
 use crate::agents::{
     Agent, AgentConfig, ExtensionConfig, ExtensionLoadResult, GoosePlatform, SessionConfig,
 };
@@ -761,6 +762,17 @@ fn build_prompt_usage(session: &Session) -> Option<Usage> {
     let input = to_nonnegative_u64(session.usage.input_tokens).unwrap_or(0);
     let output = to_nonnegative_u64(session.usage.output_tokens).unwrap_or(0);
     Some(Usage::new(total, input, output))
+}
+
+/// `_meta.goose.turnError` for a turn that ended in failure. A cancelled turn
+/// was stopped by the user, so whatever failed on the way out is not reported.
+fn turn_error_meta(was_cancelled: bool, turn_error: Option<TurnError>) -> Option<Meta> {
+    let turn_error = turn_error.filter(|_| !was_cancelled)?;
+    let mut goose = serde_json::Map::new();
+    goose.insert("turnError".to_string(), turn_error.to_meta_value());
+    let mut meta = Meta::new();
+    meta.insert("goose".to_string(), serde_json::Value::Object(goose));
+    Some(meta)
 }
 
 fn prompt_stop_reason(was_cancelled: bool, output_token_limit_reached: bool) -> StopReason {
@@ -2383,6 +2395,9 @@ impl GooseAcpAgent {
                 stream,
             )
             .await;
+        // Taken while this prompt still owns the run: once the run is cleared,
+        // another prompt can start on the same agent and reset the slot.
+        let turn_error = agent.take_turn_error(&session_id).await;
         self.clear_active_run(&session_id, &run_id).await;
         Self::send_active_run_update(cx, &args.session_id, None)?;
         let outcome = stream_result?;
@@ -2397,6 +2412,9 @@ impl GooseAcpAgent {
         let mut response = PromptResponse::new(stop_reason);
         if let Some(usage) = build_prompt_usage(&session) {
             response = response.usage(usage);
+        }
+        if let Some(meta) = turn_error_meta(outcome.was_cancelled, turn_error) {
+            response = response.meta(meta);
         }
         Ok(response)
     }
@@ -3608,6 +3626,21 @@ print(\"hello, world\")
             prompt_stop_reason(was_cancelled, output_token_limit_reached),
             expected
         );
+    }
+
+    #[test]
+    fn test_turn_error_meta() {
+        use crate::agents::turn_error::{TurnError, TurnErrorKind};
+
+        let error = || Some(TurnError::new(TurnErrorKind::Network, "connection reset"));
+        assert_eq!(
+            turn_error_meta(false, error()).map(serde_json::Value::Object),
+            Some(serde_json::json!({
+                "goose": { "turnError": { "kind": "network", "message": "connection reset" } }
+            }))
+        );
+        assert_eq!(turn_error_meta(true, error()), None);
+        assert_eq!(turn_error_meta(false, None), None);
     }
 
     #[test]
