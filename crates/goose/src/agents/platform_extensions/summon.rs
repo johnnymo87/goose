@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: subagent policy: GOOSE_SUBAGENT_ROLES_DIR (~ expanded) is scanned first; recipe declared extensions replace parent; GOOSE_SUBAGENT_DEFAULT_RECIPE scopes delegates declaring no extensions.
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::final_output_tool::FinalOutputTool;
 use crate::agents::mcp_client::{Error, McpClientTrait};
@@ -6,7 +7,7 @@ use crate::agents::subagent_task_config::{TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS
 use crate::agents::tool_execution::{ToolCallContext, ToolCallNotificationEmitter};
 use crate::agents::AgentConfig;
 use crate::config::paths::Paths;
-use crate::config::{Config, GooseMode};
+use crate::config::{resolve_extensions_for_new_session, Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::Message;
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
@@ -261,6 +262,7 @@ fn scan_recipes_from_dir(
     dir: &Path,
     kind: SourceType,
     suppress_config_warnings: bool,
+    mark_seen_on_error: bool,
     sources: &mut Vec<SourceEntry>,
     seen: &mut std::collections::HashSet<String>,
 ) {
@@ -294,6 +296,9 @@ fn scan_recipes_from_dir(
         let content = match crate::skills::read_source_file(&source_dir, Path::new(&file_name)) {
             Ok(content) => content,
             Err(error) => {
+                if mark_seen_on_error {
+                    seen.insert(name);
+                }
                 warn!("Failed to read recipe {}: {}", path.display(), error);
                 continue;
             }
@@ -315,6 +320,9 @@ fn scan_recipes_from_dir(
                 });
             }
             Err(e) => {
+                if mark_seen_on_error {
+                    seen.insert(name);
+                }
                 // The working directory commonly contains project config like package.json
                 // and tsconfig.json, which parse as valid JSON but lack Recipe fields. In that
                 // case treat them as "not a recipe" rather than warning. Dedicated recipe
@@ -374,6 +382,24 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
     let home = dirs::home_dir();
     let config = Paths::config_dir();
 
+    if let Some(dir) = subagent_roles_dir() {
+        if dir.is_dir() {
+            scan_recipes_from_dir(
+                &dir,
+                SourceType::Recipe,
+                false,
+                true,
+                &mut sources,
+                &mut seen,
+            );
+        } else {
+            tracing::warn!(
+                "GOOSE_SUBAGENT_ROLES_DIR: path '{}' is not a directory",
+                dir.display()
+            );
+        }
+    }
+
     let local_recipe_dirs: Vec<PathBuf> = vec![
         working_dir.join(".goose/recipes"),
         working_dir.join(".agents/recipes"),
@@ -417,12 +443,20 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
         working_dir,
         SourceType::Recipe,
         true,
+        false,
         &mut sources,
         &mut seen,
     );
 
     for dir in local_recipe_dirs {
-        scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
+        scan_recipes_from_dir(
+            &dir,
+            SourceType::Recipe,
+            false,
+            false,
+            &mut sources,
+            &mut seen,
+        );
     }
 
     for dir in local_agent_dirs {
@@ -430,7 +464,14 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
     }
 
     for dir in global_recipe_dirs {
-        scan_recipes_from_dir(&dir, SourceType::Recipe, false, &mut sources, &mut seen);
+        scan_recipes_from_dir(
+            &dir,
+            SourceType::Recipe,
+            false,
+            false,
+            &mut sources,
+            &mut seen,
+        );
     }
 
     for dir in global_agent_dirs {
@@ -512,6 +553,53 @@ fn current_epoch_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Directory of operator-managed role recipes (fork patch). Scanned before every
+/// other source so a repo's `.claude/agents/<name>.md` or `.goose/recipes/<name>.yaml`
+/// cannot shadow a role. Unset/empty = upstream behaviour.
+fn subagent_roles_dir() -> Option<PathBuf> {
+    Config::global()
+        .get_param::<String>("GOOSE_SUBAGENT_ROLES_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| PathBuf::from(&*shellexpand::tilde(&s)))
+}
+
+/// Fork patch: when set, a delegate whose recipe declares no extensions (ad-hoc
+/// tasks, agent `.md` files, undeclared sub-recipes) gets THIS recipe's
+/// extensions instead of inheriting the parent's. Fails closed: a set-but-broken
+/// value is an error, never a silent fallback to the parent's tools.
+pub(crate) fn subagent_default_recipe_path() -> Option<String> {
+    Config::global()
+        .get_param::<String>("GOOSE_SUBAGENT_DEFAULT_RECIPE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| shellexpand::tilde(&s).into_owned())
+}
+
+struct UnscopedSubagentDefaults {
+    extensions: Vec<ExtensionConfig>,
+    instructions: Option<String>,
+}
+
+fn unscoped_subagent_defaults() -> anyhow::Result<Option<UnscopedSubagentDefaults>> {
+    let Some(path) = subagent_default_recipe_path() else {
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("GOOSE_SUBAGENT_DEFAULT_RECIPE: cannot read {path}: {e}"))?;
+    let recipe = Recipe::from_content(&content).map_err(|e| {
+        anyhow::anyhow!("GOOSE_SUBAGENT_DEFAULT_RECIPE: {path} is not a valid recipe: {e}")
+    })?;
+    let declared = recipe.extensions.ok_or_else(|| {
+        anyhow::anyhow!("GOOSE_SUBAGENT_DEFAULT_RECIPE: {path} declares no extensions")
+    })?;
+    let extensions = resolve_extensions_for_new_session(Some(&declared), None);
+    Ok(Some(UnscopedSubagentDefaults {
+        extensions,
+        instructions: recipe.instructions,
+    }))
 }
 
 /// Get maximum number of concurrent background tasks
@@ -711,7 +799,7 @@ impl SummonClient {
                 "extensions": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Extensions to enable. Omit to inherit all, empty array for none."
+                    "description": "Restrict extensions by name. Omit to use the source recipe's declared extensions, or inherit the parent's if none are declared. Empty array for none."
                 },
                 "provider": {
                     "type": "string",
@@ -746,21 +834,29 @@ impl SummonClient {
             }
         });
 
+        let work_guidance = if subagent_default_recipe_path().is_some() {
+            "Delegates without a source (and agent .md sources that declare no extensions) are read-only.\n\
+             Write work must go to a source whose recipe grants write tools (e.g. an implementer role)."
+        } else {
+            "Work (writes): partition files strictly - no two delegates touch the same file."
+        };
+
         Tool::new(
             "delegate",
-            "Delegate a task to a subagent that runs independently with its own context.\n\n\
-             Modes:\n\
-             1. Ad-hoc: Provide `instructions` for a custom task\n\
-             2. Source-based: Provide `source` name to run a subrecipe, recipe, or agent\n\
-             3. Combined: Pair a source with a task (e.g., source: \"deploy\", instructions: \"deploy to staging\")\n\n\
-             Effective Delegation:\n\
-             - Delegates know only instructions + source content\n\
-             - Delegates cannot coordinate. Same-file work = conflicts.\n\
-             - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
-             Research (read-only): parallelize freely - delegates explore and report back.\n\
-             Work (writes): partition files strictly - no two delegates touch the same file.\n\n\
-             Decompose → async delegates → load(taskId) for each → synthesize."
-                .to_string(),
+            format!(
+                "Delegate a task to a subagent that runs independently with its own context.\n\n\
+                 Modes:\n\
+                 1. Ad-hoc: Provide `instructions` for a custom task\n\
+                 2. Source-based: Provide `source` name to run a subrecipe, recipe, or agent\n\
+                 3. Combined: Pair a source with a task (e.g., source: \"deploy\", instructions: \"deploy to staging\")\n\n\
+                 Effective Delegation:\n\
+                 - Delegates know only instructions + source content\n\
+                 - Delegates cannot coordinate. Same-file work = conflicts.\n\
+                 - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
+                 Research (read-only): parallelize freely - delegates explore and report back.\n\
+                 {work_guidance}\n\n\
+                 Decompose → async delegates → load(taskId) for each → synthesize."
+            ),
             schema.as_object().unwrap().clone(),
         )
     }
@@ -1354,12 +1450,12 @@ impl SummonClient {
             return Ok(CallToolResult::success(content).with_meta(Some(meta)));
         }
 
-        let recipe = self
+        let mut recipe = self
             .build_delegate_recipe(&params, session_id, working_dir)
             .await?;
 
         let task_config = self
-            .build_task_config(&params, &recipe, &session)
+            .build_task_config(&params, &mut recipe, &session)
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
@@ -1430,7 +1526,7 @@ impl SummonClient {
             .build_delegate_recipe(&params, &parent.id, &parent.working_dir)
             .await?;
         let task_config = self
-            .build_task_config(&params, &recipe, parent)
+            .build_task_config(&params, &mut recipe, parent)
             .await
             .map_err(|e| format!("Failed to build task config: {e}"))?;
         crate::providers::get_from_registry(task_config.provider.get_name())
@@ -1723,13 +1819,34 @@ impl SummonClient {
     async fn build_task_config(
         &self,
         params: &DelegateParams,
-        recipe: &Recipe,
+        recipe: &mut Recipe,
         session: &crate::session::Session,
     ) -> Result<TaskConfig, anyhow::Error> {
-        let mut extensions = EnabledExtensionsState::extensions_or_default(
-            Some(&session.extension_data),
-            Config::global(),
-        );
+        let mut extensions = match recipe.extensions.as_deref() {
+            // Port of upstream #12938 (delegation half): a delegated recipe's
+            // declared extensions replace the parent's.
+            Some(declared) => resolve_extensions_for_new_session(Some(declared), None),
+            None => match unscoped_subagent_defaults()? {
+                Some(defaults) => {
+                    if let Some(default_instructions) = defaults.instructions {
+                        if !default_instructions.is_empty() {
+                            let combined = match &recipe.instructions {
+                                Some(existing) if !existing.is_empty() => {
+                                    format!("{default_instructions}\n\n{existing}")
+                                }
+                                _ => default_instructions,
+                            };
+                            recipe.instructions = Some(combined);
+                        }
+                    }
+                    defaults.extensions
+                }
+                None => EnabledExtensionsState::extensions_or_default(
+                    Some(&session.extension_data),
+                    Config::global(),
+                ),
+            },
+        };
 
         if let Some(filter) = &params.extensions {
             if filter.is_empty() {
@@ -2105,12 +2222,12 @@ impl SummonClient {
         }
 
         let working_dir = session.working_dir.clone();
-        let recipe = self
+        let mut recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
 
         let task_config = self
-            .build_task_config(&params, &recipe, &session)
+            .build_task_config(&params, &mut recipe, &session)
             .await
             .map_err(|e| format!("Failed to build task config: {}", e))?;
 
@@ -2390,6 +2507,7 @@ fn resolve_working_dir(parent_dir: &Path, requested: &str) -> Result<PathBuf, an
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ExtensionConfig;
     use crate::conversation::message::{Message, MessageContent};
     use futures::StreamExt;
     use serial_test::serial;
@@ -2440,6 +2558,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn foreground_delegate_persists_child_and_scheduling_marker() {
         let temp_dir = TempDir::new().unwrap();
         let child_dir = temp_dir.path().join("child");
@@ -2837,6 +2956,7 @@ You review code."#;
             temp_dir.path(),
             SourceType::Recipe,
             true,
+            false,
             &mut sources,
             &mut seen,
         );
@@ -2867,6 +2987,7 @@ You review code."#;
         scan_recipes_from_dir(
             temp_dir.path(),
             SourceType::Recipe,
+            false,
             false,
             &mut sources,
             &mut seen,
@@ -3325,6 +3446,7 @@ You review code."#;
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_build_task_config_recreates_registered_parent_provider() {
         let temp_dir = TempDir::new().unwrap();
         let parent_provider = providers::create("openai", Vec::new()).await.unwrap();
@@ -3345,7 +3467,7 @@ You review code."#;
         };
 
         let task_config = client
-            .build_task_config(&params, &empty_recipe(), &session)
+            .build_task_config(&params, &mut empty_recipe(), &session)
             .await
             .unwrap();
 
@@ -4716,5 +4838,410 @@ You review code."#;
             .await
             .unwrap();
         assert!(extract_text(&result.content[0]).contains("final output"));
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_policy_roles_dir_wins_over_local_sources() {
+        let roles = TempDir::new().unwrap();
+        let wd = TempDir::new().unwrap();
+        fs::write(
+            roles.path().join("code-reviewer.yaml"),
+            "version: 1.0.0\ntitle: Role\ndescription: global role\ninstructions: role body\n",
+        )
+        .unwrap();
+        fs::create_dir_all(wd.path().join(".claude/agents")).unwrap();
+        fs::write(
+            wd.path().join(".claude/agents/cr.md"),
+            "---\nname: code-reviewer\ndescription: local impostor\n---\nimpostor",
+        )
+        .unwrap();
+        fs::create_dir_all(wd.path().join(".goose/recipes")).unwrap();
+        fs::write(
+            wd.path().join(".goose/recipes/code-reviewer.yaml"),
+            "version: 1.0.0\ntitle: X\ndescription: local recipe impostor\ninstructions: x\n",
+        )
+        .unwrap();
+        let roles_dir: &'static str =
+            Box::leak(roles.path().to_str().unwrap().to_string().into_boxed_str());
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_ROLES_DIR", Some(roles_dir))]);
+
+        let sources = discover_filesystem_sources(wd.path());
+        let hits: Vec<_> = sources
+            .iter()
+            .filter(|s| s.name == "code-reviewer")
+            .collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].description, "global role");
+        assert!(hits[0]
+            .path
+            .starts_with(roles.path().canonicalize().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_policy_roles_dir_unset_keeps_upstream_order() {
+        let wd = TempDir::new().unwrap();
+        fs::create_dir_all(wd.path().join(".claude/agents")).unwrap();
+        fs::write(
+            wd.path().join(".claude/agents/cr.md"),
+            "---\nname: code-reviewer\ndescription: local agent\n---\nbody",
+        )
+        .unwrap();
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_ROLES_DIR", None::<&str>)]);
+        let sources = discover_filesystem_sources(wd.path());
+        let hit = sources.iter().find(|s| s.name == "code-reviewer").unwrap();
+        assert_eq!(hit.description, "local agent");
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_policy_roles_dir_tilde_expanded() {
+        let fake_home = TempDir::new().unwrap();
+        let roles_dir = fake_home.path().join("roles");
+        fs::create_dir_all(&roles_dir).unwrap();
+        fs::write(
+            roles_dir.join("code-reviewer.yaml"),
+            "version: 1.0.0\ntitle: Role\ndescription: global role\ninstructions: role body\n",
+        )
+        .unwrap();
+
+        let wd = TempDir::new().unwrap();
+        let home_str: &'static str = Box::leak(
+            fake_home
+                .path()
+                .to_str()
+                .unwrap()
+                .to_string()
+                .into_boxed_str(),
+        );
+        let _env = env_lock::lock_env([
+            ("HOME", Some(home_str)),
+            ("GOOSE_SUBAGENT_ROLES_DIR", Some("~/roles")),
+        ]);
+
+        let sources = discover_filesystem_sources(wd.path());
+        let hit = sources.iter().find(|s| s.name == "code-reviewer");
+        assert!(
+            hit.is_some(),
+            "code-reviewer role should be found with ~/roles"
+        );
+        let hit = hit.unwrap();
+        assert_eq!(hit.description, "global role");
+    }
+
+    fn subagent_policy_platform(name: &str, tools: &[&str]) -> ExtensionConfig {
+        ExtensionConfig::Platform {
+            name: name.to_string(),
+            description: String::new(),
+            display_name: None,
+            bundled: None,
+            available_tools: tools.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    async fn subagent_policy_resolve(
+        declared: Option<Vec<ExtensionConfig>>,
+        filter: Option<Vec<&str>>,
+    ) -> anyhow::Result<Vec<ExtensionConfig>> {
+        let temp_dir = TempDir::new().unwrap();
+        let parent_provider = providers::create("openai", Vec::new()).await.unwrap();
+        let mut context = create_test_context();
+        context.provider = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&parent_provider))));
+        let client = SummonClient::new(context).unwrap();
+        let mut session = crate::session::Session {
+            provider_name: Some(parent_provider.get_name().to_string()),
+            model_config: Some(goose_providers::model::ModelConfig::new("test-model")),
+            working_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        EnabledExtensionsState::new(vec![
+            subagent_policy_platform("summon", &[]),
+            subagent_policy_platform("developer", &[]),
+        ])
+        .to_extension_data(&mut session.extension_data)
+        .unwrap();
+        let mut recipe = empty_recipe();
+        recipe.extensions = declared;
+        let params = DelegateParams {
+            extensions: filter.map(|f| f.into_iter().map(String::from).collect()),
+            provider: Some(parent_provider.get_name().to_string()),
+            model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+        Ok(client
+            .build_task_config(&params, &mut recipe, &session)
+            .await?
+            .extensions)
+    }
+
+    fn names(exts: &[ExtensionConfig]) -> Vec<String> {
+        exts.iter().map(|e| e.name()).collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_declared_extensions_replace_parent() {
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+        let declared = vec![
+            subagent_policy_platform("developer", &["tree", "read_image"]),
+            subagent_policy_platform("todo", &[]),
+        ];
+        let got = subagent_policy_resolve(Some(declared.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(got, declared); // available_tools preserved, summon NOT inherited
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_filter_only_narrows_declared() {
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+        let declared = vec![
+            subagent_policy_platform("developer", &["tree"]),
+            subagent_policy_platform("todo", &[]),
+        ];
+        let got = subagent_policy_resolve(Some(declared), Some(vec!["developer", "summon"]))
+            .await
+            .unwrap();
+        assert_eq!(got, vec![subagent_policy_platform("developer", &["tree"])]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_undeclared_inherits_parent_when_unconfigured() {
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+        let got = subagent_policy_resolve(None, None).await.unwrap();
+        assert_eq!(names(&got), vec!["summon", "developer"]);
+    }
+
+    fn subagent_policy_write_default(dir: &TempDir, body: &str) -> &'static str {
+        let p = dir.path().join("unscoped.yaml");
+        fs::write(&p, body).unwrap();
+        Box::leak(p.to_str().unwrap().to_string().into_boxed_str())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_unscoped_gets_default_recipe_extensions() {
+        let d = TempDir::new().unwrap();
+        let p = subagent_policy_write_default(
+            &d,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: u\nextensions:\n  - type: platform\n    name: developer\n    available_tools: [tree]\n",
+        );
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+        let got = subagent_policy_resolve(None, None).await.unwrap();
+        assert_eq!(got, vec![subagent_policy_platform("developer", &["tree"])]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_declared_recipe_ignores_default() {
+        let d = TempDir::new().unwrap();
+        let p = subagent_policy_write_default(
+            &d,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: u\nextensions:\n  - type: platform\n    name: todo\n",
+        );
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+        let declared = vec![subagent_policy_platform("developer", &[])];
+        let got = subagent_policy_resolve(Some(declared.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(got, declared);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_missing_default_recipe_fails_closed() {
+        let _env = env_lock::lock_env([(
+            "GOOSE_SUBAGENT_DEFAULT_RECIPE",
+            Some("/nonexistent/unscoped.yaml"),
+        )]);
+        let err = subagent_policy_resolve(None, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("GOOSE_SUBAGENT_DEFAULT_RECIPE"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_default_recipe_without_extensions_fails_closed() {
+        let d = TempDir::new().unwrap();
+        let p = subagent_policy_write_default(
+            &d,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: u\n",
+        );
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+        let err = subagent_policy_resolve(None, None).await.unwrap_err();
+        assert!(err.to_string().contains("declares no extensions"), "{err}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_default_recipe_tilde_expanded() {
+        let fake_home = TempDir::new().unwrap();
+        let unscoped_path = fake_home.path().join("unscoped.yaml");
+        fs::write(
+            &unscoped_path,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: u\nextensions:\n  - type: platform\n    name: developer\n    available_tools: [tree]\n",
+        )
+        .unwrap();
+
+        let home_str: &'static str = Box::leak(
+            fake_home
+                .path()
+                .to_str()
+                .unwrap()
+                .to_string()
+                .into_boxed_str(),
+        );
+        let _env = env_lock::lock_env([
+            ("HOME", Some(home_str)),
+            ("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some("~/unscoped.yaml")),
+        ]);
+
+        let got = subagent_policy_resolve(None, None).await.unwrap();
+        assert_eq!(got, vec![subagent_policy_platform("developer", &["tree"])]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_unscoped_delegate_gets_default_recipe_instructions() {
+        let d = TempDir::new().unwrap();
+        let p = subagent_policy_write_default(
+            &d,
+            "version: 1.0.0\ntitle: U\ndescription: U\ninstructions: READ-ONLY DELEGATE\nextensions:\n  - type: platform\n    name: developer\n",
+        );
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+
+        let parent_provider = providers::create("openai", Vec::new()).await.unwrap();
+        let mut context = create_test_context();
+        context.provider = Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&parent_provider))));
+        let client = SummonClient::new(context).unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let session = crate::session::Session {
+            provider_name: Some(parent_provider.get_name().to_string()),
+            model_config: Some(goose_providers::model::ModelConfig::new("test-model")),
+            working_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let params = DelegateParams {
+            provider: Some(parent_provider.get_name().to_string()),
+            model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+
+        // 1. Ad-hoc delegate (declares no extensions): effective instructions contain default instructions
+        let mut adhoc_recipe = empty_recipe();
+        client
+            .build_task_config(&params, &mut adhoc_recipe, &session)
+            .await
+            .unwrap();
+        assert!(
+            adhoc_recipe
+                .instructions
+                .as_deref()
+                .unwrap_or_default()
+                .contains("READ-ONLY DELEGATE"),
+            "ad-hoc delegate instructions should contain default recipe instructions"
+        );
+
+        // 2. Declared-extensions recipe: instructions do NOT contain default instructions
+        let mut declared_recipe = empty_recipe();
+        declared_recipe.extensions = Some(vec![subagent_policy_platform("developer", &[])]);
+        declared_recipe.instructions = Some("CUSTOM INSTRUCTIONS".to_string());
+
+        client
+            .build_task_config(&params, &mut declared_recipe, &session)
+            .await
+            .unwrap();
+        assert_eq!(
+            declared_recipe.instructions.as_deref(),
+            Some("CUSTOM INSTRUCTIONS"),
+            "declared-extensions recipe instructions should not be modified by default recipe"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subagent_policy_delegate_tool_description_reflects_default_recipe() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        // 1. Unset: upstream text
+        {
+            let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", None::<&str>)]);
+            let tool = client.create_delegate_tool();
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains("Work (writes): partition files strictly"),
+                "unset description should match upstream"
+            );
+            assert!(
+                !desc.contains("are read-only"),
+                "unset description should not mention read-only defaults"
+            );
+        }
+
+        // 2. Set: notes that delegates without a source are read-only
+        {
+            let d = TempDir::new().unwrap();
+            let p = subagent_policy_write_default(
+                &d,
+                "version: 1.0.0\ntitle: U\ndescription: U\nextensions:\n  - type: platform\n    name: developer\n",
+            );
+            let _env = env_lock::lock_env([("GOOSE_SUBAGENT_DEFAULT_RECIPE", Some(p))]);
+            let tool = client.create_delegate_tool();
+            let desc = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                !desc.contains("Work (writes): partition files strictly"),
+                "set description should replace the upstream write guidance"
+            );
+            assert!(
+                desc.contains(
+                    "Delegates without a source (and agent .md sources that declare no extensions) are read-only"
+                ),
+                "set description should inform model that unscoped delegates are read-only"
+            );
+            assert!(
+                desc.contains(
+                    "Write work must go to a source whose recipe grants write tools (e.g. an implementer role)"
+                ),
+                "set description should inform model where write work goes"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn subagent_policy_roles_dir_invalid_recipe_fails_closed_without_shadowing() {
+        let roles = TempDir::new().unwrap();
+        let wd = TempDir::new().unwrap();
+        // Invalid YAML in the roles dir
+        fs::write(
+            roles.path().join("code-reviewer.yaml"),
+            "not: [a, valid: recipe",
+        )
+        .unwrap();
+
+        // Local impostor in .claude/agents
+        fs::create_dir_all(wd.path().join(".claude/agents")).unwrap();
+        fs::write(
+            wd.path().join(".claude/agents/cr.md"),
+            "---\nname: code-reviewer\ndescription: local impostor\n---\nimpostor",
+        )
+        .unwrap();
+
+        let roles_dir: &'static str =
+            Box::leak(roles.path().to_str().unwrap().to_string().into_boxed_str());
+        let _env = env_lock::lock_env([("GOOSE_SUBAGENT_ROLES_DIR", Some(roles_dir))]);
+
+        let sources = discover_filesystem_sources(wd.path());
+        let hit = sources.iter().find(|s| s.name == "code-reviewer");
+        assert!(
+            hit.is_none(),
+            "invalid role in roles dir must fail closed and block local impostor, but found: {:?}",
+            hit
+        );
     }
 }
