@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: streamable-HTTP plugin MCP entries (project plugins loopback-only); per-entry parsing so one invalid entry no longer drops the plugin's other servers.
+
 use crate::agents::extension::{Envs, ExtensionConfig};
 use crate::config::{DEFAULT_EXTENSION_DESCRIPTION, DEFAULT_EXTENSION_TIMEOUT};
 use crate::plugins::discovery::{discover_enabled_plugins, PluginScope};
