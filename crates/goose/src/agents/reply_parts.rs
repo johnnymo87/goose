@@ -353,6 +353,53 @@ pub(crate) fn prepare_tools_for_provider(
     }
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Keeps a provider stream polled while its consumer is busy elsewhere.
+///
+/// The legacy agent loop runs tools between polls of the provider stream. HTTP
+/// read timeouts count time the body sits unpolled: reqwest resets its deadline
+/// after each frame and checks it before reading the next one, so a tool that
+/// outlasts the timeout fails the rest of a response the server already sent.
+/// Reading ahead on a separate task keeps the body drained.
+pub(crate) fn read_ahead(stream: MessageStream, session_id: String) -> MessageStream {
+    use tracing::Instrument;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let forwarder = tokio::spawn(
+        crate::session_context::with_session_id(Some(session_id), async move {
+            let mut stream = stream;
+            while let Some(item) = stream.next().await {
+                if tx.send(item).is_err() {
+                    break;
+                }
+            }
+        })
+        .in_current_span(),
+    );
+
+    Box::pin(futures::stream::unfold(
+        (rx, AbortOnDrop(forwarder)),
+        |(mut rx, mut forwarder)| async move {
+            if let Some(item) = rx.recv().await {
+                return Some((item, (rx, forwarder)));
+            }
+            if let Err(error) = (&mut forwarder.0).await {
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+            }
+            None
+        },
+    ))
+}
+
 #[tracing::instrument(
     skip(provider, model_config, session_id, system_prompt, messages, tools, toolshim_tools),
     fields(
@@ -1047,6 +1094,68 @@ mod tests {
     use rmcp::object;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_ahead_drops_the_provider_stream_when_dropped() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let pending: MessageStream = Box::pin(futures::stream::pending().map(move |item| {
+            let _ = &flag;
+            item
+        }));
+
+        let stream = read_ahead(pending, "session".to_string());
+        tokio::task::yield_now().await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        drop(stream);
+        for _ in 0..100 {
+            if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("dropping the read-ahead stream must drop the provider stream");
+    }
+
+    #[tokio::test]
+    async fn read_ahead_keeps_the_session_id_while_polling() {
+        let inner: MessageStream = Box::pin(
+            futures::stream::poll_fn(|_| {
+                std::task::Poll::Ready(Some(Ok((
+                    Some(Message::assistant().with_text(
+                        crate::session_context::current_session_id().unwrap_or_default(),
+                    )),
+                    None,
+                ))))
+            })
+            .take(1),
+        );
+
+        let items: Vec<_> = read_ahead(inner, "read-ahead-session".to_string())
+            .collect()
+            .await;
+
+        let (message, _) = items.into_iter().next().unwrap().unwrap();
+        assert_eq!(message.unwrap().as_concat_text(), "read-ahead-session");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "provider stream panicked")]
+    async fn read_ahead_propagates_a_provider_stream_panic() {
+        let inner: MessageStream = Box::pin(futures::stream::poll_fn(
+            |_| -> std::task::Poll<Option<_>> { panic!("provider stream panicked") },
+        ));
+        let _ = read_ahead(inner, "session".to_string()).next().await;
+    }
 
     #[derive(Clone)]
     struct GenAiTracingProvider;
