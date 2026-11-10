@@ -3187,7 +3187,7 @@ impl Agent {
                     break;
                 }
 
-                let mut stream = crate::agents::reply_parts::stream_response_from_provider(
+                let stream = crate::agents::reply_parts::stream_response_from_provider(
                     self.provider().await?,
                     model_config.clone(),
                     &session_config.id,
@@ -3196,6 +3196,7 @@ impl Agent {
                     &tools,
                     &toolshim_tools,
                 ).await?;
+                let mut stream = crate::agents::reply_parts::read_ahead(stream, session_config.id.clone());
                 last_assistant_text.clear();
 
                 let current_turn_tool_count = conversation.messages().iter()
@@ -4643,6 +4644,199 @@ mod tests {
 
         assert_eq!(first.content[0].as_text().unwrap().text, "first");
         assert_eq!(second.content[0].as_text().unwrap().text, "second");
+    }
+
+    struct SlowToolClient(std::time::Duration);
+
+    #[async_trait::async_trait]
+    impl McpClientTrait for SlowToolClient {
+        async fn list_tools(
+            &self,
+            _session_id: &str,
+            _next_cursor: Option<String>,
+            _cancellation_token: CancellationToken,
+        ) -> std::result::Result<rmcp::model::ListToolsResult, McpClientError> {
+            Ok(rmcp::model::ListToolsResult::with_all_items(vec![
+                Tool::new(
+                    "wait".to_string(),
+                    "Wait a while".to_string(),
+                    Arc::new(serde_json::Map::new()),
+                ),
+            ]))
+        }
+
+        async fn call_tool(
+            &self,
+            _ctx: &ToolCallContext,
+            _name: &str,
+            _arguments: Option<rmcp::model::JsonObject>,
+            _cancellation_token: CancellationToken,
+        ) -> std::result::Result<CallToolResult, McpClientError> {
+            tokio::time::sleep(self.0).await;
+            Ok(CallToolResult::success(vec![ContentBlock::text("waited")]))
+        }
+
+        fn get_info(&self) -> Option<&rmcp::model::InitializeResult> {
+            None
+        }
+    }
+
+    /// Streams its first response over real HTTP with a reqwest `read_timeout`
+    /// shorter than the tool's run time: one chunk carrying the tool call, then
+    /// a second chunk (usage) that the server sends right away. reqwest checks
+    /// the read deadline before it polls the buffered body, so a consumer that
+    /// leaves the body unpolled for longer than the timeout gets a decode error.
+    struct ReadTimeoutProvider {
+        url: String,
+        read_timeout: std::time::Duration,
+        call_count: AtomicUsize,
+    }
+
+    impl ReadTimeoutProvider {
+        async fn start(read_timeout: std::time::Duration) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n5\r\ntool\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                socket.write_all(b"5\r\nstop\n\r\n0\r\n\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+                let _ = socket.read(&mut request).await;
+            });
+            Self {
+                url,
+                read_timeout,
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for ReadTimeoutProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            if self.call_count.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(stream_from_single_message(
+                    Message::assistant().with_text("done"),
+                    usage,
+                ));
+            }
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .read_timeout(self.read_timeout)
+                .build()
+                .unwrap();
+            let response = client
+                .get(&self.url)
+                .send()
+                .await
+                .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            Ok(Box::pin(response.bytes_stream().map(move |chunk| {
+                let chunk = chunk.map_err(ProviderError::stream_decode_error)?;
+                if chunk.starts_with(b"tool") {
+                    Ok((
+                        Some(Message::assistant().with_tool_request(
+                            "slow-call",
+                            Ok(CallToolRequestParams::new("slow__wait")),
+                        )),
+                        None,
+                    ))
+                } else {
+                    Ok((None, Some(usage.clone())))
+                }
+            })))
+        }
+
+        fn get_name(&self) -> &str {
+            "read-timeout"
+        }
+
+        async fn get_context_limit(&self, _model: &str, _override_limit: Option<usize>) -> usize {
+            100_000
+        }
+    }
+
+    async fn run_tool_longer_than_provider_read_timeout(state_machine: bool) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let provider =
+            Arc::new(ReadTimeoutProvider::start(std::time::Duration::from_millis(500)).await);
+        let (agent, session_id) = create_test_agent(
+            temp_dir.path().join("data"),
+            crate::hooks::HookManager::from_plugins_for_test(vec![]),
+            provider.clone(),
+        )
+        .await?;
+        agent
+            .extension_manager
+            .add_client(
+                platform_extension("slow"),
+                Arc::new(SlowToolClient(std::time::Duration::from_millis(1500))),
+                None,
+            )
+            .await;
+
+        let mut stream = agent
+            .reply(
+                Message::user().with_text("run the slow tool"),
+                SessionConfig {
+                    id: session_id,
+                    schedule_id: None,
+                    max_turns: Some(10),
+                    retry_config: None,
+                },
+                state_machine,
+                None,
+            )
+            .await?;
+        let mut texts = Vec::new();
+        let mut tool_ran = false;
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::Message(message) = event? {
+                tool_ran |= message.as_concat_text().contains("waited")
+                    || message
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, MessageContent::ToolResponse(_)));
+                texts.push(message.as_concat_text());
+            }
+        }
+
+        assert!(tool_ran, "the slow tool should have run");
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("Network error") || t.contains("Please resend")),
+            "a tool outlasting the read timeout must not surface a network error: {texts:?}"
+        );
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_tool_longer_than_provider_read_timeout_is_not_a_network_error() -> Result<()> {
+        run_tool_longer_than_provider_read_timeout(false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_machine_tool_longer_than_provider_read_timeout_is_not_a_network_error(
+    ) -> Result<()> {
+        run_tool_longer_than_provider_read_timeout(true).await
     }
 
     #[tokio::test]
