@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: list_sessions_matching sorts and limits on ids before fetching full rows; expose pool for session storage inspection.
+// Modified by Jonathan Mohrbacher, 2026: list_sessions_matching sorts and limits on ids before fetching full rows; expose pool for session storage inspection; register parent links for provider headers.
 use crate::config::paths::Paths;
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageMetadata, MessageUsage, TokenState};
@@ -210,7 +210,16 @@ impl<'a> SessionUpdateBuilder<'a> {
     }
 
     pub async fn apply(self) -> Result<()> {
-        self.session_manager.apply_update_inner(self).await
+        let parent_link = self
+            .parent_session_id
+            .clone()
+            .map(|parent| (self.session_id.clone(), parent));
+        self.session_manager.apply_update_inner(self).await?;
+        // Providers name a subagent's parent in request headers (session_context).
+        if let Some((session_id, parent)) = parent_link {
+            crate::session_context::set_parent_session(&session_id, parent.as_deref());
+        }
+        Ok(())
     }
 
     pub fn user_provided_name(mut self, name: impl Into<String>) -> Self {
@@ -430,9 +439,13 @@ impl SessionManager {
         session_type: SessionType,
         goose_mode: GooseMode,
     ) -> Result<Session> {
-        self.storage
+        let session = self
+            .storage
             .create_session(working_dir, name, session_type, goose_mode)
-            .await
+            .await?;
+        // Session ids can be reused after a delete; never let a new session inherit a parent.
+        crate::session_context::set_parent_session(&session.id, None);
+        Ok(session)
     }
 
     pub async fn get_session(&self, id: &str, include_messages: bool) -> Result<Session> {
@@ -851,8 +864,16 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for Session {
             .flatten()
             .and_then(message_timestamp_to_datetime);
 
+        let id: String = row.try_get("id")?;
+        let parent_session_id: Option<String> = row.try_get("parent_session_id").ok().flatten();
+        // A child loaded from storage (after a restart, or by a path that did not link it in
+        // this process) still names its parent in provider headers.
+        if let Some(parent) = &parent_session_id {
+            crate::session_context::set_parent_session(&id, Some(parent));
+        }
+
         Ok(Session {
-            id: row.try_get("id")?,
+            id,
             working_dir: PathBuf::from(row.try_get::<String, _>("working_dir")?),
             name,
             user_set_name,
@@ -897,7 +918,7 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for Session {
                 .unwrap_or_default(),
             archived_at: row.try_get("archived_at").ok(),
             project_id: row.try_get("project_id").ok().flatten(),
-            parent_session_id: row.try_get("parent_session_id").ok().flatten(),
+            parent_session_id,
             last_message_snippet: None,
         })
     }
@@ -4864,6 +4885,50 @@ mod tests {
         insert_usage_ledger_row(&mut tx, session_id, None, usage).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parent_link_is_visible_to_providers() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let parent = new_session(&sm).await;
+        let child = new_session(&sm).await;
+        sm.update(&child)
+            .parent_session_id(Some(parent.clone()))
+            .apply()
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::session_context::parent_session_id(&child),
+            Some(parent.clone())
+        );
+        sm.update(&child)
+            .parent_session_id(None)
+            .apply()
+            .await
+            .unwrap();
+        assert_eq!(crate::session_context::parent_session_id(&child), None);
+
+        // Loaded from storage by a process that never linked it.
+        sm.update(&child)
+            .parent_session_id(Some(parent.clone()))
+            .apply()
+            .await
+            .unwrap();
+        crate::session_context::set_parent_session(&child, None);
+        sm.get_session(&child, false).await.unwrap();
+        assert_eq!(
+            crate::session_context::parent_session_id(&child),
+            Some(parent.clone())
+        );
+
+        // Ids are reused after deleting the newest session; the reuser has no parent.
+        let victim = new_session(&sm).await;
+        crate::session_context::set_parent_session(&victim, Some(&parent));
+        sm.delete_session(&victim).await.unwrap();
+        let fresh = new_session(&sm).await;
+        assert_eq!(fresh, victim);
+        assert_eq!(crate::session_context::parent_session_id(&fresh), None);
     }
 
     #[tokio::test]
