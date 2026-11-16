@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: list_sessions_matching sorts and limits on ids before fetching full rows; expose pool for session storage inspection.
+// Modified by Jonathan Mohrbacher, 2026: list_sessions_matching sorts and limits on ids before fetching full rows; expose pool for session storage inspection; register parent links for provider headers.
 use crate::config::paths::Paths;
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageMetadata, MessageUsage, TokenState};
@@ -210,7 +210,16 @@ impl<'a> SessionUpdateBuilder<'a> {
     }
 
     pub async fn apply(self) -> Result<()> {
-        self.session_manager.apply_update_inner(self).await
+        let parent_link = self
+            .parent_session_id
+            .clone()
+            .map(|parent| (self.session_id.clone(), parent));
+        self.session_manager.apply_update_inner(self).await?;
+        // Providers name a subagent's parent in request headers (session_context).
+        if let Some((session_id, parent)) = parent_link {
+            crate::session_context::set_parent_session(&session_id, parent.as_deref());
+        }
+        Ok(())
     }
 
     pub fn user_provided_name(mut self, name: impl Into<String>) -> Self {
@@ -4864,6 +4873,29 @@ mod tests {
         insert_usage_ledger_row(&mut tx, session_id, None, usage).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parent_link_is_visible_to_providers() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let parent = new_session(&sm).await;
+        let child = new_session(&sm).await;
+        sm.update(&child)
+            .parent_session_id(Some(parent.clone()))
+            .apply()
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::session_context::parent_session_id(&child),
+            Some(parent.clone())
+        );
+        sm.update(&child)
+            .parent_session_id(None)
+            .apply()
+            .await
+            .unwrap();
+        assert_eq!(crate::session_context::parent_session_id(&child), None);
     }
 
     #[tokio::test]
