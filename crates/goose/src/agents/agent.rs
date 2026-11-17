@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session; per-session turn-error slot set by failing turn paths.
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session; per-session turn-error slot set by failing turn paths; deliver subdirectory hints into last successful tool response instead of system prompt extras.
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3791,11 +3791,6 @@ impl Agent {
                 }
                 can_drain_pending_steers = true;
 
-                self.prompt_manager
-                    .lock()
-                    .await
-                    .load_subdirectory_hints(&session.working_dir);
-
                 // An empty provider response — no tool calls, no text, and no error
                 // or recovery compaction that legitimately produces no assistant
                 // output — must never be persisted: strict providers reject a
@@ -4024,6 +4019,19 @@ impl Agent {
                         preferred_turn_usage_message_id.as_deref(),
                     ) {
                         yield AgentEvent::MessageUsage { message_id, usage };
+                    }
+                }
+
+                {
+                    let mut prompt_manager = self.prompt_manager.lock().await;
+                    let hints = prompt_manager.load_subdirectory_hints(&session.working_dir);
+                    if !hints.is_empty() {
+                        let undelivered = crate::agents::prompt_manager::deliver_subdirectory_hints(
+                            &mut messages_to_add,
+                            hints,
+                            &conversation,
+                        );
+                        prompt_manager.set_pending_subdirectory_hints(undelivered);
                     }
                 }
 
@@ -7575,5 +7583,189 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             "extensions should load in parallel (~1s), but took {:?}",
             elapsed
         );
+    }
+
+    struct SubdirHintTestProvider {
+        recorded_calls: tokio::sync::Mutex<Vec<(String, Vec<Message>)>>,
+        target_path: String,
+    }
+
+    impl SubdirHintTestProvider {
+        fn new(target_path: String) -> Self {
+            Self {
+                recorded_calls: tokio::sync::Mutex::new(Vec::new()),
+                target_path,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for SubdirHintTestProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            system_prompt: &str,
+            messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let mut recorded = self.recorded_calls.lock().await;
+            let call_index = recorded.len();
+            recorded.push((system_prompt.to_string(), messages.to_vec()));
+            drop(recorded);
+
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            match call_index {
+                0 => {
+                    let tool_call = rmcp::model::CallToolRequestParams::new("developer__shell")
+                        .with_arguments(
+                            rmcp::object!({ "command": format!("ls {}", self.target_path) }),
+                        );
+                    let message = Message::assistant().with_tool_request("call_1", Ok(tool_call));
+                    Ok(stream_from_single_message(message, usage))
+                }
+                1 => {
+                    let message = Message::assistant().with_text("File checked.");
+                    Ok(stream_from_single_message(message, usage))
+                }
+                _ => {
+                    let message = Message::assistant().with_text("Turn 2 finished.");
+                    Ok(stream_from_single_message(message, usage))
+                }
+            }
+        }
+
+        fn get_name(&self) -> &str {
+            "mock-subdir-hint-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subdirectory_hints_delivered_in_conversation_across_turns() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let working_dir = temp_dir.path().canonicalize()?;
+        let sub_dir = working_dir.join("sub");
+        std::fs::create_dir(&sub_dir)?;
+        let test_file = sub_dir.join("test.txt");
+        std::fs::write(&test_file, "sample text")?;
+        std::fs::write(sub_dir.join("AGENTS.md"), "SUBDIR_HINT_SECRET_INSTRUCTION")?;
+
+        let session_data_dir = tempfile::tempdir()?;
+        let session_manager = Arc::new(SessionManager::new(session_data_dir.path().to_path_buf()));
+        let permission_manager = Arc::new(PermissionManager::new(
+            session_data_dir.path().to_path_buf(),
+        ));
+        let config = AgentConfig::new(
+            session_manager.clone(),
+            permission_manager,
+            None,
+            GooseMode::Auto,
+            true,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        let session = session_manager
+            .create_session(
+                working_dir.clone(),
+                "test-hints".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await?;
+        let session_id = session.id.clone();
+
+        let provider = Arc::new(SubdirHintTestProvider::new(
+            test_file.to_str().unwrap().to_string(),
+        ));
+        agent
+            .update_provider(
+                provider.clone(),
+                goose_providers::model::ModelConfig::new("mock-model"),
+                &session_id,
+            )
+            .await?;
+        agent
+            .add_extension(persisted_builtin("developer"), &session_id)
+            .await?;
+
+        let session_config = SessionConfig {
+            id: session_id.clone(),
+            schedule_id: None,
+            max_turns: Some(5),
+            retry_config: None,
+        };
+        let reply_stream = agent
+            .reply(
+                Message::user().with_text("Inspect the file"),
+                session_config.clone(),
+                false,
+                None,
+            )
+            .await?;
+        tokio::pin!(reply_stream);
+        while let Some(event) = reply_stream.next().await {
+            let _ = event?;
+        }
+
+        let reply_stream2 = agent
+            .reply(
+                Message::user().with_text("Continue work"),
+                session_config,
+                false,
+                None,
+            )
+            .await?;
+        tokio::pin!(reply_stream2);
+        while let Some(event) = reply_stream2.next().await {
+            let _ = event?;
+        }
+
+        let calls = provider.recorded_calls.lock().await;
+        assert!(
+            calls.len() >= 3,
+            "expected at least 3 provider calls, got {}",
+            calls.len()
+        );
+
+        let system_prompt_turn1 = &calls[0].0;
+        let system_prompt_turn2 = &calls[2].0;
+
+        assert!(
+            !system_prompt_turn1.contains("SUBDIR_HINT_SECRET_INSTRUCTION"),
+            "Turn 1 system prompt must not contain subdirectory hints"
+        );
+        assert!(
+            !system_prompt_turn2.contains("SUBDIR_HINT_SECRET_INSTRUCTION"),
+            "Turn 2 system prompt must not contain subdirectory hints"
+        );
+        assert_eq!(
+            system_prompt_turn1, system_prompt_turn2,
+            "System prompt must remain identical across turns"
+        );
+
+        let turn2_messages = &calls[2].1;
+        let marker = format!("<subdirectory-hints dir=\"{}\">", sub_dir.display());
+        let mut marker_count = 0;
+        for msg in turn2_messages {
+            for content in &msg.content {
+                if let MessageContent::ToolResponse(tr) = content {
+                    if let Ok(res) = &tr.tool_result {
+                        for block in &res.content {
+                            if let rmcp::model::ContentBlock::Text(t) = block {
+                                if t.text.contains(&marker) {
+                                    marker_count += 1;
+                                    assert!(t.text.contains("SUBDIR_HINT_SECRET_INSTRUCTION"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            marker_count, 1,
+            "marker should appear exactly once in tool response on turn 2"
+        );
+
+        Ok(())
     }
 }
