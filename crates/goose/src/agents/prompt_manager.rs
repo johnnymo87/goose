@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: subdirectory hints excluded from system prompt extras and delivered in conversation.
+// Modified by Jonathan Mohrbacher, 2026: subdirectory hints excluded from system prompt extras and delivered in conversation; assistant-only audience; requeue delivered hints on history replacement.
 #[cfg(test)]
 use chrono::DateTime;
 use chrono::Utc;
@@ -23,6 +23,7 @@ pub struct PromptManager {
     current_date_timestamp: String,
     subdirectory_hint_tracker: SubdirectoryHintTracker,
     pending_subdirectory_hints: Vec<(String, String)>,
+    pub delivered_subdirectory_hints: IndexMap<String, String>,
 }
 
 impl Default for PromptManager {
@@ -191,6 +192,7 @@ impl PromptManager {
             current_date_timestamp: Utc::now().format("%Y-%m-%d %H:00 %:z").to_string(),
             subdirectory_hint_tracker: SubdirectoryHintTracker::new(),
             pending_subdirectory_hints: Vec::new(),
+            delivered_subdirectory_hints: IndexMap::new(),
         }
     }
 
@@ -202,6 +204,7 @@ impl PromptManager {
             current_date_timestamp: dt.format("%Y-%m-%d %H:%M:%S %:z").to_string(),
             subdirectory_hint_tracker: SubdirectoryHintTracker::new(),
             pending_subdirectory_hints: Vec::new(),
+            delivered_subdirectory_hints: IndexMap::new(),
         }
     }
 
@@ -236,6 +239,26 @@ impl PromptManager {
 
     pub fn pending_subdirectory_hints(&self) -> &[(String, String)] {
         &self.pending_subdirectory_hints
+    }
+
+    pub fn delivered_subdirectory_hints(&self) -> &IndexMap<String, String> {
+        &self.delivered_subdirectory_hints
+    }
+
+    pub fn mark_hint_delivered(&mut self, key: String, content: String) {
+        self.delivered_subdirectory_hints.insert(key, content);
+    }
+
+    pub fn requeue_after_history_replacement(&mut self) {
+        for (key, content) in std::mem::take(&mut self.delivered_subdirectory_hints) {
+            if !self
+                .pending_subdirectory_hints
+                .iter()
+                .any(|(k, _)| k == &key)
+            {
+                self.pending_subdirectory_hints.push((key, content));
+            }
+        }
     }
 
     pub fn build_system_prompt(
@@ -289,14 +312,23 @@ pub fn format_marker_close() -> &'static str {
 }
 
 pub fn format_subdirectory_hint(dir: &str, content: &str) -> String {
+    let hint_source = crate::hints::get_context_filenames()
+        .into_iter()
+        .find(|name| std::path::Path::new(dir).join(name).is_file())
+        .map(|name| format!("{dir}/{name}"))
+        .unwrap_or_else(|| format!("{dir}/AGENTS.md"));
+
     format!(
-        "Directory-specific instructions for files under {dir}:\n<subdirectory-hints dir=\"{dir}\">\n{}\n</subdirectory-hints>",
+        "Repository instructions from {hint_source}, which apply to files under {dir}:\n<subdirectory-hints dir=\"{dir}\">\n{}\n</subdirectory-hints>",
         content.trim()
     )
 }
 
 pub fn conversation_contains_marker(conversation: &Conversation, marker: &str) -> bool {
     for message in conversation.messages() {
+        if !message.is_agent_visible() {
+            continue;
+        }
         for content in &message.content {
             match content {
                 MessageContentBlock::Text(t) if t.text.contains(marker) => return true,
@@ -344,6 +376,15 @@ pub fn deliver_subdirectory_hints(
     hints: Vec<(String, String)>,
     existing: &Conversation,
 ) -> Vec<(String, String)> {
+    deliver_subdirectory_hints_recording(messages_to_add, hints, existing, None)
+}
+
+pub fn deliver_subdirectory_hints_recording(
+    messages_to_add: &mut Conversation,
+    hints: Vec<(String, String)>,
+    existing: &Conversation,
+    delivered_tracker: Option<&mut IndexMap<String, String>>,
+) -> Vec<(String, String)> {
     if hints.is_empty() {
         return Vec::new();
     }
@@ -381,9 +422,20 @@ pub fn deliver_subdirectory_hints(
             })
             .collect();
         let combined = formatted_hints.join("\n\n");
-        tool_result
-            .content
-            .push(rmcp::model::ContentBlock::text(combined));
+        let hint_block = rmcp::model::ContentBlock::Text(
+            rmcp::model::TextContent::new(combined).with_annotations(
+                rmcp::model::Annotations::default()
+                    .with_audience(vec![rmcp::model::Role::Assistant]),
+            ),
+        );
+        tool_result.content.push(hint_block);
+
+        if let Some(tracker) = delivered_tracker {
+            for (key, content) in &candidate_hints {
+                tracker.insert(key.clone(), content.clone());
+            }
+        }
+
         Vec::new()
     } else {
         candidate_hints
@@ -783,7 +835,7 @@ mod tests {
         assert!(delivered.text.contains("</subdirectory-hints>"));
         assert!(delivered
             .text
-            .contains("Directory-specific instructions for files under /repo/sub:"));
+            .contains("Repository instructions from /repo/sub/AGENTS.md, which apply to files under /repo/sub:"));
     }
 
     #[test]
@@ -939,5 +991,129 @@ mod tests {
         let pos_a = delivered.text.find("/repo/a_sub").unwrap();
         let pos_z = delivered.text.find("/repo/z_sub").unwrap();
         assert!(pos_a < pos_z, "hints should be sorted deterministically");
+    }
+
+    #[test]
+    fn test_deliver_subdirectory_hints_not_suppressed_by_non_agent_visible_message() {
+        use goose_providers::conversation::message::{Message, MessageContent};
+        use rmcp::model::{CallToolResult, ContentBlock};
+
+        let mut existing = Conversation::default();
+        // A compacted/hidden message that contains the marker but has agent_visible = false
+        existing.push(
+            Message::user()
+                .with_tool_response(
+                    "call_old",
+                    Ok(CallToolResult::success(vec![
+                        ContentBlock::text("old result"),
+                        ContentBlock::text("<subdirectory-hints dir=\"/repo/sub\">\nold hint\n</subdirectory-hints>"),
+                    ])),
+                )
+                .with_visibility(true, false),
+        );
+
+        let mut messages_to_add = Conversation::default();
+        messages_to_add.push(Message::assistant());
+        messages_to_add.push(Message::user().with_tool_response(
+            "call_new",
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                "new result",
+            )])),
+        ));
+
+        let hints = vec![(
+            "subdir_hints:/repo/sub".to_string(),
+            "Sub instruction".to_string(),
+        )];
+        let undelivered = deliver_subdirectory_hints(&mut messages_to_add, hints, &existing);
+        assert!(
+            undelivered.is_empty(),
+            "hint should be delivered because existing marker is not agent-visible"
+        );
+
+        let new_resp = &messages_to_add.messages()[1];
+        let MessageContent::ToolResponse(tr) = &new_resp.content[0] else {
+            panic!()
+        };
+        let res = tr.tool_result.as_ref().unwrap();
+        assert_eq!(
+            res.content.len(),
+            2,
+            "new tool response must have the hint delivered"
+        );
+    }
+
+    #[test]
+    fn test_requeue_after_history_replacement_moves_delivered_to_pending() {
+        let mut manager = PromptManager::new();
+        manager.mark_hint_delivered(
+            "subdir_hints:/repo/sub".to_string(),
+            "Sub instruction".to_string(),
+        );
+        assert!(manager.pending_subdirectory_hints().is_empty());
+        assert_eq!(manager.delivered_subdirectory_hints().len(), 1);
+
+        manager.requeue_after_history_replacement();
+        assert!(manager.delivered_subdirectory_hints().is_empty());
+        assert_eq!(manager.pending_subdirectory_hints().len(), 1);
+        assert_eq!(
+            manager.pending_subdirectory_hints()[0].0,
+            "subdir_hints:/repo/sub"
+        );
+    }
+
+    #[test]
+    fn test_deliver_subdirectory_hints_audience_projection() {
+        use goose_providers::conversation::message::{Message, MessageContent};
+        use rmcp::model::{CallToolResult, ContentBlock};
+
+        let mut messages_to_add = Conversation::default();
+        messages_to_add.push(Message::user().with_tool_response(
+            "call_1",
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                "tool output",
+            )])),
+        ));
+
+        let hints = vec![(
+            "subdir_hints:/repo/sub".to_string(),
+            "Sub instruction".to_string(),
+        )];
+        let existing = Conversation::default();
+
+        let undelivered = deliver_subdirectory_hints(&mut messages_to_add, hints, &existing);
+        assert!(undelivered.is_empty());
+
+        let msg = &messages_to_add.messages()[0];
+
+        // 1. Survives agent_visible_content()
+        let agent_msg = msg.agent_visible_content();
+        let MessageContent::ToolResponse(ref tr) = agent_msg.content[0] else {
+            panic!()
+        };
+        let res = tr.tool_result.as_ref().unwrap();
+        assert_eq!(
+            res.content.len(),
+            2,
+            "agent_visible_content must retain the hint"
+        );
+        assert!(res.content[1]
+            .as_text()
+            .unwrap()
+            .text
+            .contains("<subdirectory-hints"));
+
+        // 2. Excluded from user_visible_content()
+        let user_msg = msg.user_visible_content();
+        let MessageContent::ToolResponse(ref tr) = user_msg.content[0] else {
+            panic!()
+        };
+        let res = tr.tool_result.as_ref().unwrap();
+        assert_eq!(
+            res.content.len(),
+            1,
+            "user_visible_content must exclude the hint"
+        );
+        assert_eq!(res.content[0].as_text().unwrap().text, "tool output");
     }
 }

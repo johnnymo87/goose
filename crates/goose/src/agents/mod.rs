@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: self-compaction module; turn-error module; export deliver_subdirectory_hints.
+// Modified by Jonathan Mohrbacher, 2026: self-compaction module; turn-error module; export deliver_subdirectory_hints and deliver_subdirectory_hints_recording.
 mod agent;
 pub mod container;
 pub mod execute_commands;
@@ -38,7 +38,9 @@ pub use extension::{ExtensionConfig, ExtensionError};
 pub use extension_manager::ExtensionManager;
 pub use goose_agent::events::AgentEvent;
 pub(crate) use large_response_handler::max_tool_response_size;
-pub use prompt_manager::{deliver_subdirectory_hints, PromptManager};
+pub use prompt_manager::{
+    deliver_subdirectory_hints, deliver_subdirectory_hints_recording, PromptManager,
+};
 #[cfg(feature = "scheduler")]
 pub use schedule_tool::ScheduleTool;
 pub use subagent_handler::SUBAGENT_TOOL_REQUEST_TYPE;

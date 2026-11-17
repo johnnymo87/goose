@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session; per-session turn-error slot set by failing turn paths; deliver subdirectory hints into last successful tool response instead of system prompt extras.
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session; per-session turn-error slot set by failing turn paths; deliver subdirectory hints into last successful tool response instead of system prompt extras; requeue delivered hints across compaction and history replacements.
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2602,6 +2602,7 @@ impl Agent {
                         let updated_conversation = updated_session
                             .conversation
                             .ok_or_else(|| anyhow!("Session has no conversation after history modification"))?;
+                        self.prompt_manager.lock().await.requeue_after_history_replacement();
                         yield AgentEvent::HistoryReplaced(updated_conversation);
                     }
                 }));
@@ -2708,6 +2709,11 @@ impl Agent {
                     )
                     .await;
 
+                self.prompt_manager
+                    .lock()
+                    .await
+                    .requeue_after_history_replacement();
+
                 for event in events {
                     yield event;
                 }
@@ -2755,6 +2761,10 @@ impl Agent {
                         let compacted_conversation = compaction.conversation;
                         session_manager.replace_conversation(&session_config.id, &compacted_conversation).await?;
                         self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), &compaction.usage, Some(compaction.retained_context_tokens)).await?;
+                        self.prompt_manager
+                            .lock()
+                            .await
+                            .requeue_after_history_replacement();
 
                         yield AgentEvent::HistoryReplaced(compacted_conversation.clone());
 
@@ -3056,6 +3066,10 @@ impl Agent {
                                 yield AgentEvent::Message(note_message);
                                 yield AgentEvent::Message(resume_message);
                                 conversation = new_conversation;
+                                self.prompt_manager
+                                    .lock()
+                                    .await
+                                    .requeue_after_history_replacement();
                                 compaction_attempts = 0;
                                 turn_start_compaction_info = super::moim::compute_compaction_info(
                                     &session_config.id,
@@ -3671,6 +3685,10 @@ impl Agent {
                                     self.update_session_metrics(&session_config.id, session_config.schedule_id.clone(), &compaction.usage, Some(compaction.retained_context_tokens)).await?;
                                     conversation = compaction.conversation;
                                     did_recovery_compact_this_iteration = true;
+                                    self.prompt_manager
+                                        .lock()
+                                        .await
+                                        .requeue_after_history_replacement();
                                     yield AgentEvent::HistoryReplaced(conversation.clone());
                                     break;
                                 }
@@ -3886,6 +3904,10 @@ impl Agent {
                                     info!("Retry logic triggered, restarting agent loop");
                                     messages_to_add = Conversation::default();
                                     session_manager.replace_conversation(&session_config.id, &conversation).await?;
+                                    self.prompt_manager
+                                        .lock()
+                                        .await
+                                        .requeue_after_history_replacement();
                                     yield AgentEvent::HistoryReplaced(conversation.clone());
                                 }
                                 Ok(RetryResult::Skipped)
@@ -3978,12 +4000,16 @@ impl Agent {
                                 .collect();
 
                             if matching_ids.len() == 2 {
-                                for id in &matching_ids {
-                                    session_manager.update_message_metadata(&session_config.id, id, |metadata| {
-                                        metadata.with_agent_invisible()
-                                    }).await?;
-                                }
-                                session_manager.add_message(&session_config.id, &summary_msg).await?;
+                                    for id in &matching_ids {
+                                        session_manager.update_message_metadata(&session_config.id, id, |metadata| {
+                                            metadata.with_agent_invisible()
+                                        }).await?;
+                                    }
+                                    session_manager.add_message(&session_config.id, &summary_msg).await?;
+                                    self.prompt_manager
+                                        .lock()
+                                        .await
+                                        .requeue_after_history_replacement();
                             } else {
                                 warn!("Expected a tool request/reply pair, but found {} matching messages",
                                     matching_ids.len());
@@ -4026,10 +4052,11 @@ impl Agent {
                     let mut prompt_manager = self.prompt_manager.lock().await;
                     let hints = prompt_manager.load_subdirectory_hints(&session.working_dir);
                     if !hints.is_empty() {
-                        let undelivered = crate::agents::prompt_manager::deliver_subdirectory_hints(
+                        let undelivered = crate::agents::prompt_manager::deliver_subdirectory_hints_recording(
                             &mut messages_to_add,
                             hints,
                             &conversation,
+                            Some(&mut prompt_manager.delivered_subdirectory_hints),
                         );
                         prompt_manager.set_pending_subdirectory_hints(undelivered);
                     }
@@ -7764,6 +7791,235 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         assert_eq!(
             marker_count, 1,
             "marker should appear exactly once in tool response on turn 2"
+        );
+
+        Ok(())
+    }
+
+    struct CompactionSubdirHintTestProvider {
+        recorded_calls: tokio::sync::Mutex<Vec<(String, Vec<Message>)>>,
+        target_path: String,
+        has_failed_context: AtomicBool,
+    }
+
+    impl CompactionSubdirHintTestProvider {
+        fn new(target_path: String) -> Self {
+            Self {
+                recorded_calls: tokio::sync::Mutex::new(Vec::new()),
+                target_path,
+                has_failed_context: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for CompactionSubdirHintTestProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            system_prompt: &str,
+            messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+
+            // Handle compaction summarization call
+            if system_prompt.contains("Task Context")
+                || messages
+                    .iter()
+                    .any(|m| m.as_concat_text().contains("Please summarize"))
+            {
+                let summary_msg = Message::assistant().with_text("Summary of prior work.");
+                return Ok(stream_from_single_message(summary_msg, usage));
+            }
+
+            let mut recorded = self.recorded_calls.lock().await;
+            let call_index = recorded.len();
+            recorded.push((system_prompt.to_string(), messages.to_vec()));
+            drop(recorded);
+
+            match call_index {
+                0 => {
+                    let tool_call = rmcp::model::CallToolRequestParams::new("developer__shell")
+                        .with_arguments(
+                            rmcp::object!({ "command": format!("ls {}", self.target_path) }),
+                        );
+                    let message = Message::assistant().with_tool_request("call_1", Ok(tool_call));
+                    Ok(stream_from_single_message(message, usage))
+                }
+                1 => {
+                    let message = Message::assistant().with_text("Turn 1 finished.");
+                    Ok(stream_from_single_message(message, usage))
+                }
+                2 => {
+                    // Turn 2: fail with context limit to trigger recovery compaction
+                    self.has_failed_context.store(true, Ordering::SeqCst);
+                    Err(ProviderError::ContextLengthExceeded(
+                        "context length limit exceeded".to_string(),
+                    ))
+                }
+                3 => {
+                    // Turn 3 (after compaction): run tool again
+                    let tool_call = rmcp::model::CallToolRequestParams::new("developer__shell")
+                        .with_arguments(
+                            rmcp::object!({ "command": format!("ls {}", self.target_path) }),
+                        );
+                    let message = Message::assistant().with_tool_request("call_2", Ok(tool_call));
+                    Ok(stream_from_single_message(message, usage))
+                }
+                4 => {
+                    let message =
+                        Message::assistant().with_text("Turn 3 finished after compaction.");
+                    Ok(stream_from_single_message(message, usage))
+                }
+                _ => {
+                    let message = Message::assistant().with_text("Done.");
+                    Ok(stream_from_single_message(message, usage))
+                }
+            }
+        }
+
+        fn get_name(&self) -> &str {
+            "mock-compaction-subdir-hint-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subdirectory_hints_redelivered_after_compaction() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let working_dir = temp_dir.path().canonicalize()?;
+        let sub_dir = working_dir.join("sub");
+        std::fs::create_dir(&sub_dir)?;
+        let test_file = sub_dir.join("test.txt");
+        std::fs::write(&test_file, "sample text")?;
+        std::fs::write(sub_dir.join("AGENTS.md"), "SUBDIR_HINT_SECRET_INSTRUCTION")?;
+
+        let session_data_dir = tempfile::tempdir()?;
+        let session_manager = Arc::new(SessionManager::new(session_data_dir.path().to_path_buf()));
+        let permission_manager = Arc::new(PermissionManager::new(
+            session_data_dir.path().to_path_buf(),
+        ));
+        let config = AgentConfig::new(
+            session_manager.clone(),
+            permission_manager,
+            None,
+            GooseMode::Auto,
+            true,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        let session = session_manager
+            .create_session(
+                working_dir.clone(),
+                "test-hints-compaction".to_string(),
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await?;
+        let session_id = session.id.clone();
+
+        let provider = Arc::new(CompactionSubdirHintTestProvider::new(
+            test_file.to_str().unwrap().to_string(),
+        ));
+        agent
+            .update_provider(
+                provider.clone(),
+                goose_providers::model::ModelConfig::new("mock-model"),
+                &session_id,
+            )
+            .await?;
+        agent
+            .add_extension(persisted_builtin("developer"), &session_id)
+            .await?;
+
+        // Turn 1: tool touches subdir, hint delivered
+        let session_config = SessionConfig {
+            id: session_id.clone(),
+            schedule_id: None,
+            max_turns: Some(5),
+            retry_config: None,
+        };
+        let reply_stream = agent
+            .reply(
+                Message::user().with_text("Inspect the file"),
+                session_config.clone(),
+                false,
+                None,
+            )
+            .await?;
+        tokio::pin!(reply_stream);
+        while let Some(event) = reply_stream.next().await {
+            let _ = event?;
+        }
+
+        // Turn 2: triggers recovery compaction, which hides turn 1 messages and requeues hints
+        let reply_stream2 = agent
+            .reply(
+                Message::user().with_text("Trigger compaction"),
+                session_config.clone(),
+                false,
+                None,
+            )
+            .await?;
+        tokio::pin!(reply_stream2);
+        while let Some(event) = reply_stream2.next().await {
+            let _ = event?;
+        }
+
+        // Turn 3: runs tool again and re-delivers the hint into the post-compaction tool response
+        let reply_stream3 = agent
+            .reply(
+                Message::user().with_text("Inspect file again"),
+                session_config,
+                false,
+                None,
+            )
+            .await?;
+        tokio::pin!(reply_stream3);
+        while let Some(event) = reply_stream3.next().await {
+            let _ = event?;
+        }
+
+        let updated_session = session_manager.get_session(&session_id, true).await?;
+        let conv = updated_session.conversation.unwrap();
+
+        let marker = format!("<subdirectory-hints dir=\"{}\">", sub_dir.display());
+        let mut agent_visible_marker_count = 0;
+        let mut agent_invisible_marker_count = 0;
+
+        for msg in conv.messages() {
+            let contains_marker = msg.content.iter().any(|c| {
+                if let MessageContent::ToolResponse(tr) = c {
+                    if let Ok(res) = &tr.tool_result {
+                        return res.content.iter().any(|block| {
+                            if let rmcp::model::ContentBlock::Text(t) = block {
+                                t.text.contains(&marker)
+                                    && t.text.contains("SUBDIR_HINT_SECRET_INSTRUCTION")
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                }
+                false
+            });
+
+            if contains_marker {
+                if msg.is_agent_visible() {
+                    agent_visible_marker_count += 1;
+                } else {
+                    agent_invisible_marker_count += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            agent_invisible_marker_count, 1,
+            "turn 1 tool response carrying hint should now be hidden/invisible to agent"
+        );
+        assert_eq!(
+            agent_visible_marker_count, 1,
+            "post-compaction tool response must have the hint re-delivered as agent-visible"
         );
 
         Ok(())
