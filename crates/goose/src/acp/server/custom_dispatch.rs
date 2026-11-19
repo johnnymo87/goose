@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: dispatch _goose/unstable/session/settings/set custom method.
+// Modified by Jonathan Mohrbacher, 2026: dispatch _goose/unstable/session/settings/set custom method; dispatch truncate_from_message.
 use super::*;
 use goose_acp_macros::custom_methods;
 
@@ -677,6 +677,15 @@ impl GooseAcpAgent {
         req: TruncateSessionConversationRequest,
     ) -> Result<EmptyResponse, agent_client_protocol::Error> {
         self.on_truncate_session_conversation(req).await
+    }
+
+    #[custom_method(TruncateSessionConversationFromMessageRequest)]
+    async fn dispatch_truncate_session_conversation_from_message(
+        &self,
+        req: TruncateSessionConversationFromMessageRequest,
+    ) -> Result<TruncateSessionConversationFromMessageResponse, agent_client_protocol::Error> {
+        self.on_truncate_session_conversation_from_message(req)
+            .await
     }
 
     #[custom_method(UpdateSessionProjectRequest)]

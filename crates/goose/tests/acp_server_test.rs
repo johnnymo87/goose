@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test; self-compaction over ACP test; reload excludes self_compact_and_resume for recipe response schema; session/prompt reports a failed turn in _meta.goose.turnError.
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set custom method and session/prompt maxTurns; rolling memory settings test; self-compaction over ACP test; reload excludes self_compact_and_resume for recipe response schema; session/prompt reports a failed turn in _meta.goose.turnError; session/prompt messageId and truncate_from_message.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -2595,5 +2595,114 @@ fn test_prompt_turn_error_reports_a_failed_turn_in_meta() {
             succeeded.pointer("/_meta/goose/turnError").is_none(),
             "a clean turn must not carry turnError: {succeeded}"
         );
+    });
+}
+
+#[test]
+#[serial]
+fn test_prompt_message_id_and_truncate_from_message() {
+    run_test(async move {
+        let openai = OpenAiFixture::new(
+            vec![(
+                "what is 1+1".to_string(),
+                include_str!("acp_test_data/openai_basic.txt"),
+            )],
+            Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.to_string();
+
+        let conversation = |session_id: String| {
+            let cx = conn.cx().clone();
+            async move {
+                let exported = send_custom(
+                    &cx,
+                    "_goose/unstable/session/export",
+                    serde_json::json!({ "sessionId": session_id }),
+                )
+                .await
+                .unwrap();
+                let data: serde_json::Value =
+                    serde_json::from_str(exported["data"].as_str().unwrap()).unwrap();
+                data.pointer("/conversation")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        };
+
+        // A malformed id is rejected before the run starts.
+        let bad = send_custom(
+            conn.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "what is 1+1" }],
+                "_meta": { "goose": { "messageId": "" } },
+            }),
+        )
+        .await;
+        assert!(bad.is_err(), "empty messageId must be rejected: {bad:?}");
+
+        let done = send_custom(
+            conn.cx(),
+            "session/prompt",
+            serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "what is 1+1" }],
+                "_meta": { "goose": { "messageId": "msg_honk_test_1" } },
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            done.get("stopReason").and_then(|s| s.as_str()),
+            Some("end_turn")
+        );
+
+        let before = conversation(session_id.clone()).await;
+        assert!(
+            before.len() >= 2,
+            "expected user + assistant rows: {before:?}"
+        );
+        let user = &before[0];
+        assert_eq!(user.get("role").and_then(|r| r.as_str()), Some("user"));
+        assert_eq!(
+            user.get("id").and_then(|i| i.as_str()),
+            Some("msg_honk_test_1"),
+            "client-supplied messageId must be the stored id: {user}"
+        );
+
+        let truncate = |message_id: &'static str| {
+            send_custom(
+                conn.cx(),
+                "_goose/unstable/session/conversation/truncate_from_message",
+                serde_json::json!({ "sessionId": session_id, "messageId": message_id }),
+            )
+        };
+
+        let unknown = truncate("msg_honk_unknown").await.unwrap();
+        assert_eq!(unknown.get("found"), Some(&serde_json::json!(false)));
+        assert_eq!(conversation(session_id.clone()).await.len(), before.len());
+
+        let found = truncate("msg_honk_test_1").await.unwrap();
+        assert_eq!(found.get("found"), Some(&serde_json::json!(true)));
+        assert!(
+            conversation(session_id.clone()).await.is_empty(),
+            "truncating from the first message must remove the whole turn"
+        );
+
+        let again = truncate("msg_honk_test_1").await.unwrap();
+        assert_eq!(again.get("found"), Some(&serde_json::json!(false)));
+
+        let no_session = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/conversation/truncate_from_message",
+            serde_json::json!({ "sessionId": "", "messageId": "x" }),
+        )
+        .await;
+        assert!(no_session.is_err());
     });
 }

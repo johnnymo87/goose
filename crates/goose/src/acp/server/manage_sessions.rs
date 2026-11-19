@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: on_set_session_settings pins session cache TTL and recipe; rolling memory setting in settings/set.
+// Modified by Jonathan Mohrbacher, 2026: on_set_session_settings pins session cache TTL and recipe; rolling memory setting in settings/set; truncate_from_message by message id.
 use super::*;
 
 impl GooseAcpAgent {
@@ -332,6 +332,48 @@ impl GooseAcpAgent {
             .await
             .internal_err()?;
         Ok(EmptyResponse {})
+    }
+
+    pub(super) async fn on_truncate_session_conversation_from_message(
+        &self,
+        req: TruncateSessionConversationFromMessageRequest,
+    ) -> Result<TruncateSessionConversationFromMessageResponse, agent_client_protocol::Error> {
+        let session_id = req.session_id.trim();
+        if session_id.is_empty() {
+            return Err(
+                agent_client_protocol::Error::invalid_params().data("sessionId cannot be empty")
+            );
+        }
+        let message_id = req.message_id.trim();
+        if message_id.is_empty() {
+            return Err(
+                agent_client_protocol::Error::invalid_params().data("messageId cannot be empty")
+            );
+        }
+        // Deleting rows under a running turn would let the turn write its tail after the cut.
+        // The check is not atomic with a prompt arriving next; callers that need that
+        // guarantee (honkd) serialize prompts and truncation themselves.
+        if let Some((run_id, _)) = self.active_runs.agent_run(session_id) {
+            return Err(
+                agent_client_protocol::Error::invalid_request().data(format!(
+                    "session {session_id} has an active run ({run_id}); truncate after it ends"
+                )),
+            );
+        }
+
+        self.session_manager
+            .get_session(session_id, false)
+            .await
+            .map_err(|_| {
+                agent_client_protocol::Error::resource_not_found(Some(session_id.to_string()))
+                    .data(format!("Session not found: {session_id}"))
+            })?;
+        let found = self
+            .session_manager
+            .truncate_conversation_from_message(session_id, message_id)
+            .await
+            .internal_err()?;
+        Ok(TruncateSessionConversationFromMessageResponse { found })
     }
 
     pub(super) async fn on_update_session_project(

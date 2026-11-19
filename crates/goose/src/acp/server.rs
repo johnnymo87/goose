@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: session/prompt _meta.goose.maxTurns bounds the run; session/prompt reports a failed turn in _meta.goose.turnError.
+// Modified by Jonathan Mohrbacher, 2026: session/prompt _meta.goose.maxTurns bounds the run; session/prompt reports a failed turn in _meta.goose.turnError; session/prompt _meta.goose.messageId sets the stored user message id; advertise truncateFromMessage.
 use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 use crate::acp::fs::AcpTools;
@@ -370,6 +370,9 @@ fn meta_string(
 fn agent_capabilities_meta() -> Option<Meta> {
     let mut goose = serde_json::Map::new();
     goose.insert("recipeParameterScopes".to_string(), serde_json::json!({}));
+    // session/prompt honors _meta.goose.messageId, and
+    // _goose/unstable/session/conversation/truncate_from_message exists.
+    goose.insert("truncateFromMessage".to_string(), serde_json::json!(true));
     if cfg!(feature = "local-inference") {
         goose.insert("localInference".to_string(), serde_json::json!({}));
     }
@@ -449,6 +452,28 @@ fn max_turns_from_meta(meta: Option<&Meta>) -> Result<Option<u32>, agent_client_
     }
     Err(agent_client_protocol::Error::invalid_params()
         .data("_meta.goose.maxTurns must be a positive integer"))
+}
+
+/// `_meta.goose.messageId` on `session/prompt`: the id to store the user message under, so
+/// a client can later address it (`_goose/unstable/session/conversation/truncate_from_message`).
+/// The caller owns uniqueness; truncation cuts from the first row with the id.
+fn message_id_from_meta(
+    meta: Option<&Meta>,
+) -> Result<Option<String>, agent_client_protocol::Error> {
+    let Some(value) = meta
+        .and_then(|meta| meta.get("goose"))
+        .and_then(|goose| goose.get("messageId"))
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    match value.as_str().map(str::trim) {
+        Some(id) if !id.is_empty() => Ok(Some(id.to_string())),
+        _ => Err(agent_client_protocol::Error::invalid_params()
+            .data("_meta.goose.messageId must be a non-empty string")),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2321,6 +2346,7 @@ impl GooseAcpAgent {
         args: PromptRequest,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
         let max_turns = max_turns_from_meta(args.meta.as_ref())?;
+        let message_id = message_id_from_meta(args.meta.as_ref())?;
 
         // The ACP session_id IS the thread ID.
         let session_id = args.session_id.0.to_string();
@@ -2370,7 +2396,10 @@ impl GooseAcpAgent {
             return Err(error);
         }
 
-        let user_message = Self::convert_acp_prompt_to_message(&args.prompt);
+        let mut user_message = Self::convert_acp_prompt_to_message(&args.prompt);
+        if let Some(message_id) = message_id {
+            user_message = user_message.with_id(message_id);
+        }
         let use_state_machine = use_state_machine_from_meta(args.meta.as_ref());
         let session_config = SessionConfig {
             id: session_id.clone(),
@@ -3788,6 +3817,59 @@ print(\"hello, world\")
         assert_eq!(
             max_turns_from_meta(Some(&meta_str)).unwrap_err().code,
             agent_client_protocol::ErrorCode::InvalidParams
+        );
+    }
+
+    #[test]
+    fn test_message_id_from_meta() {
+        let meta = |v: serde_json::Value| -> Meta { serde_json::from_value(v).unwrap() };
+        assert_eq!(message_id_from_meta(None).unwrap(), None);
+        assert_eq!(
+            message_id_from_meta(Some(&meta(serde_json::json!({ "other": 1 })))).unwrap(),
+            None
+        );
+        assert_eq!(
+            message_id_from_meta(Some(&meta(serde_json::json!({ "goose": {} })))).unwrap(),
+            None
+        );
+        assert_eq!(
+            message_id_from_meta(Some(&meta(
+                serde_json::json!({ "goose": { "messageId": null } })
+            )))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            message_id_from_meta(Some(&meta(
+                serde_json::json!({ "goose": { "messageId": "msg_honk_1" } })
+            )))
+            .unwrap()
+            .as_deref(),
+            Some("msg_honk_1")
+        );
+        for bad in [
+            serde_json::json!(""),
+            serde_json::json!("   "),
+            serde_json::json!(7),
+        ] {
+            assert_eq!(
+                message_id_from_meta(Some(&meta(
+                    serde_json::json!({ "goose": { "messageId": bad } })
+                )))
+                .unwrap_err()
+                .code,
+                agent_client_protocol::ErrorCode::InvalidParams
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_capabilities_advertise_truncate_from_message() {
+        assert_eq!(
+            agent_capabilities_meta()
+                .and_then(|meta| meta.get("goose").cloned())
+                .and_then(|goose| goose.get("truncateFromMessage").cloned()),
+            Some(serde_json::json!(true))
         );
     }
 
