@@ -1,7 +1,8 @@
 # Adds the aarch64-apple-darwin CLI to an EXISTING patched-* release that was published
 # before patched-release.yml built darwin. The binary is built from the release's own tag,
 # so it is the same source as the Linux assets already on that release; the Linux assets
-# are left untouched and SHA256SUMS is regenerated over every asset.
+# are left untouched and SHA256SUMS is regenerated over every asset. It refuses a release
+# that already has darwin assets.
 #
 # Run: push a tag named darwin-backfill-<release tag>, e.g. darwin-backfill-patched-1.54.0.15,
 # at any commit that has this file (the build checks out the release tag, not the pushed one).
@@ -33,6 +34,14 @@ jobs:
           case "$TAG" in patched-*) ;; *) echo "not a patched-* tag: $TAG" >&2; exit 1 ;; esac
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null
           sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          test -n "$sha"
+          # A Rust build is not reproducible: replacing a darwin asset would break every
+          # pinned hash of it. Refuse rather than clobber; delete the asset by hand to redo.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+              | grep -qx 'goose-aarch64-apple-darwin.tar.gz'; then
+            echo "$TAG already has darwin assets; refusing to replace them" >&2
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
@@ -68,4 +77,5 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir all --pattern 'goose-*'
           cp dist/* all/
           (cd all && sha256sum goose-* > SHA256SUMS && cat SHA256SUMS)
-          gh release upload "$TAG" dist/* all/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
+          gh release upload "$TAG" all/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

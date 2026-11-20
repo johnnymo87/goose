@@ -5,7 +5,7 @@
 # aarch64-apple-darwin tarballs as a release of this fork.
 #
 # A release made before the darwin build was added gets its darwin assets from
-# patched-release-darwin.yml (workflow_dispatch with the tag).
+# patched-release-darwin.yml (push a darwin-backfill-<tag> tag).
 #
 # Run: push a tag named patched-<upstream version>.<n>, e.g. patched-1.54.0.1, on the patched branch.
 # The name must not start with "v": upstream's release.yml and publish-docker.yml fire on v* tags.
