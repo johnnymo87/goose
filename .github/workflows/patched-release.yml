@@ -1,7 +1,11 @@
-# Modified by Jonathan Mohrbacher, 2026: test-patches runs subdirectory hints tests; test-patches runs message id / truncate_from_message tests.
+# Modified by Jonathan Mohrbacher, 2026: test-patches runs subdirectory hints tests; test-patches runs message id / truncate_from_message tests; the release also carries the aarch64-apple-darwin CLI.
 # Builds this branch (an upstream release tag plus a few local patches) with upstream's own
-# Linux CLI build workflow, so the result differs from the upstream release only by the patches,
-# and publishes the gnu tarballs as a release of this fork.
+# Linux CLI build workflow and upstream's macOS bundle workflow (CLI only, unsigned), so the result
+# differs from the upstream release only by the patches, and publishes the gnu tarballs and the
+# aarch64-apple-darwin tarballs as a release of this fork.
+#
+# A release made before the darwin build was added gets its darwin assets from
+# patched-release-darwin.yml (workflow_dispatch with the tag).
 #
 # Run: push a tag named patched-<upstream version>.<n>, e.g. patched-1.54.0.1, on the patched branch.
 # The name must not start with "v": upstream's release.yml and publish-docker.yml fire on v* tags.
@@ -21,6 +25,20 @@ jobs:
     permissions:
       contents: read
     with:
+      ref: ${{ github.sha }}
+
+  # The Mac runs the same patched goose as the Linux hosts (workstation pkgs/goose).
+  # Unsigned: the Nix fetch never sets a quarantine attribute, and the linker's ad-hoc
+  # signature is all Apple Silicon needs to exec a binary.
+  build-macos:
+    uses: ./.github/workflows/bundle-macos.yml
+    permissions:
+      contents: read
+    with:
+      target: aarch64-apple-darwin
+      package_cli: true
+      package_desktop: false
+      signing: false
       ref: ${{ github.sha }}
 
   # Unit tests for the patched code paths (including the vendored acp-http crate), on the same toolchain.
@@ -51,7 +69,7 @@ jobs:
           cargo test --release -p agent-client-protocol-http --features server --lib
 
   release:
-    needs: [build, test-patches]
+    needs: [build, build-macos, test-patches]
     if: ${{ !cancelled() && needs.test-patches.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
@@ -62,6 +80,10 @@ jobs:
           pattern: goose-*-unknown-linux-gnu
           merge-multiple: true
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: goose-aarch64-apple-darwin
+          path: dist
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,6 +91,7 @@ jobs:
         run: |
           ls -la dist
           test -f dist/goose-aarch64-unknown-linux-gnu.tar.gz
+          test -f dist/goose-aarch64-apple-darwin.tar.gz
           (cd dist && sha256sum * > SHA256SUMS)
           gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "$TAG" --notes "Upstream goose v$(echo "$TAG" | sed -E 's/^patched-([0-9]+[.][0-9]+[.][0-9]+).*/\1/') plus the local patches committed after that tag at $GITHUB_SHA."
