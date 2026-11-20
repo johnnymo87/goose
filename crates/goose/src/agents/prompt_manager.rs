@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: subdirectory hints excluded from system prompt extras and delivered in conversation; assistant-only audience; requeue delivered hints on history replacement.
+// Modified by Jonathan Mohrbacher, 2026: subdirectory hints excluded from system prompt extras and delivered in conversation; assistant-only audience; requeue delivered hints on history replacement; requeue hints whose markers left the conversation.
 #[cfg(test)]
 use chrono::DateTime;
 use chrono::Utc;
@@ -247,6 +247,34 @@ impl PromptManager {
 
     pub fn mark_hint_delivered(&mut self, key: String, content: String) {
         self.delivered_subdirectory_hints.insert(key, content);
+    }
+
+    /// Moves every delivered hint whose marker is no longer in the agent-visible conversation
+    /// back to pending. History can shrink without this agent knowing (another connection's
+    /// `truncate_from_message`), so the turn start re-checks what is actually there.
+    pub fn requeue_hints_missing_from(&mut self, conversation: &Conversation) {
+        let missing: Vec<String> = self
+            .delivered_subdirectory_hints
+            .keys()
+            .filter(|key| {
+                !conversation_contains_marker(
+                    conversation,
+                    &format_marker_open(hint_dir_from_key(key)),
+                )
+            })
+            .cloned()
+            .collect();
+        for key in missing {
+            if let Some(content) = self.delivered_subdirectory_hints.shift_remove(&key) {
+                if !self
+                    .pending_subdirectory_hints
+                    .iter()
+                    .any(|(k, _)| k == &key)
+                {
+                    self.pending_subdirectory_hints.push((key, content));
+                }
+            }
+        }
     }
 
     pub fn requeue_after_history_replacement(&mut self) {
@@ -1041,6 +1069,37 @@ mod tests {
             2,
             "new tool response must have the hint delivered"
         );
+    }
+
+    #[test]
+    fn test_requeue_hints_missing_from_requeues_only_missing_markers() {
+        use goose_providers::conversation::message::Message;
+
+        let mut manager = PromptManager::new();
+        manager.mark_hint_delivered("subdir_hints:/repo/kept".to_string(), "Kept".to_string());
+        manager.mark_hint_delivered("subdir_hints:/repo/gone".to_string(), "Gone".to_string());
+
+        let mut conversation = Conversation::default();
+        conversation
+            .push(Message::user().with_text(format_subdirectory_hint("/repo/kept", "Kept")));
+        manager.requeue_hints_missing_from(&conversation);
+
+        assert_eq!(
+            manager
+                .delivered_subdirectory_hints()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["subdir_hints:/repo/kept"]
+        );
+        assert_eq!(
+            manager.pending_subdirectory_hints(),
+            &[("subdir_hints:/repo/gone".to_string(), "Gone".to_string())]
+        );
+
+        // Idempotent: a second pass changes nothing.
+        manager.requeue_hints_missing_from(&conversation);
+        assert_eq!(manager.pending_subdirectory_hints().len(), 1);
+        assert_eq!(manager.delivered_subdirectory_hints().len(), 1);
     }
 
     #[test]

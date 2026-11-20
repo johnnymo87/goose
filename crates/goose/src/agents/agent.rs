@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session; per-session turn-error slot set by failing turn paths; deliver subdirectory hints into last successful tool response instead of system prompt extras; requeue delivered hints across compaction and history replacements.
+// Modified by Jonathan Mohrbacher, 2026: clear_final_output_tool and recipe response clearing; rolling memory turn start fold; self-compaction kind; self-compaction tool availability and dispatch; self-compaction loop execution and turn context refresh; per-run self-compaction cap and shadowing bypass; parallel non-serializing extension loading in load_extensions_from_session; per-session turn-error slot set by failing turn paths; deliver subdirectory hints into last successful tool response instead of system prompt extras; requeue delivered hints across compaction and history replacements; turn start requeues hints missing from the conversation.
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2634,6 +2634,12 @@ impl Agent {
             .conversation
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Session {} has no conversation", session_config.id))?;
+        // History may have been cut since the last turn (truncate_from_message runs on any
+        // connection); hints whose delivery went with it are delivered again.
+        self.prompt_manager
+            .lock()
+            .await
+            .requeue_hints_missing_from(&conversation);
 
         if self.final_output_tool.lock().await.is_some() {
             let provider = self.provider().await?;

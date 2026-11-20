@@ -350,15 +350,14 @@ impl GooseAcpAgent {
                 agent_client_protocol::Error::invalid_params().data("messageId cannot be empty")
             );
         }
-        // Deleting rows under a running turn would let the turn write its tail after the cut.
-        // The check is not atomic with a prompt arriving next; callers that need that
-        // guarantee (honkd) serialize prompts and truncation themselves.
-        if let Some((run_id, _)) = self.active_runs.agent_run(session_id) {
-            return Err(
-                agent_client_protocol::Error::invalid_request().data(format!(
-                    "session {session_id} has an active run ({run_id}); truncate after it ends"
-                )),
-            );
+        // Deleting rows under a running turn (or a live voice interaction, which writes
+        // messages) would let it write its tail after the cut. The check is not atomic with a
+        // prompt arriving next; callers that need that guarantee (honkd) serialize prompts and
+        // truncation themselves.
+        if self.active_runs.is_active(session_id) {
+            return Err(agent_client_protocol::Error::invalid_request().data(format!(
+                "session {session_id} has an active run or live voice interaction; truncate after it ends"
+            )));
         }
 
         self.session_manager
