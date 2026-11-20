@@ -1,0 +1,79 @@
+# The aarch64-apple-darwin CLI for this fork's releases (patched-release.yml and
+# patched-release-darwin.yml). It is upstream's bundle-macos.yml build-goose +
+# package-cli steps (same toolchain via hermit, default features, unsigned,
+# same tarball layout), with two differences:
+#
+# 1. CMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON. llama-cpp-sys-2 passes CMAKE_* env
+#    through to llama.cpp's CMake, whose vendored cpp-httplib otherwise links any
+#    OpenSSL it finds. On current macOS runner images that is Homebrew's, which
+#    (a) no longer compiles there (const X509_NAME) and (b) would make the binary
+#    need Homebrew's libssl at runtime. Upstream's own darwin binaries link no
+#    OpenSSL, so this keeps the same shape.
+# 2. A portability check: the binary may link only system libraries.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit to build"
+        required: true
+        type: string
+
+name: "Patched build (macOS CLI)"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build goose (aarch64-apple-darwin)
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      CMAKE_DISABLE_FIND_PACKAGE_OpenSSL: "ON"
+      TARGET: aarch64-apple-darwin
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          key: patched-macos-deployment-target-12
+
+      - name: Build goose
+        run: |
+          source ./bin/activate-hermit
+          rustup target add "$TARGET"
+          cargo build --release -p goose-cli --bin goose --target "$TARGET"
+
+      - name: Links only system libraries
+        run: |
+          bin="target/${TARGET}/release/goose"
+          otool -L "$bin"
+          bad="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/Library/)' || true)"
+          if [ -n "$bad" ]; then
+            echo "goose links non-system libraries:" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
+          "$bin" --version
+
+      - name: Package CLI
+        run: |
+          mkdir -p package dist
+          cp "target/${TARGET}/release/goose" package/goose
+          chmod +x package/goose
+          tar -cjf "dist/goose-${TARGET}.tar.bz2" -C package .
+          tar -czf "dist/goose-${TARGET}.tar.gz" -C package .
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: goose-aarch64-apple-darwin
+          path: |
+            dist/goose-aarch64-apple-darwin.tar.bz2
+            dist/goose-aarch64-apple-darwin.tar.gz
+          if-no-files-found: error
+          overwrite: true

@@ -1,6 +1,6 @@
 # Modified by Jonathan Mohrbacher, 2026: test-patches runs subdirectory hints tests; test-patches runs message id / truncate_from_message tests; the release also carries the aarch64-apple-darwin CLI.
 # Builds this branch (an upstream release tag plus a few local patches) with upstream's own
-# Linux CLI build workflow and upstream's macOS bundle workflow (CLI only, unsigned), so the result
+# Linux CLI build workflow and patched-build-macos.yml (upstream's macOS CLI build, unsigned), so the result
 # differs from the upstream release only by the patches, and publishes the gnu tarballs and the
 # aarch64-apple-darwin tarballs as a release of this fork.
 #
@@ -31,14 +31,10 @@ jobs:
   # Unsigned: the Nix fetch never sets a quarantine attribute, and the linker's ad-hoc
   # signature is all Apple Silicon needs to exec a binary.
   build-macos:
-    uses: ./.github/workflows/bundle-macos.yml
+    uses: ./.github/workflows/patched-build-macos.yml
     permissions:
       contents: read
     with:
-      target: aarch64-apple-darwin
-      package_cli: true
-      package_desktop: false
-      signing: false
       ref: ${{ github.sha }}
 
   # Unit tests for the patched code paths (including the vendored acp-http crate), on the same toolchain.
