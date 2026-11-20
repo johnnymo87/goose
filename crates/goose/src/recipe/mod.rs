@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort.
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -108,6 +109,9 @@ pub struct Settings {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<usize>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<goose_providers::thinking::ThinkingEffort>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -826,5 +830,37 @@ isGlobal: true"#;
             error_msg,
             "settings.temperature: invalid type: string \"not_a_number\", expected f32"
         );
+    }
+
+    #[test]
+    fn test_format_serde_error_invalid_thinking_effort() {
+        let valid_content = r#"{
+            "version": "1.0.0",
+            "title": "Test",
+            "description": "Test",
+            "instructions": "Test",
+            "settings": {
+                "thinking_effort": "high"
+            }
+        }"#;
+        let recipe =
+            Recipe::from_content(valid_content).expect("valid thinking_effort should parse");
+        assert_eq!(
+            recipe.settings.as_ref().and_then(|s| s.thinking_effort),
+            Some(goose_providers::thinking::ThinkingEffort::High)
+        );
+
+        let content = r#"{
+            "version": "1.0.0",
+            "title": "Test",
+            "description": "Test",
+            "instructions": "Test",
+            "settings": {
+                "thinking_effort": "bogus"
+            }
+        }"#;
+
+        let result = Recipe::from_content(content);
+        assert!(result.is_err(), "bogus thinking_effort must fail to parse");
     }
 }
