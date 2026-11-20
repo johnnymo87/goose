@@ -1,4 +1,4 @@
-# Modified by Jonathan Mohrbacher, 2026: test-patches runs subdirectory hints tests; test-patches runs message id / truncate_from_message tests; the release also carries the aarch64-apple-darwin CLI.
+# Modified by Jonathan Mohrbacher, 2026: test-patches runs subdirectory hints tests; test-patches runs message id / truncate_from_message tests; the release also carries the aarch64-apple-darwin CLI; test-patches runs role recipe thinking_effort tests.
 # Builds this branch (an upstream release tag plus a few local patches) with upstream's own
 # Linux CLI build workflow and patched-build-macos.yml (upstream's macOS CLI build, unsigned), so the result
 # differs from the upstream release only by the patches, and publishes the gnu tarballs and the
