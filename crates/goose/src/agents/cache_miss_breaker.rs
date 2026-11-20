@@ -11,7 +11,10 @@
 //! A call with any cache read resets the count; a smaller call neither counts nor
 //! resets. At `trip_steps` in a row the delegate is stopped, but only for a
 //! Gemini model that has reported a cache hit in this process before (a model
-//! that never reports cache reads would otherwise always trip).
+//! that never reports cache reads would otherwise always trip). Only delegates
+//! feed that set, and it starts empty at each goose-serve start, so a delegate
+//! stuck from its first call is counted only from the first hit any Gemini
+//! delegate in the process reports (opencode seeds it from every session).
 //!
 //! It is a step observer over the delegate's `AgentEvent` stream, so it needs
 //! nothing from the agent loop beyond `AgentEvent::Usage` (one per provider
@@ -63,11 +66,14 @@ impl Detector {
     /// Record one model call. `context` is all prompt tokens, cache reads included
     /// (goose's `input_tokens`). True exactly once, on the call that trips.
     pub fn step(&mut self, context: i64, cache_read: i64, cost: f64) -> bool {
-        if self.tripped {
+        if cache_read > 0 {
+            // A hit re-arms it: a delegate that tripped on its final answer and kept
+            // going (it was never stopped) gets counted afresh.
+            self.streak = Streak::default();
+            self.tripped = false;
             return false;
         }
-        if cache_read > 0 {
-            self.streak = Streak::default();
+        if self.tripped {
             return false;
         }
         if context < self.min_context {
@@ -113,16 +119,39 @@ pub enum Verdict {
     Stop,
 }
 
+/// Which a provider reports first within one model call. Gemini (google format)
+/// streams the message parts and then the usage; OpenAI-style providers send the
+/// usage with or before the message, so agent.rs yields it first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Order {
+    MessageFirst,
+    UsageFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Watching,
+    /// Tripped; the trip step's response has not asked for more tools (yet).
+    Tripped,
+    /// Tripped on a step that asked for tools; stop once their results are in.
+    AwaitingToolResults,
+    Stopped,
+}
+
 /// Per-delegate observer. Feed it every event of the delegate's stream.
 #[derive(Debug)]
 pub struct Breaker {
     session_id: String,
     detector: Option<Detector>,
     model: String,
-    /// The current step (since the last usage) asked for a tool other than final output.
+    order: Option<Order>,
+    /// Message-first only: the current step asked for a tool other than final output.
     step_wants_tools: bool,
-    tripped: bool,
-    stopped: bool,
+    /// Wait for the trip step's tool results before stopping (the state machine
+    /// runs a step's tools concurrently with reporting its usage; the legacy loop
+    /// has already finished them by the time it yields the usage).
+    defer_to_tool_results: bool,
+    state: State,
 }
 
 impl Breaker {
@@ -144,27 +173,46 @@ impl Breaker {
             session_id: session_id.to_string(),
             detector,
             model: String::new(),
+            order: None,
             step_wants_tools: false,
-            tripped: false,
-            stopped: false,
+            defer_to_tool_results: false,
+            state: State::Watching,
         }
     }
 
+    /// For the state-machine loop: let the trip step's tools finish first.
+    pub fn deferring_to_tool_results(mut self) -> Self {
+        self.defer_to_tool_results = true;
+        self
+    }
+
     pub fn observe(&mut self, event: &AgentEvent) -> Verdict {
+        if self.state == State::Stopped || self.detector.is_none() {
+            return Verdict::Continue;
+        }
         match event {
-            AgentEvent::Usage(usage) => self.observe_usage(usage),
-            AgentEvent::Message(message) => self.observe_message(message),
+            AgentEvent::Usage(usage) => {
+                self.order.get_or_insert(Order::UsageFirst);
+                self.observe_usage(usage)
+            }
+            AgentEvent::Message(message) => {
+                if message.role == Role::Assistant {
+                    self.order.get_or_insert(Order::MessageFirst);
+                }
+                self.observe_message(message)
+            }
             _ => Verdict::Continue,
         }
     }
 
     fn observe_usage(&mut self, usage: &ProviderUsage) -> Verdict {
-        // Providers report usage after (Gemini) or before a step's messages; a step's
-        // tool requests seen before its usage belong to it.
-        let step_wants_tools = std::mem::take(&mut self.step_wants_tools);
-        let Some(detector) = self.detector.as_mut() else {
-            return Verdict::Continue;
-        };
+        // Message-first: the tool requests seen since the last usage are this step's.
+        let step_wants_tools =
+            std::mem::take(&mut self.step_wants_tools) && self.order == Some(Order::MessageFirst);
+        if self.state == State::AwaitingToolResults {
+            // Results never showed up as a message; do not let another call through.
+            return self.stop();
+        }
         if !is_gemini(&usage.model) {
             return Verdict::Continue;
         }
@@ -181,36 +229,59 @@ impl Breaker {
                 return Verdict::Continue;
             }
         }
-        if detector.step(context, read, usage.cost.unwrap_or(0.0)) {
-            self.tripped = true;
-            self.model = usage.model.clone();
-            let s = detector.streak();
-            tracing::warn!(
-                session_id = %self.session_id,
-                model = %self.model,
-                "cache-miss-breaker: tripped: {} consecutive uncached calls at ~{}K context, ${:.2}",
-                s.count,
-                s.context / 1000,
-                s.cost
-            );
-            if step_wants_tools {
-                return self.stop();
-            }
+        if read > 0 && self.state == State::Tripped {
+            // The cache recovered before the delegate asked for more tools.
+            self.state = State::Watching;
         }
-        Verdict::Continue
+        let Some(detector) = self.detector.as_mut() else {
+            return Verdict::Continue;
+        };
+        if !detector.step(context, read, usage.cost.unwrap_or(0.0)) {
+            return Verdict::Continue;
+        }
+        self.model = usage.model.clone();
+        let s = detector.streak();
+        tracing::warn!(
+            session_id = %self.session_id,
+            model = %self.model,
+            "cache-miss-breaker: tripped: {} consecutive uncached calls at ~{}K context, ${:.2}",
+            s.count,
+            s.context / 1000,
+            s.cost
+        );
+        if !step_wants_tools {
+            self.state = State::Tripped;
+            return Verdict::Continue;
+        }
+        if self.defer_to_tool_results {
+            self.state = State::AwaitingToolResults;
+            return Verdict::Continue;
+        }
+        self.stop()
     }
 
     fn stop(&mut self) -> Verdict {
-        self.stopped = true;
+        self.state = State::Stopped;
         tracing::warn!(session_id = %self.session_id, "cache-miss-breaker: stopping delegate");
         Verdict::Stop
     }
 
-    /// The trip step's own response decides: more tools means stop before running
-    /// them; a final answer (text, or the final-output tool) is let through.
-    /// Whichever of the step's usage and its tool request comes second stops it.
+    /// The trip step's own response decides: a request for more tools stops the
+    /// delegate before its next model call; a final answer (text, or the
+    /// final-output tool) is let through.
     fn observe_message(&mut self, message: &Message) -> Verdict {
-        if self.stopped || message.role != Role::Assistant {
+        if self.state == State::AwaitingToolResults {
+            let has_results = message
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::ToolResponse(_)));
+            return if has_results {
+                self.stop()
+            } else {
+                Verdict::Continue
+            };
+        }
+        if message.role != Role::Assistant {
             return Verdict::Continue;
         }
         let wants_more = message.content.iter().any(|c| match c {
@@ -223,15 +294,21 @@ impl Breaker {
         if !wants_more {
             return Verdict::Continue;
         }
-        if !self.tripped {
-            self.step_wants_tools = true;
-            return Verdict::Continue;
+        match self.state {
+            State::Tripped if self.defer_to_tool_results => {
+                self.state = State::AwaitingToolResults;
+                Verdict::Continue
+            }
+            State::Tripped => self.stop(),
+            _ => {
+                self.step_wants_tools = true;
+                Verdict::Continue
+            }
         }
-        self.stop()
     }
 
     pub fn stopped(&self) -> bool {
-        self.stopped
+        self.state == State::Stopped
     }
 
     /// The failure the lead sees. `last_response` is the delegate's last assistant text.
@@ -351,10 +428,13 @@ mod tests {
         let mut b = Breaker::with_detector("child", Some(Detector::new(3, 1000)));
         // The process must have seen this model hit the cache.
         assert_eq!(b.observe(&usage(model, 2000, 1500)), Verdict::Continue);
-        // Usage reported before the step's message: the trip waits for its tool request.
-        for _ in 0..3 {
+        // Usage reported before the step's message (OpenAI-style): the previous
+        // step's tool request must not stop the trip step, only its own does.
+        for _ in 0..2 {
             assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
+            assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
         }
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
         assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Stop);
         assert!(b.stopped());
         assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
@@ -373,6 +453,7 @@ mod tests {
         // Gemini streams the step's message first and its usage last.
         let model = "gemini-test-usage-last";
         let mut b = Breaker::with_detector("child", Some(Detector::new(3, 1000)));
+        b.observe(&tool_call("developer__shell"));
         b.observe(&usage(model, 2000, 1500));
         for _ in 0..2 {
             assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
@@ -380,6 +461,69 @@ mod tests {
         }
         assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
         assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Stop);
+    }
+
+    #[test]
+    fn usage_first_trip_step_with_a_final_answer_is_let_through() {
+        let model = "gemini-test-usage-first-final";
+        let mut b = Breaker::with_detector("child", Some(Detector::new(2, 1000)));
+        b.observe(&usage(model, 2000, 1500));
+        b.observe(&tool_call("developer__shell"));
+        b.observe(&usage(model, 2000, 0));
+        b.observe(&tool_call("developer__shell"));
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
+        assert_eq!(
+            b.observe(&AgentEvent::Message(Message::assistant().with_text("done"))),
+            Verdict::Continue
+        );
+        assert!(!b.stopped());
+    }
+
+    #[test]
+    fn deferred_breaker_waits_for_the_trip_steps_tool_results() {
+        let model = "gemini-test-deferred";
+        let mut b = Breaker::with_detector("child", Some(Detector::new(1, 1000)))
+            .deferring_to_tool_results();
+        b.observe(&tool_call("developer__shell"));
+        b.observe(&usage(model, 2000, 1500));
+        assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
+        let results = Message::user()
+            .with_tool_response("call-1", Ok(rmcp::model::CallToolResult::success(vec![])));
+        assert_eq!(b.observe(&AgentEvent::Message(results)), Verdict::Stop);
+    }
+
+    #[test]
+    fn deferred_breaker_never_lets_another_call_through() {
+        let model = "gemini-test-deferred-fallback";
+        let mut b = Breaker::with_detector("child", Some(Detector::new(1, 1000)))
+            .deferring_to_tool_results();
+        b.observe(&tool_call("developer__shell"));
+        b.observe(&usage(model, 2000, 1500));
+        b.observe(&tool_call("developer__shell"));
+        b.observe(&usage(model, 2000, 0));
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Stop);
+    }
+
+    #[test]
+    fn a_cache_hit_after_a_text_only_trip_rearms_the_breaker() {
+        let model = "gemini-test-rearm";
+        let mut b = Breaker::with_detector("child", Some(Detector::new(1, 1000)));
+        b.observe(&AgentEvent::Message(
+            Message::assistant().with_text("thinking"),
+        ));
+        b.observe(&usage(model, 2000, 1500));
+        b.observe(&AgentEvent::Message(
+            Message::assistant().with_text("text only"),
+        ));
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
+        b.observe(&usage(model, 2000, 1500));
+        assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
+        assert_eq!(
+            b.observe(&usage(model, 2000, 0)),
+            Verdict::Stop,
+            "trips again"
+        );
     }
 
     #[test]

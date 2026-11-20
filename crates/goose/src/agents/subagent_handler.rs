@@ -248,7 +248,8 @@ impl ForegroundSubagentRunner {
         .await?;
         // A child token, so the breaker can stop this delegate without touching its parent.
         let cancel = cancel.child_token();
-        let mut breaker = cache_miss_breaker::Breaker::from_env(&subagent.id);
+        let mut breaker =
+            cache_miss_breaker::Breaker::from_env(&subagent.id).deferring_to_tool_results();
         let mut events = agent
             .stream_state_machine_session(session_config, cancel.clone())
             .await?;
@@ -468,6 +469,10 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                 if breaker.observe(event) == cache_miss_breaker::Verdict::Stop {
                     cancel.cancel();
                     drain_after_stop(&mut stream).await;
+                    // The trip step may have delivered the final output alongside other tools.
+                    if let Some(output) = get_final_output(&agent, has_response_schema).await {
+                        return Ok((conversation, Some(output)));
+                    }
                     let last = cache_miss_breaker::last_assistant_text(conversation.messages());
                     return Err(anyhow!(breaker.stop_message(last.as_deref())));
                 }
