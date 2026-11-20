@@ -1,6 +1,7 @@
-// Modified by Jonathan Mohrbacher, 2026: subagent policy: with GOOSE_SUBAGENT_DEFAULT_RECIPE set, an extension that fails to start fails the delegate.
+// Modified by Jonathan Mohrbacher, 2026: subagent policy: with GOOSE_SUBAGENT_DEFAULT_RECIPE set, an extension that fails to start fails the delegate; cache-miss breaker stops a Gemini delegate whose prompt cache stopped hitting.
 use crate::{
     agents::{
+        cache_miss_breaker,
         final_output_tool::FinalOutputTool,
         state_machine::{trailing_error, MAX_TURNS_MESSAGE},
         subagent_task_config::TaskConfig,
@@ -245,11 +246,19 @@ impl ForegroundSubagentRunner {
             self.use_login_shell_path,
         )
         .await?;
+        // A child token, so the breaker can stop this delegate without touching its parent.
+        let cancel = cancel.child_token();
+        let mut breaker =
+            cache_miss_breaker::Breaker::from_env(&subagent.id).deferring_to_tool_results();
         let mut events = agent
-            .stream_state_machine_session(session_config, cancel)
+            .stream_state_machine_session(session_config, cancel.clone())
             .await?;
         while let Some(event) = events.next().await {
-            event?;
+            if breaker.observe(&event?) == cache_miss_breaker::Verdict::Stop {
+                cancel.cancel();
+                drain_after_stop(&mut events).await;
+                return Err(cache_miss_breaker::Stopped(breaker.stop_message(None)).into());
+            }
         }
         Ok(())
     }
@@ -267,6 +276,10 @@ impl ForegroundSubagentRunner {
             return SubagentOutcome::Completed(output);
         }
         if let Err(error) = run_result {
+            if error.is::<cache_miss_breaker::Stopped>() {
+                let last = messages.and_then(|m| cache_miss_breaker::last_assistant_text(m));
+                return SubagentOutcome::Failed(with_last_output(error.to_string(), last));
+            }
             return SubagentOutcome::Failed(error.to_string());
         }
         if let Some(error) = subagent.conversation.as_ref().and_then(trailing_error) {
@@ -432,6 +445,11 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             retry_config: recipe.retry,
         };
 
+        // A child token, so the breaker can stop this delegate without touching its parent.
+        let cancel = cancellation_token
+            .map(|token| token.child_token())
+            .unwrap_or_default();
+        let mut breaker = cache_miss_breaker::Breaker::from_env(&session_id);
         let mut stream =
             crate::session_context::with_session_id(Some(session_id.to_string()), async {
                 agent
@@ -439,7 +457,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                         user_message,
                         session_config,
                         crate::agents::state_machine::enabled(),
-                        cancellation_token,
+                        Some(cancel.clone()),
                     )
                     .await
             })
@@ -447,6 +465,18 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
         while let Some(message_result) = stream.next().await {
+            if let Ok(event) = &message_result {
+                if breaker.observe(event) == cache_miss_breaker::Verdict::Stop {
+                    cancel.cancel();
+                    drain_after_stop(&mut stream).await;
+                    // The trip step may have delivered the final output alongside other tools.
+                    if let Some(output) = get_final_output(&agent, has_response_schema).await {
+                        return Ok((conversation, Some(output)));
+                    }
+                    let last = cache_miss_breaker::last_assistant_text(conversation.messages());
+                    return Err(anyhow!(breaker.stop_message(last.as_deref())));
+                }
+            }
             match message_result {
                 Ok(AgentEvent::Message(msg)) => {
                     if let Some(ref callback) = on_message {
@@ -483,6 +513,28 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
 
         Ok((conversation, final_output))
     })
+}
+
+/// Let a cancelled delegate's stream wind down so its session is saved cleanly, but
+/// never wait long: a stopped delegate must not hold its parent's tool call.
+async fn drain_after_stop<S, T>(stream: &mut S)
+where
+    S: futures::Stream<Item = T> + Unpin,
+{
+    let drain = async { while stream.next().await.is_some() {} };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+        .await
+        .is_err()
+    {
+        debug!("cache-miss-breaker: delegate stream did not end within 30s of cancel");
+    }
+}
+
+fn with_last_output(message: String, last: Option<String>) -> String {
+    match last.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        Some(text) => format!("{message}\n--- its last output ---\n{text}"),
+        None => message,
+    }
 }
 
 async fn build_subagent_prompt(
@@ -786,5 +838,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Replays a stuck delegate: every call after the first comes back at 60K
+    /// context with no cache read, and every response asks for another tool.
+    #[derive(Debug)]
+    struct UncachedGeminiProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for UncachedGeminiProvider {
+        fn get_name(&self) -> &str {
+            "gcp_vertex_ai"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[rmcp::model::Tool],
+        ) -> std::result::Result<
+            crate::providers::base::MessageStream,
+            goose_providers::errors::ProviderError,
+        > {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let read = if n == 0 { 40_000 } else { 0 };
+            let message = Message::assistant()
+                .with_text(format!("step {n}"))
+                .with_tool_request(
+                    format!("call-{n}"),
+                    Ok(CallToolRequestParams::new("nosuch__tool".to_string())),
+                );
+            let mut usage = goose_providers::conversation::token_usage::Usage::new(
+                Some(60_000),
+                Some(10),
+                None,
+            );
+            usage.cache_read_input_tokens = Some(read);
+            let usage = goose_providers::conversation::token_usage::ProviderUsage::new(
+                "gemini-test-replay".to_string(),
+                usage,
+            );
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok((Some(message), None)),
+                Ok((None, Some(usage))),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cache_miss_breaker_stops_a_stuck_gemini_delegate_and_tells_the_lead() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_CACHE_MISS_BREAKER", None::<&str>),
+            ("GOOSE_CACHE_MISS_BREAKER_STEPS", Some("3")),
+            ("GOOSE_CACHE_MISS_BREAKER_MIN_CONTEXT", None),
+            ("GOOSE_SUBAGENT_DEFAULT_RECIPE", None),
+        ]);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+        let session = session_manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "stuck-child".to_string(),
+                SessionType::SubAgent,
+                crate::config::GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(UncachedGeminiProvider {
+            calls: calls.clone(),
+        });
+        let parent_cancel = CancellationToken::new();
+        let params = SubagentRunParams {
+            config: AgentConfig::new(
+                session_manager.clone(),
+                PermissionManager::instance(),
+                None,
+                crate::config::GooseMode::Auto,
+                true,
+                GoosePlatform::GooseCli,
+            ),
+            recipe: Recipe::builder()
+                .version("1.0.0")
+                .title("T")
+                .description("T")
+                .instructions("work forever")
+                .build()
+                .unwrap(),
+            task_config: TaskConfig::new(
+                provider,
+                goose_providers::model::ModelConfig::new("gemini-test-replay"),
+                &session.id,
+                temp_dir.path(),
+                vec![],
+            )
+            .with_max_turns(Some(50)),
+            return_last_only: true,
+            session_id: session.id.clone(),
+            cancellation_token: Some(parent_cancel.clone()),
+            on_message: None,
+            notification_tx: None,
+        };
+
+        let err = run_subagent_task(params).await.unwrap_err().to_string();
+
+        assert!(err.contains("STOPPED by the cache-miss breaker"), "{err}");
+        assert!(err.contains("3 consecutive model calls"), "{err}");
+        assert!(err.contains("~60K context"), "{err}");
+        assert!(
+            err.contains("re-dispatch #1 after cache-miss breaker"),
+            "{err}"
+        );
+        assert!(err.contains("--- its last output ---\nstep 3"), "{err}");
+        // One seeding call with a cache hit, then exactly three uncached ones.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(
+            !parent_cancel.is_cancelled(),
+            "the parent's token is untouched"
+        );
     }
 }
