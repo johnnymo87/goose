@@ -4982,6 +4982,38 @@
       "x-side": "agent",
       "x-method": "_goose/unstable/session/conversation/truncate"
     },
+    "TruncateSessionConversationFromMessageRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "messageId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "messageId"
+      ],
+      "description": "Truncate a session conversation from the message with the given id onward\n(that message included). The boundary is the message's row, so messages\nstored in the same second before it are kept. Refused while the session has\nan active run.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/conversation/truncate_from_message"
+    },
+    "TruncateSessionConversationFromMessageResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "found": {
+          "type": "boolean",
+          "description": "False when no message with that id exists in the session (nothing was removed)."
+        }
+      },
+      "required": [
+        "found"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/conversation/truncate_from_message"
+    },
     "UpdateSessionProjectRequest_unstable": {
       "type": "object",
       "properties": {
@@ -7849,6 +7881,15 @@
                 {
                   "allOf": [
                     {
+                      "$ref": "#/$defs/TruncateSessionConversationFromMessageRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/session/conversation/truncate_from_message",
+                  "title": "TruncateSessionConversationFromMessageRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
                       "$ref": "#/$defs/UpdateSessionProjectRequest_unstable"
                     }
                   ],
@@ -8601,6 +8642,14 @@
                         }
                       ],
                       "title": "GetSessionInfoResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/TruncateSessionConversationFromMessageResponse_unstable"
+                        }
+                      ],
+                      "title": "TruncateSessionConversationFromMessageResponse_unstable"
                     },
                     {
                       "allOf": [

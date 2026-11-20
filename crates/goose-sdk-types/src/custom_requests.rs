@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: SetSessionSettingsRequest custom request for session settings pinning; rolling memory setting in settings/set.
+// Modified by Jonathan Mohrbacher, 2026: SetSessionSettingsRequest custom request for session settings pinning; rolling memory setting in settings/set; TruncateSessionConversationFromMessageRequest.
 use agent_client_protocol::schema::v1::{
     AvailableCommand, ContentBlock, McpServer, Meta, SessionInfo,
 };
@@ -825,6 +825,28 @@ pub struct GetSessionInfoResponse {
 pub struct TruncateSessionConversationRequest {
     pub session_id: String,
     pub truncate_from: i64,
+}
+
+/// Truncate a session conversation from the message with the given id onward
+/// (that message included). The boundary is the message's row, so messages
+/// stored in the same second before it are kept. Refused while the session has
+/// an active run.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(
+    method = "_goose/unstable/session/conversation/truncate_from_message",
+    response = TruncateSessionConversationFromMessageResponse
+)]
+#[serde(rename_all = "camelCase")]
+pub struct TruncateSessionConversationFromMessageRequest {
+    pub session_id: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct TruncateSessionConversationFromMessageResponse {
+    /// False when no message with that id exists in the session (nothing was removed).
+    pub found: bool,
 }
 
 /// Update the project association for a session.
