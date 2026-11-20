@@ -1,5 +1,6 @@
-// Modified by Jonathan Mohrbacher, 2026: self-compaction module; turn-error module; export deliver_subdirectory_hints and deliver_subdirectory_hints_recording.
+// Modified by Jonathan Mohrbacher, 2026: self-compaction module; turn-error module; export deliver_subdirectory_hints and deliver_subdirectory_hints_recording; cache-miss breaker module.
 mod agent;
+pub mod cache_miss_breaker;
 pub mod container;
 pub mod execute_commands;
 pub mod extension;
