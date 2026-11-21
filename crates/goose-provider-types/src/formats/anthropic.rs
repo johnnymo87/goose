@@ -1920,6 +1920,80 @@ mod tests {
     }
 
     #[test]
+    fn native_claude_thinking_carries_display_and_block_binding() -> Result<()> {
+        let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
+
+        let config = cfg_with_effort("claude-opus-5", "high");
+        let messages = vec![Message::user().with_text("Hello")];
+        let payload = create_request_with_options_provider(
+            &config,
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions::native(),
+        )?;
+
+        assert_eq!(
+            payload["thinking"],
+            json!({
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+            })
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn summarized_thinking_round_trips_with_its_signature() -> Result<()> {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Summary of my reasoning."}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_full"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+        let parts = collect_stream(events).await;
+        assert_eq!(
+            parts.thinking,
+            vec![(
+                "Summary of my reasoning.".to_string(),
+                "sig_full".to_string()
+            )]
+        );
+        let (text, signature) = parts.thinking[0].clone();
+
+        let history = vec![
+            Message::user().with_text("Question"),
+            Message::assistant()
+                .with_thinking(text, signature)
+                .with_text("Answer"),
+            Message::user().with_text("Follow-up"),
+        ];
+        let config = cfg_with_effort("claude-opus-5", "high");
+        let payload = create_request_with_options_provider(
+            &config,
+            "system",
+            &history,
+            &[],
+            AnthropicFormatOptions::native(),
+        )?;
+        let replayed = &payload["messages"][1]["content"][0];
+        assert_eq!(replayed["type"], "thinking");
+        assert_eq!(replayed["thinking"], "Summary of my reasoning.");
+        assert_eq!(replayed["signature"], "sig_full");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_create_request_non_claude_adaptive_omits_thinking_display() -> Result<()> {
         let _guard = env_lock::lock_env([("GOOSE_THINKING_EFFORT", None::<&str>)]);
 

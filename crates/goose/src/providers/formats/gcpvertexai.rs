@@ -379,6 +379,26 @@ mod tests {
     }
 
     #[test]
+    fn claude_adaptive_thinking_requests_summarized_display() -> Result<()> {
+        let mut config = ModelConfig::new("claude-opus-5-5");
+        config.reasoning = Some(true);
+        config.request_params = Some(std::collections::HashMap::from([(
+            "thinking_effort".to_string(),
+            serde_json::json!("high"),
+        )]));
+        let messages = vec![Message::user().with_text("Hello")];
+
+        let request = create_anthropic_request(&config, "system", &messages, &[])?;
+
+        assert_eq!(
+            request["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(request["output_config"]["effort"], "high");
+        Ok(())
+    }
+
+    #[test]
     fn test_unknown_model_parsing() -> Result<()> {
         let model = GcpVertexAIModel::try_from("claude-future-version")?;
         assert!(matches!(model, GcpVertexAIModel::Claude(_)));
