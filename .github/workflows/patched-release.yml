@@ -61,6 +61,7 @@ jobs:
           cargo test --release -p goose --features "$F" --test self_compact
           cargo test --release -p goose --features "$F" --test turn_error
           cargo test --release -p goose-sdk-types --lib -- settings_request rolling_memory_dto
+          cargo test --release -p goose-provider-types --lib -- thinking_display native_claude_thinking summarized_thinking_round_trips test_create_request_adaptive_thinking test_create_request_enabled_thinking_with_budget
           cargo test --release -p goose-cli --lib -- cache_ttl
           cargo test --release -p agent-client-protocol-http --features server --lib
 
