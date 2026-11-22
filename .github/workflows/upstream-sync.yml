@@ -90,14 +90,16 @@ jobs:
           L1_ALLOW_SAME: ${{ inputs.allow_same && '1' || '' }}
           L1_PLAN_ONLY: ${{ inputs.plan_only && '1' || '' }}
         run: python3 .github/fork/upstream_sync.py prepare "$RUNNER_TEMP/l1"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: steps.prepare.outputs.work == 'true'
         with:
           name: upstream-sync
           path: ${{ runner.temp }}/l1
           retention-days: 7
 
-  # Performs exactly the pushes and PR edits prepare wrote down; runs nothing from the
+  # Performs the pushes and PR edits prepare wrote down, after checking them (prepare ran
+  # candidate code that could have rewritten its own output): only watcher-shaped refs,
+  # and only commits whose patch-id the fork already holds. Runs nothing from the
   # candidate tree. contents/pull-requests write is used only by a test-l1/ rehearsal's
   # GITHUB_TOKEN fallback; a real run pushes with GOOSE_SYNC_TOKEN.
   publish:
@@ -111,7 +113,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: upstream-sync
           path: ${{ runner.temp }}/l1
@@ -120,4 +122,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GOOSE_SYNC_TOKEN: ${{ secrets.GOOSE_SYNC_TOKEN }}
           L1_FALLBACK_TOKEN: ${{ github.token }}
+          L1_PREFIX: ${{ inputs.prefix }}
         run: python3 .github/fork/upstream_sync.py publish "$RUNNER_TEMP/l1"

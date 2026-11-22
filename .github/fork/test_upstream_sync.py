@@ -209,6 +209,72 @@ class ReportTest(unittest.TestCase):
         self.assertIn("v1.60.9", body)
 
 
+class ValidateTest(unittest.TestCase):
+    """publish's guard against a plan rewritten by the candidate's build scripts."""
+
+    def setUp(self):
+        import subprocess, tempfile
+        self.dir = tempfile.mkdtemp()
+        g = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "tag.gpgsign=false", "-c", "commit.gpgsign=false", *a], cwd=self.dir,
+                                      check=True, capture_output=True, text=True).stdout.strip()
+        self.g = g
+        g("init", "-q")
+        def commit(path, text, msg):
+            with open(f"{self.dir}/{path}", "w") as f:
+                f.write(text)
+            g("add", path)
+            g("commit", "-qm", msg)
+            return g("rev-parse", "HEAD")
+        commit("up.txt", "a\n", "upstream a")
+        g("tag", "v0.9.0")
+        commit("fork.txt", "patch\n", "patch one")
+        g("update-ref", "refs/remotes/fork/patched/v0.9.0", "HEAD")
+        g("checkout", "-q", "--detach", "v0.9.0")
+        commit("up.txt", "a\nb\n", "upstream b")
+        g("tag", "v1.0.0")
+        g("-c", "user.name=t", "cherry-pick", "refs/remotes/fork/patched/v0.9.0")
+        self.tip = g("rev-parse", "HEAD")
+        g("tag", "-a", "patched-1.0.0.0", "-m", "t", self.tip)
+        self.repo = us.Repo(self.dir, "johnnymo87/goose")
+        self.repo.fetch_tag = lambda v: f"refs/tags/{v}"
+        self.repo.fetch_branch = lambda b: f"refs/remotes/fork/{b}"
+        self.plan = {"fork": "johnnymo87/goose", "prefix": "", "target": "v1.0.0",
+                     "sources": [["v0.9.0", "patched/v0.9.0"]], "carried": None, "atomic": True,
+                     "refspecs": [f"{self.tip}:refs/heads/patched/v1.0.0", "refs/tags/patched-1.0.0.0:refs/tags/patched-1.0.0.0"],
+                     "pr": None, "close": [], "comment": []}
+
+    def check(self, **kw):
+        us.validate(dict(self.plan, **kw), self.repo, "", "johnnymo87/goose")
+
+    def test_a_rebuilt_stack_passes(self):
+        self.check()
+
+    def test_any_other_ref_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.check(refspecs=self.plan["refspecs"] + [f"+{self.tip}:refs/heads/fork-main"])
+        with self.assertRaises(SystemExit):
+            self.check(refspecs=[f"{self.tip}:refs/heads/patched/v1.0.0"])
+        with self.assertRaises(SystemExit):
+            self.check(atomic=False)
+        with self.assertRaises(SystemExit):
+            self.check(prefix="test-l1/")
+
+    def test_a_commit_the_fork_does_not_hold_is_refused(self):
+        with open(f"{self.dir}/evil.yml", "w") as f:
+            f.write("x\n")
+        self.g("add", "evil.yml")
+        self.g("commit", "-qm", "patch one")
+        evil = self.g("rev-parse", "HEAD")
+        self.g("tag", "-f", "-a", "patched-1.0.0.0", "-m", "t", evil)
+        with self.assertRaises(SystemExit):
+            self.check(refspecs=[f"{evil}:refs/heads/patched/v1.0.0", "refs/tags/patched-1.0.0.0:refs/tags/patched-1.0.0.0"])
+
+    def test_a_tag_off_the_branch_is_refused(self):
+        self.g("tag", "-f", "-a", "patched-1.0.0.0", "-m", "t", "v1.0.0")
+        with self.assertRaises(SystemExit):
+            self.check()
+
+
 class ScrubTest(unittest.TestCase):
     def test_candidate_code_sees_no_credential(self):
         import os

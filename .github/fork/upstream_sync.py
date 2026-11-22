@@ -38,6 +38,7 @@ REQUIRED_ASSETS = [
 ]
 MARKER_DIR = "fork-sync/"
 LOCK_REGEN_SUBJECT = "Cargo.lock: regenerate for {v} (fork watcher)"
+MARKER_SUBJECT = "fork-sync: {v} upstream-sync report (fork watcher)"
 TEST_WORKFLOW = ".github/workflows/patched-test.yml"
 
 Version = tuple[int, int, int]
@@ -114,7 +115,12 @@ class Commit:
 
 
 def filter_stack(commits: list[Commit]) -> list[Commit]:
-    """Drop commits the watcher regenerates: Cargo.lock-only commits and fork-sync reports."""
+    """Drop what the watcher regenerates or what only records a decision.
+
+    Cargo.lock-only commits and fork-sync reports are regenerated. An empty commit is a
+    recorded drop (a patch upstream absorbed, kept by subject so a carry-forward does not
+    count it as owed); it is dropped from the next stack.
+    """
 
     def regenerated(path: str) -> bool:
         return path == "Cargo.lock" or path.startswith(MARKER_DIR)
@@ -126,7 +132,7 @@ def filter_stack(commits: list[Commit]) -> list[Commit]:
             raise ValueError(
                 f"{c.sha[:12]} mixes {MARKER_DIR} with code (a squash merge?); the stack must stay one commit per patch"
             )
-        if not c.files or not all(regenerated(f) for f in c.files):
+        if c.files and not all(regenerated(f) for f in c.files):
             kept.append(c)
     return kept
 
@@ -157,6 +163,7 @@ class State:
     sync_prs: list[SyncPR]
     base_branch_ahead: bool
     allow_same: bool = False
+    in_flight: Optional[str] = None
     pending_base: Optional[str] = None
     target_branch_exists: bool = False
 
@@ -186,6 +193,8 @@ def decide(s: State) -> Decision:
     major = new[0] > old_v[0]
     if new < old_v or (new == old_v and not s.allow_same):
         return Decision("up-to-date", f"{s.target} is not newer than {s.base_tag}")
+    if s.in_flight:
+        return Decision("release-in-flight", f"{s.in_flight} has no complete release yet; it is the next base")
     if s.pending_base:
         pv = parse_version(s.pending_base)
         return Decision(
@@ -284,7 +293,7 @@ def render_report(
 #            with GOOSE_SYNC_TOKEN. Runs nothing from the candidate tree.
 
 LOG: list[str] = []
-SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSWORD|^ACTIONS_|^GH_|^GITHUB_TOKEN$")
+SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSWORD|^ACTIONS_|^GH_|^GITHUB_(TOKEN|ENV|OUTPUT|PATH|STEP_SUMMARY|STATE)$")
 
 
 def log(msg: str) -> None:
@@ -379,8 +388,7 @@ class Repo:
                     self.git("cherry-pick", "--abort", check=False)
                     self.git("reset", "-q", "--hard", before)
             if status == "applied" and not self.git("diff", "--quiet", before, "HEAD", check=False).returncode:
-                self.git("reset", "-q", "--hard", before)
-                status = "empty"
+                status = "empty"  # kept as an empty commit: the recorded drop
             log(f"  {status:8} {c.sha[:12]} {c.subject}" + (f"  [{', '.join(conflicts)}]" if conflicts else ""))
             results.append(PatchResult(c, status, conflicts, self.conflicts_with(c, target)))
         return results
@@ -464,7 +472,7 @@ def prepare(out: str) -> dict:
         raise SystemExit("L1_SKIP_TESTS and L1_ALLOW_SAME are for test-prefixed rehearsals only")
     workdir = os.environ.get("L1_WORKDIR") or tempfile.mkdtemp(prefix="upstream-sync-")
     repo = Repo(workdir, fork)
-    plan: dict = {"fork": fork, "prefix": prefix, "fetch": [], "refspecs": [], "atomic": False, "pr": None,
+    plan: dict = {"fork": fork, "prefix": prefix, "target": None, "sources": [], "carried": None, "refspecs": [], "atomic": False, "pr": None,
                   "close": [], "comment": [], "label_major": False, "fail": None, "summary": ""}
 
     now = datetime.now(timezone.utc)
@@ -475,11 +483,18 @@ def prepare(out: str) -> dict:
     log(f"target={target} base={base_tag} prefix={prefix!r}")
 
     repo.init(os.environ.get("L1_REFERENCE"))
-    target_tags, base_ahead, sync_prs, pending, branch_exists = [], False, [], None, False
+    target_tags, base_ahead, sync_prs, pending, branch_exists, in_flight = [], False, [], None, False, None
     tv, bv = parse_version(target or ""), parse_patched_tag(base_tag or "")
     if tv and bv:
         target_tags = [r.rsplit("/", 1)[1] for r in repo.remote_refs(f"refs/tags/{tp}patched-{target[1:]}.*")]
         branch_exists = bool(repo.remote_refs(f"refs/heads/{prefix}patched/{target}"))
+        if not prefix and not os.environ.get("L1_BASE"):
+            # A patched tag newer than the newest complete release is a release still being
+            # built (or one that failed): it is the next base, so nothing may start from
+            # the older one. Rehearsal tags never get releases, so rehearsals skip this.
+            newer = [t for t in (r.rsplit("/", 1)[1] for r in repo.remote_refs("refs/tags/patched-*"))
+                     if (parse_patched_tag(t) or ((0, 0, 0), 0)) > bv]
+            in_flight = max(newer, key=parse_patched_tag) if newer else None
         raw = json.loads(run(["gh", "pr", "list", "-R", fork, "--state", "all", "--limit", "200",
                               "--json", "number,headRefName,state"]).stdout)
         sync_head = re.compile(re.escape(prefix) + r"upstream-sync/(v\d+\.\d+\.\d+)")
@@ -504,7 +519,8 @@ def prepare(out: str) -> dict:
         base_ahead = tv in bases
 
     d = decide(State(os.environ.get("GOOSE_HOLD", ""), target, base_tag, target_tags, sync_prs, base_ahead,
-                     allow_same=allow_same and bool(prefix), pending_base=pending, target_branch_exists=branch_exists))
+                     allow_same=allow_same and bool(prefix), in_flight=in_flight, pending_base=pending,
+                     target_branch_exists=branch_exists))
     log(f"decision: {d.kind} {d.reason}".rstrip())
     plan["summary"] = f"upstream-sync: **{d.kind}** {d.reason} (target {target}, base {base_tag})"
     if d.kind not in ("fresh", "from-base-branch") or os.environ.get("L1_PLAN_ONLY") == "1":
@@ -516,26 +532,34 @@ def prepare(out: str) -> dict:
     repo.fetch_tag(target)
     repo.fetch_tag(old_v)
     stack_ref = repo.fetch_branch(f"patched/{old_v}")
-    plan["fetch"] = [["upstream", f"refs/tags/{target}"], ["fork", f"refs/heads/patched/{old_v}"]]
+    plan["target"] = target
+    plan["sources"] = [[old_v, f"patched/{old_v}"]]
     original = filter_stack(repo.commits(f"{old_v}..{stack_ref}"))
     still_owed: list[Commit] = []
     if d.kind == "from-base-branch":
-        stack = filter_stack(repo.commits(f"{target}..refs/remotes/fork/{prefix}base/{target}"))
+        raw_base = repo.commits(f"{target}..refs/remotes/fork/{prefix}base/{target}")
+        stack = filter_stack(raw_base)
+        still_owed = owed(raw_base, original)
+        plan["sources"].append([target, f"{prefix}base/{target}"])
     elif d.carry_from:
         repo.fetch_tag(d.carry_from)
         carried_ref = repo.fetch_branch(f"{prefix}upstream-sync/{d.carry_from}")
-        stack = filter_stack(repo.commits(f"{d.carry_from}..{carried_ref}"))
-        still_owed = owed(stack, original)
-        plan["fetch"].append(["fork", f"refs/heads/{prefix}upstream-sync/{d.carry_from}"])
+        raw_carried = repo.commits(f"{d.carry_from}..{carried_ref}")
+        stack = filter_stack(raw_carried)
+        still_owed = owed(raw_carried, original)
+        plan["sources"].append([d.carry_from, f"{prefix}upstream-sync/{d.carry_from}"])
+        plan["carried"] = [f"{prefix}upstream-sync/{d.carry_from}", repo.sha(carried_ref)]
     else:
         stack = original
+    for c in still_owed:
+        log(f"  owed     {c.sha[:12]} {c.subject}")
     log(f"applying {len(stack)} commits onto {target}")
     repo.git("checkout", "-q", "--detach", target)
     results = repo.apply(stack, target)
     failed = [r for r in results if r.status in ("conflict", "error")]
 
     tests_failed, test_tail = False, ""
-    if not failed:
+    if not failed and not still_owed:
         repo.regenerate_lock(target, required=not skip_tests)
         if skip_tests:
             log("tests skipped (L1_SKIP_TESTS=1, a rehearsal)")
@@ -545,7 +569,7 @@ def prepare(out: str) -> dict:
             log("patched test filter: " + ("PASS" if ok else "FAIL"))
 
     head = repo.sha("HEAD")
-    if not failed and not tests_failed:
+    if not failed and not still_owed and not tests_failed:
         branch, tag = f"{prefix}patched/{target}", f"{tp}patched-{target[1:]}.0"
         repo.git("tag", "-a", tag, "-m", f"{target} plus the fork's patches (fork watcher)", head)
         plan["refspecs"] = [f"{head}:refs/heads/{branch}", f"refs/tags/{tag}:refs/tags/{tag}"]
@@ -553,13 +577,18 @@ def prepare(out: str) -> dict:
         plan["close"] = [[n, f"Superseded: {target} applied cleanly as {tag}."] for n in d.close_prs]
         plan["summary"] = f"upstream-sync: **clean** {target} -> {branch}, tagged {tag}"
     elif d.kind == "from-base-branch":
-        body = render_report(target, old_v, results, "\n".join(LOG) + "\n" + test_tail, d.major, None, tests_failed)
-        plan["comment"] = [[n, body] for n in d.close_prs]
-        plan["fail"] = f"base/{target} does not pass; see the comment on its upstream-sync PR"
+        body = render_report(target, old_v, results, "\n".join(LOG) + "\n" + test_tail, d.major, None, tests_failed,
+                             still_owed)
+        # The worker's PR is usually MERGED by now (that is what put the stack on base/).
+        for_v = [p for p in sync_prs if p.version == target and p.state in ("OPEN", "MERGED")]
+        plan["comment"] = [[max(p.number for p in for_v), body]] if for_v else []
+        where = f"the comment on PR #{plan['comment'][0][0]}" if for_v else "this run's log"
+        plan["fail"] = f"base/{target} is not ready to tag ({len(failed)} failed, {len(still_owed)} owed, " \
+                       f"tests {'failed' if tests_failed else 'not run' if failed or still_owed else 'passed'}); see {where}"
         plan["summary"] = f"upstream-sync: **red** {plan['fail']}"
     else:
         base_branch, sync_branch = f"{prefix}base/{target}", f"{prefix}upstream-sync/{target}"
-        if failed:
+        if failed or still_owed:
             repo.regenerate_lock(target, required=False)
         body = render_report(target, old_v, results, "\n".join(LOG) + "\n" + test_tail, d.major, d.carry_from,
                              tests_failed, still_owed)
@@ -568,37 +597,133 @@ def prepare(out: str) -> dict:
         with open(os.path.join(workdir, marker), "w") as f:
             f.write(body)
         repo.git("add", marker)
-        repo.git("commit", "-q", "-m", f"fork-sync: {target} upstream-sync report (fork watcher)")
+        repo.git("commit", "-q", "-m", MARKER_SUBJECT.format(v=target))
         head = repo.sha("HEAD")
         if not repo.remote_refs(f"refs/heads/{base_branch}"):
             plan["refspecs"].append(f"{repo.sha(target)}:refs/heads/{base_branch}")
         plan["refspecs"].append(f"+{head}:refs/heads/{sync_branch}")
-        what = "tests failed" if tests_failed else f"{len(failed)} of {len(results)} patches failed"
+        parts = [f"{len(failed)} of {len(results)} patches failed"] if failed else []
+        parts += [f"{len(still_owed)} owed"] if still_owed else []
+        what = "tests failed" if tests_failed else ", ".join(parts)
         title = (f"[{prefix.rstrip('/')}] " if prefix else "") + f"upstream-sync: {target} ({what})"
         plan["pr"] = {"base": base_branch, "head": sync_branch, "title": title, "body": body}
         plan["label_major"] = d.major
         plan["close"] = [[n, "Superseded by {pr_url}, which carries this branch forward."] for n in d.close_prs]
         plan["summary"] = f"upstream-sync: **conflict** {title}"
 
-    # The bundle holds only what the fork lacks; publish fetches plan["fetch"] first.
+    # The bundle holds only what the fork lacks: every new commit sits on the target tag,
+    # which publish fetches from upstream itself.
     os.makedirs(out, exist_ok=True)
     tips = [r.split(":", 1)[0].lstrip("+") for r in plan["refspecs"]]
     for i, t in enumerate(tips):
         repo.git("update-ref", f"refs/l1/{i}", t)
-    have = [ref for _, ref in plan["fetch"] if ref.startswith("refs/tags/")]
-    have += ["refs/remotes/fork/" + ref.removeprefix("refs/heads/") for r, ref in plan["fetch"] if r == "fork"]
     tag_refs = [r.split(":", 1)[0] for r in plan["refspecs"] if r.startswith("refs/tags/")]
     p = repo.git("bundle", "create", os.path.join(out, "sync.bundle"), "--glob=refs/l1/*", *tag_refs,
-                 "--not", *have, check=False)
+                 "--not", f"refs/tags/{target}", check=False)
     if p.returncode != 0 and "empty bundle" not in p.stderr:
         raise RuntimeError(f"git bundle create: {p.stderr.strip()}")
     return plan
 
 
+def patch_id(repo: Repo, sha: str) -> Optional[str]:
+    diff = run(["git", "diff-tree", "-p", "-U0", "--no-commit-id", sha, "--", ".", ":!Cargo.lock"], cwd=repo.dir).stdout
+    if not diff.strip():
+        return None
+    out = subprocess.run(["git", "patch-id", "--stable"], cwd=repo.dir, input=diff, text=True, capture_output=True,
+                         check=True).stdout.split()
+    return out[0] if out else None
+
+
+def validate(plan: dict, repo: Repo, prefix: str, fork: str) -> None:
+    """Refuse a plan that does anything but what prepare is allowed to ask for.
+
+    prepare runs a new upstream release's build scripts, which could rewrite plan.json or
+    the bundle. Everything publish pushes must therefore be a watcher-shaped ref, and every
+    commit it pushes must be a patch the fork already holds (same patch-id), a Cargo.lock
+    regeneration, the fork-sync report, or an empty recorded drop.
+    """
+
+    def refuse(why: str) -> None:
+        raise SystemExit(f"::error::refusing the plan: {why}")
+
+    if plan.get("fork") != fork or plan.get("prefix") != prefix:
+        refuse(f"plan is for {plan.get('fork')!r} prefix {plan.get('prefix')!r}, expected {fork!r} {prefix!r}")
+    target = plan.get("target") or ""
+    if not parse_version(target):
+        refuse(f"target {target!r}")
+    P, T, TV = re.escape(prefix), re.escape(target), re.escape(target[1:])
+    TP = re.escape(prefix.replace("/", "-"))
+    forms = {
+        "patched": rf"([0-9a-f]{{40}}):refs/heads/{P}patched/{T}",
+        "base": rf"([0-9a-f]{{40}}):refs/heads/{P}base/{T}",
+        "sync": rf"\+([0-9a-f]{{40}}):refs/heads/{P}upstream-sync/{T}",
+        "tag": rf"refs/tags/({TP}patched-{TV}\.0):refs/tags/\1",
+    }
+    got: dict[str, str] = {}
+    for r in plan["refspecs"]:
+        kind = next((k for k, f in forms.items() if re.fullmatch(f, r)), None)
+        if not kind or kind in got:
+            refuse(f"refspec {r!r}")
+        got[kind] = re.fullmatch(forms[kind], r).group(1)  # type: ignore[union-attr]
+    if got and set(got) not in ({"patched", "tag"}, {"sync"}, {"base", "sync"}):
+        refuse(f"refspec set {sorted(got)}")
+    if "patched" in got and not plan["atomic"]:
+        refuse("a branch and tag push that is not atomic")
+
+    target_sha = repo.sha(f"refs/tags/{target}")
+    if "base" in got and got["base"] != target_sha:
+        refuse(f"base/{target} would not be the bare upstream tag")
+    if "tag" in got and repo.sha(f"refs/tags/{got['tag']}") != got["patched"]:
+        refuse(f"{got['tag']} does not point at patched/{target}")
+
+    branch_form = re.compile(rf"patched/(v\d+\.\d+\.\d+)|{P}(?:base|upstream-sync)/(v\d+\.\d+\.\d+)")
+    known_ids, known_subjects = set(), set()
+    for base_v, branch in plan.get("sources", []):
+        m = branch_form.fullmatch(branch)
+        if not m or (m.group(1) or m.group(2)) != base_v:
+            refuse(f"source {branch!r} on {base_v!r}")
+        repo.fetch_tag(base_v)
+        ref = repo.fetch_branch(branch)
+        for c in repo.commits(f"{base_v}..{ref}"):
+            known_subjects.add(c.subject)
+            pid = patch_id(repo, c.sha)
+            if pid:
+                known_ids.add(pid)
+
+    tip = got.get("patched") or got.get("sync")
+    if tip:
+        for c in repo.commits(f"{target_sha}..{tip}"):
+            if not c.files:
+                ok = c.subject in known_subjects
+            elif c.files == ["Cargo.lock"]:
+                ok = c.subject == LOCK_REGEN_SUBJECT.format(v=target)
+            elif c.files == [f"{MARKER_DIR}{target}.md"]:
+                ok = c.subject == MARKER_SUBJECT.format(v=target) and "sync" in got
+            else:
+                ok = patch_id(repo, c.sha) in known_ids
+            if not ok:
+                refuse(f"commit {c.sha[:12]} {c.subject!r} is not a patch the fork already holds")
+
+    if plan.get("carried"):
+        branch, sha = plan["carried"]
+        if not re.fullmatch(rf"{P}upstream-sync/v\d+\.\d+\.\d+", branch):
+            refuse(f"carried {branch!r}")
+        now = [line.split("\t")[0] for line in repo.git("ls-remote", "fork", f"refs/heads/{branch}").stdout.splitlines()]
+        if now != [sha]:
+            refuse(f"{branch} moved since prepare read it (someone pushed); rerun so their work is carried")
+    if plan["pr"] and (plan["pr"]["base"], plan["pr"]["head"]) != (f"{prefix}base/{target}", f"{prefix}upstream-sync/{target}"):
+        refuse(f"PR {plan['pr']['head']!r} -> {plan['pr']['base']!r}")
+    for n, _ in plan["close"] + plan["comment"]:
+        head = run(["gh", "pr", "view", str(int(n)), "-R", fork, "--json", "headRefName", "-q", ".headRefName"]).stdout.strip()
+        if not re.fullmatch(rf"{P}upstream-sync/v\d+\.\d+\.\d+", head):
+            refuse(f"PR #{n} (head {head!r}) is not an upstream-sync PR")
+
+
 def publish(out: str, plan: dict) -> int:
-    fork = plan["fork"]
+    fork = os.environ.get("GITHUB_REPOSITORY") or plan["fork"]
+    prefix = os.environ.get("L1_PREFIX", "")
     token = os.environ.get("GOOSE_SYNC_TOKEN", "")
-    if not token and plan["prefix"]:
+    if not token and prefix:
         # A rehearsal may push with GITHUB_TOKEN; that works only while it adds no new
         # workflow blob, which a stack re-applied onto its own base does not.
         token = os.environ.get("L1_FALLBACK_TOKEN", "")
@@ -612,18 +737,19 @@ def publish(out: str, plan: dict) -> int:
     def gh(*args: str) -> str:
         return run(["gh", *args], env=gh_env).stdout
 
+    repo = Repo(os.environ.get("L1_PUBLISH_DIR") or tempfile.mkdtemp(prefix="upstream-sync-publish-"), fork, token)
+    repo.init(os.environ.get("L1_REFERENCE"))
+    if plan.get("target") and parse_version(plan["target"]):
+        repo.fetch_tag(plan["target"])
+    bundle = os.path.join(out, "sync.bundle")
+    if plan["refspecs"] and os.path.exists(bundle):
+        repo.git("fetch", "-q", bundle, "+refs/l1/*:refs/l1/*")
+        for r in plan["refspecs"]:
+            if r.startswith("refs/tags/"):
+                t = r.split(":", 1)[0].removeprefix("refs/tags/")
+                repo.git("fetch", "-q", bundle, f"+refs/tags/{t}:refs/tags/{t}")
+    validate(plan, repo, prefix, fork)
     if plan["refspecs"]:
-        repo = Repo(os.environ.get("L1_PUBLISH_DIR") or tempfile.mkdtemp(prefix="upstream-sync-publish-"), fork, token)
-        repo.init(os.environ.get("L1_REFERENCE"))
-        for remote, ref in plan["fetch"]:
-            repo.fetch(remote, ref)
-        bundle = os.path.join(out, "sync.bundle")
-        if os.path.exists(bundle):
-            repo.git("fetch", "-q", bundle, "+refs/l1/*:refs/l1/*")
-        tags = [r for r in plan["refspecs"] if r.startswith("refs/tags/")]
-        for r in tags:
-            t = r.split(":", 1)[0].removeprefix("refs/tags/")
-            repo.git("fetch", "-q", bundle, f"+refs/tags/{t}:refs/tags/{t}")
         repo.push(plan["refspecs"], plan["atomic"])
     pr_url = ""
     if plan["pr"]:
@@ -640,9 +766,9 @@ def publish(out: str, plan: dict) -> int:
     for n, body in plan["comment"]:
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as bf:
             bf.write(body)
-        gh("pr", "comment", str(n), "-R", fork, "--body-file", bf.name)
+        gh("pr", "comment", str(int(n)), "-R", fork, "--body-file", bf.name)
     for n, comment in plan["close"]:
-        gh("pr", "close", str(n), "-R", fork, "--comment", comment.replace("{pr_url}", pr_url))
+        gh("pr", "close", str(int(n)), "-R", fork, "--comment", comment.replace("{pr_url}", pr_url))
     write_summary(plan["summary"] + (f": {pr_url}" if pr_url else ""))
     if plan["fail"]:
         raise SystemExit("::error::" + plan["fail"])
@@ -656,6 +782,7 @@ def has_work(plan: dict) -> bool:
 def main(argv: list[str]) -> int:
     mode = argv[1] if len(argv) > 1 else "local"
     out = argv[2] if len(argv) > 2 else tempfile.mkdtemp(prefix="upstream-sync-out-")
+    os.makedirs(out, exist_ok=True)
     if mode in ("prepare", "local"):
         plan = prepare(out)
         with open(os.path.join(out, "plan.json"), "w") as f:
