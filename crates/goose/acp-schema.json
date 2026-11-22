@@ -832,12 +832,23 @@
               "type": "null"
             }
           ]
+        },
+        "rollingMemory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RollingMemoryDto"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Rolling memory for this session. Absent: unchanged. null: off."
         }
       },
       "required": [
         "sessionId"
       ],
-      "description": "Pin a session's prompt-cache TTL and recipe, persisted on the session row.\n\nThe recipe is stored on the session and read every turn: its `title`,\n`instructions` and `response` take effect. Its `settings`, `extensions`,\n`prompt` and `parameters` are ignored, `retry` and `sub_recipes` are\ndropped, and the session keeps its model.",
+      "description": "Pin a session's prompt-cache TTL, recipe and rolling memory, persisted on the session row.\n\nThe recipe is stored on the session and read every turn: its `title`,\n`instructions` and `response` take effect. Its `settings`, `extensions`,\n`prompt` and `parameters` are ignored, `retry` and `sub_recipes` are\ndropped, and the session keeps its model.",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/settings/set"
     },
@@ -9160,6 +9171,23 @@
         }
       ],
       "x-docs-ignore": true
+    },
+    "RollingMemoryDto": {
+      "type": "object",
+      "properties": {
+        "budgetTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tailTokens": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "budgetTokens",
+        "tailTokens"
+      ]
     }
   },
   "anyOf": [

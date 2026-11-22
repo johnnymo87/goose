@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: skip tool pair summarization when rolling memory is on for the session.
 //! Replaces one batch of old tool request and response pairs with compact summaries.
 
 use std::sync::Arc;
@@ -68,7 +69,7 @@ impl Operation<Session, GooseEffect> for ToolPairCompactionOperation {
         conversation: &Conversation,
         _emit: &Emitter,
     ) -> Result<OperationResult<GooseEffect>> {
-        if !self.enabled {
+        if !self.enabled || crate::context_mgmt::rolling::is_on(session) {
             return not_applicable();
         }
 

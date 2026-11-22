@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: _goose/unstable/session/settings/set pins a session's cache TTL and recipe; session/prompt _meta.goose.maxTurns bounds the run.
+// Modified by Jonathan Mohrbacher, 2026: _goose/unstable/session/settings/set pins a session's cache TTL, recipe and rolling memory; session/prompt _meta.goose.maxTurns bounds the run.
 use agent_client_protocol::schema::v1::Meta;
 
 use super::{AcpConnection, ResultExt};
@@ -116,6 +116,13 @@ impl AcpConnection {
             .map(normalized_cache_ttl)
             .transpose()?;
 
+        if let Some(Some(dto)) = &req.rolling_memory {
+            if let Err(msg) = dto.validate() {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data(format!("invalid rollingMemory: {msg}")));
+            }
+        }
+
         let mut session = self
             .services
             .session_manager
@@ -159,6 +166,24 @@ impl AcpConnection {
                     .await
                     .internal_err_ctx("Failed to pin cache TTL")?;
             }
+        }
+
+        if let Some(v) = req.rolling_memory {
+            let session = self
+                .services
+                .session_manager
+                .get_session(session_id, false)
+                .await
+                .internal_err_ctx("Failed to re-read session")?;
+            let mut data = session.extension_data;
+            crate::context_mgmt::rolling::write_settings(&mut data, v.map(Into::into));
+            self.services
+                .session_manager
+                .update(session_id)
+                .extension_data(data)
+                .apply()
+                .await
+                .internal_err_ctx("Failed to persist rolling memory settings to session")?;
         }
 
         let Some(recipe) = recipe else {

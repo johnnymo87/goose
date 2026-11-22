@@ -146,7 +146,51 @@ jobs:
             "agents::state_machine::ops_self_compact::tests::test_compacted_turns_before_derivation" \
             "agents::state_machine::ops_self_compact::tests::test_self_compact_turn_limit_operation" \
             "agents::state_machine::ops_self_compact::tests::test_finalize_cancellation_guards" \
-            "agents::state_machine::ops_self_compact::tests::test_finalize_cancellation_skips_prompt_with_persisted_outcome"
+            "agents::state_machine::ops_self_compact::tests::test_finalize_cancellation_skips_prompt_with_persisted_outcome" \
+            "prompt_template::tests::compaction_rolling_template_is_registered" \
+            "context_mgmt::rolling::tests::rolling_backoff_cases" \
+            "context_mgmt::rolling::tests::rolling_calibrated_ratio_clamps" \
+            "context_mgmt::rolling::tests::rolling_check_backed_off_returns_none" \
+            "context_mgmt::rolling::tests::rolling_check_cheap_path_matches_full_estimate" \
+            "context_mgmt::rolling::tests::rolling_check_under_budget_returns_none" \
+            "context_mgmt::rolling::tests::rolling_cut_ignores_agent_invisible_history" \
+            "context_mgmt::rolling::tests::rolling_cut_includes_old_compact_summary" \
+            "context_mgmt::rolling::tests::rolling_cut_nothing_to_fold" \
+            "context_mgmt::rolling::tests::rolling_cut_pairing_violation_is_error" \
+            "context_mgmt::rolling::tests::rolling_cut_previous_memory_detected_and_excluded_from_progress" \
+            "context_mgmt::rolling::tests::rolling_cut_ratio_scales_tail" \
+            "context_mgmt::rolling::tests::rolling_cut_single_turn_bigger_than_tail" \
+            "context_mgmt::rolling::tests::rolling_cut_skips_turn_context_and_steer_and_nudge" \
+            "context_mgmt::rolling::tests::rolling_cut_tail_starts_at_genuine_prompt" \
+            "context_mgmt::rolling::tests::rolling_decide_cases" \
+            "context_mgmt::rolling::tests::rolling_estimate_cases" \
+            "context_mgmt::rolling::tests::rolling_fold_round_trip" \
+            "context_mgmt::rolling::tests::rolling_fold_rows_cut_out_of_bounds" \
+            "context_mgmt::rolling::tests::rolling_fold_rows_rejects_empty_folded" \
+            "context_mgmt::rolling::tests::rolling_fold_rows_rejects_folded_at_or_after_cut" \
+            "context_mgmt::rolling::tests::rolling_fold_rows_rejects_missing_id" \
+            "context_mgmt::rolling::tests::rolling_fold_rows_shape" \
+            "context_mgmt::rolling::tests::rolling_genuine_prompt_visibility_and_types" \
+            "context_mgmt::rolling::tests::rolling_history_skips_turn_context_and_previous_memory" \
+            "context_mgmt::rolling::tests::rolling_memory_failures" \
+            "context_mgmt::rolling::tests::rolling_memory_large_end_turn_is_success" \
+            "context_mgmt::rolling::tests::rolling_memory_neutralizes_previous_memory_closing_tags" \
+            "context_mgmt::rolling::tests::rolling_memory_refusal_retries_once_without_tool_responses" \
+            "context_mgmt::rolling::tests::rolling_memory_request_shape" \
+            "context_mgmt::rolling::tests::rolling_render_line_stamps_utc_and_strips_only_leading_prefix" \
+            "context_mgmt::rolling::tests::rolling_render_neutralizes_closing_tags" \
+            "context_mgmt::rolling::tests::rolling_resolve_absent_both_env" \
+            "context_mgmt::rolling::tests::rolling_resolve_absent_no_env" \
+            "context_mgmt::rolling::tests::rolling_resolve_absent_only_one_env" \
+            "context_mgmt::rolling::tests::rolling_resolve_invalid_object" \
+            "context_mgmt::rolling::tests::rolling_resolve_null_both_env" \
+            "context_mgmt::rolling::tests::rolling_resolve_object_key" \
+            "context_mgmt::rolling::tests::rolling_resolve_unparsable_env" \
+            "context_mgmt::rolling::tests::rolling_settings_validate_floors" \
+            "context_mgmt::rolling::tests::rolling_settings_write_null" \
+            "context_mgmt::rolling::tests::rolling_state_default_absent" \
+            "context_mgmt::rolling::tests::rolling_state_invalid_defaults" \
+            "context_mgmt::rolling::tests::rolling_state_roundtrip"
 
           run_exact_tests --release -p goose --features "$F" --test self_compact -- \
             "test_happy_path_self_compact" \
@@ -180,6 +224,16 @@ jobs:
             "test_prompt_max_turns_bounds_run" \
             "test_session_settings_idempotent_prompts_byte_identical" \
             "test_session_settings_templated_recipe_renders_consistently"
+
+          run_exact_tests --release -p goose --features "$F" --test rolling_memory -- \
+            "rolling_fold_happens_and_next_call_sees_memory_plus_tail" \
+            "rolling_off_by_default_no_memory_call" \
+            "rolling_skips_threshold_auto_compaction" \
+            "rolling_failure_proceeds_and_counts" \
+            "rolling_metrics_use_retained_form" \
+            "rolling_cancel_during_memory_call_drops_cleanly" \
+            "rolling_decide_skip_yields_no_folding_notice_and_no_memory_call" \
+            "rolling_fires_only_once_across_turns"
 
           run_exact_tests --release -p goose-provider-types --lib -- \
             "formats::anthropic::tests::native_claude_thinking_carries_display_and_block_binding" \

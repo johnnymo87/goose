@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set and session/prompt _meta.goose.maxTurns (stopReason max_turn_requests).
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set (cache TTL, recipe, rolling memory) and session/prompt _meta.goose.maxTurns (stopReason max_turn_requests).
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -103,6 +103,22 @@ fn test_session_settings_set_rejects_invalid_input() {
             conn.cx(),
             SETTINGS_SET,
             serde_json::json!({
+                "sessionId": session_id,
+                "rollingMemory": { "budgetTokens": 5000, "tailTokens": 500 }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            data_text(&err).contains("invalid rollingMemory: "),
+            "{err:?}"
+        );
+
+        let err = send_custom(
+            conn.cx(),
+            SETTINGS_SET,
+            serde_json::json!({
                 "sessionId": "unknown-nonexistent-session",
                 "recipe": { "title": "Some Recipe", "description": "Description" }
             }),
@@ -188,6 +204,7 @@ fn test_session_settings_set_persists_and_survives_reload() {
                     "sessionId": session_id,
                     "cacheTtl": "1h",
                     "recipe": recipe,
+                    "rollingMemory": { "budgetTokens": 20000, "tailTokens": 2000 },
                 }),
             )
             .await
@@ -208,6 +225,56 @@ fn test_session_settings_set_persists_and_survives_reload() {
         assert!(
             stored_recipe.sub_recipes.is_none(),
             "sub_recipes must not be stored"
+        );
+        assert_eq!(
+            stored
+                .extension_data
+                .get_extension_state("rolling_memory", "v0"),
+            Some(&serde_json::json!({ "budgetTokens": 20000, "tailTokens": 2000 }))
+        );
+
+        // Setting rollingMemory: null turns it off (explicit null)
+        send_custom(
+            conn.cx(),
+            SETTINGS_SET,
+            serde_json::json!({
+                "sessionId": session_id,
+                "rollingMemory": null,
+            }),
+        )
+        .await
+        .unwrap();
+        let stored = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored
+                .extension_data
+                .get_extension_state("rolling_memory", "v0"),
+            Some(&serde_json::Value::Null)
+        );
+
+        // Absent rollingMemory leaves the stored state unchanged
+        send_custom(
+            conn.cx(),
+            SETTINGS_SET,
+            serde_json::json!({
+                "sessionId": session_id,
+                "cacheTtl": "1h",
+            }),
+        )
+        .await
+        .unwrap();
+        let stored = session_manager
+            .get_session(&session_id, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored
+                .extension_data
+                .get_extension_state("rolling_memory", "v0"),
+            Some(&serde_json::Value::Null)
         );
         let out = session
             .prompt("Hello with recipe", PermissionDecision::AllowOnce)

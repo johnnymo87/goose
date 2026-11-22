@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: compaction failure messages are recognisable as turn errors.
+// Modified by Jonathan Mohrbacher, 2026: compaction failure messages are recognisable as turn errors; skip proactive auto-compaction when rolling memory is on for the session.
 //! Compacts conversation history when it is too large for the configured context window.
 
 use std::sync::Arc;
@@ -193,16 +193,21 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
             if context_errors > MAX_CONTEXT_ERROR_COMPACTIONS {
                 return not_applicable();
             }
-        } else if proactive_compaction_tokens(
-            session,
-            conversation,
-            self.context_limit,
-            self.threshold,
-        )
-        .await?
-        .is_none()
-        {
-            return not_applicable();
+        } else {
+            if crate::context_mgmt::rolling::is_on(session) {
+                return not_applicable();
+            }
+            if proactive_compaction_tokens(
+                session,
+                conversation,
+                self.context_limit,
+                self.threshold,
+            )
+            .await?
+            .is_none()
+            {
+                return not_applicable();
+            }
         }
 
         let conversation_with_hidden_error;
