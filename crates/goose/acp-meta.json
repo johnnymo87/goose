@@ -411,6 +411,11 @@
       "responseType": "EmptyResponse"
     },
     {
+      "method": "_goose/unstable/session/conversation/truncate_from_message",
+      "requestType": "TruncateSessionConversationFromMessageRequest_unstable",
+      "responseType": "TruncateSessionConversationFromMessageResponse_unstable"
+    },
+    {
       "method": "_goose/unstable/session/project/update",
       "requestType": "UpdateSessionProjectRequest_unstable",
       "responseType": "EmptyResponse"

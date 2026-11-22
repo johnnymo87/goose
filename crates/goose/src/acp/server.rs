@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: session/prompt turn_failed errors carry data.kind and data.message; register session_settings (settings/set) and honour session/prompt _meta.goose.maxTurns.
+// Modified by Jonathan Mohrbacher, 2026: session/prompt turn_failed errors carry data.kind and data.message; register session_settings (settings/set) and honour session/prompt _meta.goose.maxTurns; session/prompt _meta.goose.messageId sets the stored user message id; advertise truncateFromMessage.
 use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 pub(super) use crate::acp::response_builder::{
@@ -129,6 +129,7 @@ mod sources;
 mod tool_calls;
 mod tool_notifications;
 mod tools;
+mod truncate_from_message;
 
 pub type AcpProviderFactory =
     Arc<dyn Fn(String) -> BoxFuture<'static, Result<Arc<dyn Provider>>> + Send + Sync>;
@@ -409,6 +410,10 @@ fn meta_tags(meta: Option<&Meta>) -> Result<Vec<(String, String)>, agent_client_
 fn agent_capabilities_meta() -> Option<Meta> {
     let mut goose = serde_json::Map::new();
     goose.insert("recipeParameterScopes".to_string(), serde_json::json!({}));
+    goose.insert(
+        truncate_from_message::TRUNCATE_FROM_MESSAGE_CAPABILITY.to_string(),
+        serde_json::json!(true),
+    );
     if cfg!(feature = "local-inference") {
         goose.insert("localInference".to_string(), serde_json::json!({}));
     }
@@ -2244,6 +2249,7 @@ impl AcpConnection {
         args: PromptRequest,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
         let max_turns = session_settings::max_turns_from_meta(args.meta.as_ref())?;
+        let message_id = truncate_from_message::message_id_from_meta(args.meta.as_ref())?;
         // The ACP session_id IS the thread ID.
         let session_id = args.session_id.0.to_string();
 
@@ -2284,7 +2290,10 @@ impl AcpConnection {
             return Err(error);
         }
 
-        let user_message = Self::convert_acp_prompt_to_message(&args.prompt);
+        let mut user_message = Self::convert_acp_prompt_to_message(&args.prompt);
+        if let Some(message_id) = message_id {
+            user_message = user_message.with_id(message_id);
+        }
         // The client's trace context must stay attached while the turn's spans and tool calls are polled.
         #[cfg(feature = "otel")]
         let trace_cx = crate::otel::trace_context::extract_from_meta(args.meta.as_ref())

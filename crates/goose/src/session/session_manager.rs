@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: register parent links for provider headers.
+// Modified by Jonathan Mohrbacher, 2026: register parent links for provider headers; truncate_conversation_from_message reports whether the message was found and clears stale context usage.
 use crate::agents::Container;
 use crate::config::paths::Paths;
 use crate::config::ExtensionConfig;
@@ -644,11 +644,13 @@ impl SessionManager {
             .await
     }
 
+    /// Deletes the message with `message_id` and every later message. Returns false (and
+    /// deletes nothing) when the session has no message with that id.
     pub async fn truncate_conversation_from_message(
         &self,
         session_id: &str,
         message_id: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.storage
             .truncate_conversation_from_message(session_id, message_id)
             .await
@@ -3052,7 +3054,7 @@ impl SessionStorage {
         &self,
         session_id: &str,
         message_id: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let pool = self.pool().await?;
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
@@ -3074,10 +3076,20 @@ impl SessionStorage {
             .bind(boundary_id)
             .execute(&mut *tx)
             .await?;
+
+            // The session's current usage describes the last provider call, whose context
+            // included the rows just removed; auto-compaction would act on it. Accumulated
+            // totals are spend and stay.
+            sqlx::query(
+                "UPDATE sessions SET input_tokens = NULL, output_tokens = NULL, total_tokens = NULL, cache_read_tokens = NULL, cache_write_tokens = NULL WHERE id = ?",
+            )
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(boundary.is_some())
     }
 
     async fn search_chat_history(
@@ -3810,15 +3822,33 @@ mod tests {
         .unwrap();
         set_message_timestamp(&sm, &session.id, "next-prompt", timestamp).await;
 
-        sm.truncate_conversation_from_message(&session.id, "terminal-history")
+        sm.update(&session.id)
+            .usage(Usage::new(Some(900), Some(100), Some(1000)))
+            .accumulated_usage(Usage::new(Some(9000), Some(1000), Some(10000)))
+            .apply()
             .await
             .unwrap();
+
+        assert!(!sm
+            .truncate_conversation_from_message(&session.id, "no-such-message")
+            .await
+            .unwrap());
+        let untouched = sm.get_session(&session.id, false).await.unwrap();
+        assert_eq!(untouched.usage.total_tokens, Some(1000));
+
+        assert!(sm
+            .truncate_conversation_from_message(&session.id, "terminal-history")
+            .await
+            .unwrap());
 
         let reloaded = sm.get_session(&session.id, true).await.unwrap();
         let messages = reloaded.conversation.unwrap().messages().to_vec();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id.as_deref(), Some("assistant"));
         assert_eq!(messages[0].as_concat_text(), "assistant reply");
+        assert_eq!(reloaded.usage.total_tokens, None);
+        assert_eq!(reloaded.usage.input_tokens, None);
+        assert_eq!(reloaded.accumulated_usage.total_tokens, Some(10000));
     }
 
     #[tokio::test]
