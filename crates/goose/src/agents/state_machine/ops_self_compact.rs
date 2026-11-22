@@ -201,6 +201,9 @@ pub fn self_compact_available(session: &Session, provider: &dyn Provider) -> boo
     {
         return false;
     }
+    if crate::session::session_has_zero_extensions(session) {
+        return false;
+    }
     let enabled = Config::global()
         .get_param::<bool>("GOOSE_SELF_COMPACT")
         .unwrap_or(true);

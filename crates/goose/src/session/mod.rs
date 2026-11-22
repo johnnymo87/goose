@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: export session_has_zero_extensions for tool-less sessions.
 mod chat_history_search;
 mod diagnostics;
 mod durable_tool_metadata;
@@ -21,7 +22,8 @@ pub use export_markdown::{
     export_session_to_markdown, message_to_markdown, user_projected_message_to_markdown,
 };
 pub use extension_data::{
-    EnabledExtensionsState, ExtensionData, ExtensionState, GoalState, TodoState,
+    session_has_zero_extensions, EnabledExtensionsState, ExtensionData, ExtensionState, GoalState,
+    TodoState,
 };
 pub use session_manager::{
     Session, SessionInsights, SessionManager, SessionNameUpdate, SessionType, SessionUpdateBuilder,

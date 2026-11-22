@@ -1,10 +1,17 @@
+// Modified by Jonathan Mohrbacher, 2026: wrap SkillOperation to offer no tools when a session has zero extensions.
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use goose_agent::command::Command;
+use goose_agent::operation::{not_applicable, Emitter, Operation, OperationResult};
 use goose_agent::skills::SkillSource;
 use goose_sdk_types::custom_requests::SourceEntry;
+use rmcp::model::Tool;
 
+use super::effects::GooseEffect;
+use crate::conversation::Conversation;
 use crate::session::Session;
 
 pub(crate) const NO_SKILLS_HELP: &str = "No skills installed.\n\n\
@@ -12,6 +19,67 @@ pub(crate) const NO_SKILLS_HELP: &str = "No skills installed.\n\n\
     - ~/.agents/skills/ (global)\n  \
     - ~/.agents/plugins/*/skills/ (installed plugins)\n  \
     - .agents/skills/ (in current project)\n";
+
+pub struct SkillOperation<'a> {
+    inner: goose_agent::skills::SkillOperation<'a, Session>,
+}
+
+impl<'a> SkillOperation<'a> {
+    pub fn new(source: Arc<dyn SkillSource<Session> + 'a>) -> Self {
+        Self {
+            inner: goose_agent::skills::SkillOperation::new(source),
+        }
+    }
+
+    pub fn with_no_skills_help(mut self, help: impl Into<String>) -> Self {
+        self.inner = self.inner.with_no_skills_help(help);
+        self
+    }
+}
+
+#[async_trait]
+impl Operation<Session, GooseEffect> for SkillOperation<'_> {
+    fn name(&self) -> &'static str {
+        Operation::<Session, GooseEffect>::name(&self.inner)
+    }
+
+    async fn commands(&self, session: &Session) -> Result<Vec<Command<'_, Session, GooseEffect>>> {
+        if crate::session::session_has_zero_extensions(session) {
+            return Ok(Vec::new());
+        }
+        self.inner.commands(session).await
+    }
+
+    async fn inference_tools(&self, session: &Session) -> Result<Vec<Tool>> {
+        if crate::session::session_has_zero_extensions(session) {
+            return Ok(Vec::new());
+        }
+        Operation::<Session, GooseEffect>::inference_tools(&self.inner, session).await
+    }
+
+    async fn prompt_parts(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+    ) -> Result<Vec<(String, String)>> {
+        if crate::session::session_has_zero_extensions(session) {
+            return Ok(Vec::new());
+        }
+        Operation::<Session, GooseEffect>::prompt_parts(&self.inner, session, conversation).await
+    }
+
+    async fn run(
+        &self,
+        session: &Session,
+        conversation: &Conversation,
+        emit: &Emitter,
+    ) -> Result<OperationResult<GooseEffect>> {
+        if crate::session::session_has_zero_extensions(session) {
+            return not_applicable();
+        }
+        self.inner.run(session, conversation, emit).await
+    }
+}
 
 pub(crate) struct GooseSkillSource;
 
@@ -99,5 +167,38 @@ mod tests {
             .unwrap();
 
         assert!(content.contains("Symlinked guidance."));
+    }
+
+    #[tokio::test]
+    async fn skill_operation_offers_no_tools_or_prompts_when_zero_extensions() {
+        use crate::session::extension_data::{
+            EnabledExtensionsState, ExtensionData, ExtensionState,
+        };
+
+        let op = SkillOperation::new(Arc::new(GooseSkillSource));
+
+        // Session with zero extensions
+        let mut extension_data = ExtensionData::default();
+        EnabledExtensionsState::new(Vec::new())
+            .to_extension_data(&mut extension_data)
+            .unwrap();
+        let session = Session {
+            extension_data,
+            ..Default::default()
+        };
+
+        assert!(op.inference_tools(&session).await.unwrap().is_empty());
+        assert!(op
+            .prompt_parts(&session, &Conversation::default())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(op.commands(&session).await.unwrap().is_empty());
+
+        // Default session (extensions not explicitly emptied)
+        let default_session = Session::default();
+        let tools = op.inference_tools(&default_session).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "load_skill");
     }
 }

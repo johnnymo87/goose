@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: export retry and compaction failure checks for turn errors; self-compaction operation; rolling memory operation; subdirectory_hints module.
+// Modified by Jonathan Mohrbacher, 2026: export retry and compaction failure checks for turn errors; self-compaction operation; rolling memory operation; subdirectory_hints module; wrap SkillOperation for tool-less sessions.
 //! Runs an ordered, re-entrant pipeline over persisted conversation state.
 //!
 //! Callers persist incoming messages, construct `Step`s from their own operations,
@@ -58,7 +58,6 @@ pub(crate) use tool_confirmation::{
     persist_tool_confirmation_decision,
 };
 
-pub(super) use goose_agent::skills::SkillOperation;
 pub(super) use inference_preparation::GooseInferenceRequestPreparer;
 pub(super) use ops_auto_effort::AutoEffortOperation;
 pub(crate) use ops_compaction::is_compaction_failure_message;
@@ -77,6 +76,7 @@ pub(crate) use ops_retry::is_retry_failure_message;
 pub(super) use ops_retry::RetryOperation;
 pub(super) use ops_rolling_memory::RollingMemoryOperation;
 pub(super) use ops_self_compact::{SelfCompactOperation, SelfCompactTurnLimitOperation};
+pub(super) use ops_skills::SkillOperation;
 pub(super) use ops_skills::{GooseSkillSource, NO_SKILLS_HELP};
 pub(super) use ops_status::StatusOperation;
 pub(super) use ops_stop_hook::{StopHookOperation, DEFAULT_BLOCK_CAP};

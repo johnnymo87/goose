@@ -147,6 +147,8 @@ jobs:
             "agents::state_machine::ops_self_compact::tests::test_self_compact_turn_limit_operation" \
             "agents::state_machine::ops_self_compact::tests::test_finalize_cancellation_guards" \
             "agents::state_machine::ops_self_compact::tests::test_finalize_cancellation_skips_prompt_with_persisted_outcome" \
+            "session::extension_data::tests::test_session_has_zero_extensions" \
+            "agents::state_machine::ops_skills::tests::skill_operation_offers_no_tools_or_prompts_when_zero_extensions" \
             "prompt_template::tests::compaction_rolling_template_is_registered" \
             "context_mgmt::rolling::tests::rolling_backoff_cases" \
             "context_mgmt::rolling::tests::rolling_calibrated_ratio_clamps" \
@@ -232,7 +234,8 @@ jobs:
             "test_tool_not_advertised_when_provider_manages_own_context" \
             "test_sibling_tool_call_compaction_waits_for_siblings" \
             "test_rebuilt_machine_mid_turn_at_most_once_per_turn" \
-            "test_recheck_availability_when_about_to_compact_self_compact"
+            "test_recheck_availability_when_about_to_compact_self_compact" \
+            "test_tools_not_advertised_when_session_has_zero_extensions"
 
           run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
             "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \

@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: session_has_zero_extensions helper for tool-less sessions.
 // Extension data management for sessions
 // Provides a simple way to store extension-specific data with versioned keys
 
@@ -170,6 +171,19 @@ impl EnabledExtensionsState {
     }
 }
 
+/// Returns true if the session explicitly has zero extensions configured.
+pub fn session_has_zero_extensions(session: &Session) -> bool {
+    if let Some(state) = EnabledExtensionsState::from_extension_data(&session.extension_data) {
+        return state.extensions.is_empty();
+    }
+    if let Some(recipe) = &session.recipe {
+        if let Some(extensions) = &recipe.extensions {
+            return extensions.is_empty();
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +339,51 @@ mod tests {
         assert!(!names
             .iter()
             .any(|name| name == "definitely_not_real_platform_extension"));
+    }
+
+    #[test]
+    fn test_session_has_zero_extensions() {
+        let make_session = |extension_data: ExtensionData| Session {
+            extension_data,
+            ..Default::default()
+        };
+
+        // 1. Empty extension data (no state saved) -> false
+        let session = make_session(ExtensionData::default());
+        assert!(!session_has_zero_extensions(&session));
+
+        // 2. Explicitly empty extensions list -> true
+        let mut empty_ext_data = ExtensionData::default();
+        EnabledExtensionsState::new(Vec::new())
+            .to_extension_data(&mut empty_ext_data)
+            .unwrap();
+        let session = make_session(empty_ext_data);
+        assert!(session_has_zero_extensions(&session));
+
+        // 3. Non-empty extensions list -> false
+        let mut populated_ext_data = ExtensionData::default();
+        EnabledExtensionsState::new(vec![test_extension()])
+            .to_extension_data(&mut populated_ext_data)
+            .unwrap();
+        let session = make_session(populated_ext_data);
+        assert!(!session_has_zero_extensions(&session));
+
+        // 4. Recipe with empty extensions -> true
+        let mut session = make_session(ExtensionData::default());
+        let recipe = crate::recipe::Recipe::from_content(
+            "title: t\ndescription: d\nprompt: p\nextensions: []\n",
+        )
+        .unwrap();
+        session.recipe = Some(recipe);
+        assert!(session_has_zero_extensions(&session));
+
+        // 5. Recipe with non-empty extensions -> false
+        let mut session = make_session(ExtensionData::default());
+        let recipe = crate::recipe::Recipe::from_content(
+            "title: t\ndescription: d\nprompt: p\nextensions:\n  - name: developer\n    type: builtin\n",
+        )
+        .unwrap();
+        session.recipe = Some(recipe);
+        assert!(!session_has_zero_extensions(&session));
     }
 }
