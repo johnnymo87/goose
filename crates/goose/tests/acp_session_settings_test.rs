@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set and session/prompt _meta.goose.maxTurns.
+// Modified by Jonathan Mohrbacher, 2026: test _goose/unstable/session/settings/set and session/prompt _meta.goose.maxTurns (stopReason max_turn_requests).
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -435,17 +435,12 @@ fn test_prompt_max_turns_bounds_run() {
             1,
             "maxTurns 1 must stop the run before the final_output continuation: {result:?}"
         );
+        let response = result.expect("reaching max turns is a normal stop, not a failed turn");
+        assert_eq!(response["stopReason"], "max_turn_requests");
         let text = agent_text(&session.session_updates());
-        let reported = match &result {
-            Ok(_) => text.contains("maximum number of actions"),
-            Err(err) => {
-                format!("{err:?}").contains("maximum number of actions")
-                    || text.contains("maximum number of actions")
-            }
-        };
         assert!(
-            reported,
-            "expected the max turns message: {result:?} / {text}"
+            text.contains("maximum number of actions"),
+            "expected the max turns message: {text}"
         );
     });
 }

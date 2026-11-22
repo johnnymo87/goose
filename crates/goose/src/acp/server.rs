@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: session/prompt turn_failed errors carry data.kind and data.message; register session_settings (settings/set) and honour session/prompt _meta.goose.maxTurns; session/prompt _meta.goose.messageId sets the stored user message id; advertise truncateFromMessage.
+// Modified by Jonathan Mohrbacher, 2026: session/prompt turn_failed errors carry data.kind and data.message; register session_settings (settings/set) and honour session/prompt _meta.goose.maxTurns; session/prompt _meta.goose.messageId sets the stored user message id; advertise truncateFromMessage; reaching max turns ends the prompt with stopReason max_turn_requests.
 use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 pub(super) use crate::acp::response_builder::{
@@ -225,6 +225,7 @@ const PROVIDER_CONFIG_STATUS_CHECK_CONCURRENCY: usize = 16;
 /// below is keyed by session ID.
 struct AgentStreamOutcome {
     was_cancelled: bool,
+    max_turns_reached: bool,
     output_token_limit_reached: bool,
 }
 
@@ -763,9 +764,15 @@ fn build_prompt_usage(session: &Session) -> Option<Usage> {
     Some(Usage::new(total, input, output))
 }
 
-fn prompt_stop_reason(was_cancelled: bool, output_token_limit_reached: bool) -> StopReason {
+fn prompt_stop_reason(
+    was_cancelled: bool,
+    max_turns_reached: bool,
+    output_token_limit_reached: bool,
+) -> StopReason {
     if was_cancelled {
         StopReason::Cancelled
+    } else if max_turns_reached {
+        StopReason::MaxTurnRequests
     } else if output_token_limit_reached {
         StopReason::MaxTokens
     } else {
@@ -2201,6 +2208,7 @@ impl AcpConnection {
         }
 
         let was_cancelled = cancel_token.is_cancelled();
+        let mut max_turns_reached = false;
         if !was_cancelled {
             if last_message_was_error {
                 let session = self
@@ -2209,11 +2217,15 @@ impl AcpConnection {
                     .get_session(session_id, true)
                     .await
                     .internal_err_ctx("Failed to load session")?;
-                if let Some(error) = session
+                let last_error = session
                     .conversation
                     .as_ref()
                     .and_then(Conversation::last)
-                    .filter(|message| message.error_kind().is_some())
+                    .filter(|message| message.error_kind().is_some());
+                max_turns_reached =
+                    last_error.is_some_and(crate::acp::turn_error::is_max_turns_message);
+                if let Some(error) = last_error
+                    .filter(|_| !max_turns_reached)
                     .and_then(|message| {
                         message
                             .content
@@ -2231,6 +2243,7 @@ impl AcpConnection {
 
         Ok(AgentStreamOutcome {
             was_cancelled,
+            max_turns_reached,
             output_token_limit_reached,
         })
     }
@@ -2331,8 +2344,11 @@ impl AcpConnection {
         let outcome = stream_result?;
         let session = usage_result?;
 
-        let stop_reason =
-            prompt_stop_reason(outcome.was_cancelled, outcome.output_token_limit_reached);
+        let stop_reason = prompt_stop_reason(
+            outcome.was_cancelled,
+            outcome.max_turns_reached,
+            outcome.output_token_limit_reached,
+        );
 
         let mut response = PromptResponse::new(stop_reason);
         if let Some(usage) = build_prompt_usage(&session) {
@@ -3548,9 +3564,18 @@ print(\"hello, world\")
         expected: StopReason,
     ) {
         assert_eq!(
-            prompt_stop_reason(was_cancelled, output_token_limit_reached),
+            prompt_stop_reason(was_cancelled, false, output_token_limit_reached),
             expected
         );
+    }
+
+    #[test]
+    fn test_prompt_stop_reason_reports_max_turn_requests() {
+        assert_eq!(
+            prompt_stop_reason(false, true, true),
+            StopReason::MaxTurnRequests
+        );
+        assert_eq!(prompt_stop_reason(true, true, false), StopReason::Cancelled);
     }
 
     #[test]
