@@ -30,7 +30,15 @@ fn normalized_cache_ttl(ttl: &str) -> Result<String, agent_client_protocol::Erro
 
 /// The recipe as the session row stores it: rendered with the session's
 /// parameter values, except for scheduled sessions, which keep the template.
-fn recipe_to_store(raw: Recipe, session: &Session) -> Result<Recipe, agent_client_protocol::Error> {
+/// `retry` and `sub_recipes` are dropped: the state machine reads the stored
+/// recipe every turn, and a retry block would let a failed check truncate a
+/// long-lived session back to its kickoff message.
+fn recipe_to_store(
+    mut raw: Recipe,
+    session: &Session,
+) -> Result<Recipe, agent_client_protocol::Error> {
+    raw.retry = None;
+    raw.sub_recipes = None;
     if raw.check_for_security_warnings() {
         return Err(invalid_recipe(
             "contains hidden characters that could be malicious",
@@ -108,7 +116,7 @@ impl AcpConnection {
             .map(normalized_cache_ttl)
             .transpose()?;
 
-        let session = self
+        let mut session = self
             .services
             .session_manager
             .get_session(session_id, false)
@@ -153,15 +161,17 @@ impl AcpConnection {
             }
         }
 
-        if let Some(recipe) = recipe {
-            self.services
-                .session_manager
-                .update(session_id)
-                .recipe(Some(recipe))
-                .apply()
-                .await
-                .internal_err_ctx("Failed to persist recipe to session")?;
-        }
+        let Some(recipe) = recipe else {
+            self.render_stored_recipe_template(&mut session).await?;
+            return Ok(EmptyResponse {});
+        };
+        self.services
+            .session_manager
+            .update(session_id)
+            .recipe(Some(recipe))
+            .apply()
+            .await
+            .internal_err_ctx("Failed to persist recipe to session")?;
 
         Ok(EmptyResponse {})
     }

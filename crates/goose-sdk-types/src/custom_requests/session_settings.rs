@@ -7,9 +7,10 @@ use super::{EmptyResponse, RecipeDto};
 
 /// Pin a session's prompt-cache TTL and recipe, persisted on the session row.
 ///
-/// Only the recipe's `instructions` and `response` take effect; its `settings`,
-/// `extensions`, `prompt` and `parameters` are ignored, and the session keeps
-/// its model.
+/// The recipe is stored on the session and read every turn: its `title`,
+/// `instructions` and `response` take effect. Its `settings`, `extensions`,
+/// `prompt` and `parameters` are ignored, `retry` and `sub_recipes` are
+/// dropped, and the session keeps its model.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
 #[request(
     method = "_goose/unstable/session/settings/set",
