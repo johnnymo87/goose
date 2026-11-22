@@ -181,9 +181,12 @@ impl Breaker {
         }
     }
 
-    /// For the state-machine loop: let the trip step's tools finish first.
+    /// For the state-machine loop: let the trip step's tools finish first. That loop
+    /// always sends a step's message before its usage, but sends no message at all for
+    /// an empty response, so the order is fixed here rather than learned.
     pub fn deferring_to_tool_results(mut self) -> Self {
         self.defer_to_tool_results = true;
+        self.order = Some(Order::MessageFirst);
         self
     }
 
@@ -233,6 +236,11 @@ impl Breaker {
         if read > 0 && self.state == State::Tripped {
             // The cache recovered before the delegate asked for more tools.
             self.state = State::Watching;
+        }
+        if self.state == State::Tripped && step_wants_tools && self.defer_to_tool_results {
+            // Still cold, and this step asked for tools after a text-only trip.
+            self.state = State::AwaitingToolResults;
+            return Verdict::Continue;
         }
         let Some(detector) = self.detector.as_mut() else {
             return Verdict::Continue;
@@ -297,7 +305,8 @@ impl Breaker {
         }
         match self.state {
             State::Tripped if self.defer_to_tool_results => {
-                self.state = State::AwaitingToolResults;
+                // Its usage, which follows, says whether the cache has recovered.
+                self.step_wants_tools = true;
                 Verdict::Continue
             }
             State::Tripped => self.stop(),
@@ -372,11 +381,21 @@ where
     }
 }
 
-pub(crate) fn with_last_output(message: String, last: Option<String>) -> String {
-    match last.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+/// A breaker stop fails the delegate with the stop message and its last output.
+pub(crate) fn stopped_outcome(
+    error: &anyhow::Error,
+    latest_turn: &[Message],
+) -> Option<goose_agent::subagent::SubagentOutcome> {
+    error.downcast_ref::<Stopped>()?;
+    let message = error.to_string();
+    let outcome = match last_assistant_text(latest_turn)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
         Some(text) => format!("{message}\n--- its last output ---\n{text}"),
         None => message,
-    }
+    };
+    Some(goose_agent::subagent::SubagentOutcome::Failed(outcome))
 }
 
 /// Typed error so the foreground runner can recognise a breaker stop.
@@ -548,6 +567,61 @@ mod tests {
             Verdict::Stop,
             "trips again"
         );
+    }
+
+    #[test]
+    fn deferred_breaker_ignores_an_empty_first_response() {
+        // The state machine sends no message for an empty response, only its usage.
+        let model = "gemini-test-deferred-empty-first";
+        let mut b = Breaker::with_detector("child", Some(Detector::new(1, 1000)))
+            .deferring_to_tool_results();
+        b.observe(&usage(model, 2000, 1500));
+        assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
+        let results = Message::user()
+            .with_tool_response("call-1", Ok(rmcp::model::CallToolResult::success(vec![])));
+        assert_eq!(
+            b.observe(&AgentEvent::Message(results)),
+            Verdict::Stop,
+            "the trip step's tools were requested, so its results stop it"
+        );
+    }
+
+    #[test]
+    fn deferred_breaker_rearms_when_the_cache_recovers_after_a_text_only_trip() {
+        let model = "gemini-test-deferred-rearm";
+        let mut b = Breaker::with_detector("child", Some(Detector::new(1, 1000)))
+            .deferring_to_tool_results();
+        b.observe(&tool_call("developer__shell"));
+        b.observe(&usage(model, 2000, 1500));
+        b.observe(&AgentEvent::Message(
+            Message::assistant().with_text("text only"),
+        ));
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
+        assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
+        assert_eq!(b.observe(&usage(model, 2000, 1500)), Verdict::Continue);
+        let results = Message::user()
+            .with_tool_response("call-1", Ok(rmcp::model::CallToolResult::success(vec![])));
+        assert_eq!(b.observe(&AgentEvent::Message(results)), Verdict::Continue);
+        assert!(!b.stopped(), "the cache recovered, so the delegate runs on");
+    }
+
+    #[test]
+    fn deferred_breaker_stops_after_a_text_only_trip_when_the_cache_stays_cold() {
+        let model = "gemini-test-deferred-cold";
+        let mut b = Breaker::with_detector("child", Some(Detector::new(1, 1000)))
+            .deferring_to_tool_results();
+        b.observe(&tool_call("developer__shell"));
+        b.observe(&usage(model, 2000, 1500));
+        b.observe(&AgentEvent::Message(
+            Message::assistant().with_text("text only"),
+        ));
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
+        assert_eq!(b.observe(&tool_call("developer__shell")), Verdict::Continue);
+        assert_eq!(b.observe(&usage(model, 2000, 0)), Verdict::Continue);
+        let results = Message::user()
+            .with_tool_response("call-1", Ok(rmcp::model::CallToolResult::success(vec![])));
+        assert_eq!(b.observe(&AgentEvent::Message(results)), Verdict::Stop);
     }
 
     #[test]

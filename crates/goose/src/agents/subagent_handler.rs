@@ -179,12 +179,8 @@ impl ForegroundSubagentRunner {
             return SubagentOutcome::Cancelled;
         }
         if let Err(error) = run_result {
-            if error.is::<cache_miss_breaker::Stopped>() {
-                let last = cache_miss_breaker::last_assistant_text(latest_turn);
-                return SubagentOutcome::Failed(cache_miss_breaker::with_last_output(
-                    error.to_string(),
-                    last,
-                ));
+            if let Some(outcome) = cache_miss_breaker::stopped_outcome(&error, latest_turn) {
+                return outcome;
             }
             return SubagentOutcome::Failed(error.to_string());
         }

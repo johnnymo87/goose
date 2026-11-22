@@ -206,6 +206,9 @@ jobs:
             "agents::cache_miss_breaker::tests::deferred_breaker_waits_for_the_trip_steps_tool_results" \
             "agents::cache_miss_breaker::tests::deferred_breaker_never_lets_another_call_through" \
             "agents::cache_miss_breaker::tests::a_cache_hit_after_a_text_only_trip_rearms_the_breaker" \
+            "agents::cache_miss_breaker::tests::deferred_breaker_ignores_an_empty_first_response" \
+            "agents::cache_miss_breaker::tests::deferred_breaker_rearms_when_the_cache_recovers_after_a_text_only_trip" \
+            "agents::cache_miss_breaker::tests::deferred_breaker_stops_after_a_text_only_trip_when_the_cache_stays_cold" \
             "agents::cache_miss_breaker::tests::breaker_lets_a_final_answer_through" \
             "agents::cache_miss_breaker::tests::breaker_ignores_non_gemini_and_models_never_seen_caching" \
             "agents::cache_miss_breaker::delegate_tests::cache_miss_breaker_stops_a_stuck_gemini_delegate_and_tells_the_lead" \
