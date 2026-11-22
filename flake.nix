@@ -1,3 +1,4 @@
+# Modified by Jonathan Mohrbacher, 2026: dev shell adds bindgenHook and cmake so `cargo build -p goose-cli` works in it.
 {
   description = "goose - An AI agent CLI";
 
@@ -91,6 +92,13 @@
         };
 
         devShells.default = pkgs.mkShell {
+          # goose-cli's default features build llama-cpp-sys-2: bindgenHook exports
+          # LIBCLANG_PATH and BINDGEN_EXTRA_CLANG_ARGS, and its build script runs cmake.
+          nativeBuildInputs = with pkgs; [
+            rustPlatform.bindgenHook
+            cmake
+          ];
+
           packages = buildInputs ++ (with pkgs; [
             cargo-watch
             cargo-edit
