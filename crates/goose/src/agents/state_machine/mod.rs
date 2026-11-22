@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: export retry and compaction failure checks for turn errors.
 //! Runs an ordered, re-entrant pipeline over persisted conversation state.
 //!
 //! Callers persist incoming messages, construct `Step`s from their own operations,
@@ -57,6 +58,7 @@ pub(crate) use tool_confirmation::{
 pub(super) use goose_agent::skills::SkillOperation;
 pub(super) use inference_preparation::GooseInferenceRequestPreparer;
 pub(super) use ops_auto_effort::AutoEffortOperation;
+pub(crate) use ops_compaction::is_compaction_failure_message;
 pub(super) use ops_compaction::CompactionOperation;
 pub(super) use ops_context_relevance::{ContextRelevanceOperation, UnavailableDecisions};
 pub(super) use ops_doctor::DoctorOperation;
@@ -68,6 +70,7 @@ pub(super) use ops_recipe::RecipeOperation;
 pub(super) use ops_remaining_tool_calls::RemainingToolCallsOperation;
 #[cfg(test)]
 pub(super) use ops_remaining_tool_calls::UNCLAIMED_TOOL_ERROR;
+pub(crate) use ops_retry::is_retry_failure_message;
 pub(super) use ops_retry::RetryOperation;
 pub(super) use ops_skills::{GooseSkillSource, NO_SKILLS_HELP};
 pub(super) use ops_status::StatusOperation;

@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: compaction failure messages are recognisable as turn errors.
 //! Compacts conversation history when it is too large for the configured context window.
 
 use std::sync::Arc;
@@ -268,6 +269,12 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
     }
 }
 
+const COMPACTION_FAILURE_PREFIX: &str = "Ran into this error trying to compact: ";
+
+pub(crate) fn is_compaction_failure_message(message: &str) -> bool {
+    message.starts_with(COMPACTION_FAILURE_PREFIX)
+}
+
 fn compaction_failure_message(e: &anyhow::Error) -> Message {
     let provider_error = e.downcast_ref::<ProviderError>();
     if let Some(err @ ProviderError::CreditsExhausted { .. }) = provider_error {
@@ -276,7 +283,7 @@ fn compaction_failure_message(e: &anyhow::Error) -> Message {
     Message::assistant().with_error(
         provider_error.map_or(MessageErrorKind::Other, MessageErrorKind::from),
         format!(
-            "Ran into this error trying to compact: {e}.\n\n\
+            "{COMPACTION_FAILURE_PREFIX}{e}.\n\n\
              Please try again or create a new session"
         ),
     )

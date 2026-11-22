@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: session/prompt turn_failed errors carry data.kind and data.message.
 use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 pub(super) use crate::acp::response_builder::{
@@ -1618,7 +1619,7 @@ fn prompt_error_from_message_content(
         MessageContent::Error(error)
             if error.kind == crate::conversation::message::MessageErrorKind::Authentication =>
         {
-            Some(agent_client_protocol::Error::auth_required().data(turn_failed_data()))
+            Some(agent_client_protocol::Error::auth_required().data(turn_failed_data(error)))
         }
         MessageContent::SystemNotification(notification)
             if notification.notification_type == SystemNotificationType::CreditsExhausted =>
@@ -1640,14 +1641,14 @@ fn prompt_error_from_message_content(
         }
         MessageContent::Error(error) => Some(
             agent_client_protocol::Error::new(-32603, error.message.clone())
-                .data(turn_failed_data()),
+                .data(turn_failed_data(error)),
         ),
         _ => None,
     }
 }
 
-fn turn_failed_data() -> serde_json::Value {
-    serde_json::json!({ "reason": crate::acp::TURN_FAILED_REASON })
+fn turn_failed_data(error: &crate::conversation::message::ErrorContent) -> serde_json::Value {
+    crate::acp::turn_error::turn_failed_data(error)
 }
 
 fn credits_exhausted_prompt_error(
@@ -3441,7 +3442,9 @@ print(\"hello, world\")
             error.code,
             agent_client_protocol::schema::v1::ErrorCode::AuthRequired
         );
-        assert_eq!(error.data.unwrap()["reason"], "turn_failed");
+        let data = error.data.unwrap();
+        assert_eq!(data["reason"], "turn_failed");
+        assert_eq!(data["kind"], "authentication");
     }
 
     #[test]
@@ -3459,7 +3462,7 @@ print(\"hello, world\")
             serde_json::json!({
                 "code": -32603,
                 "message": message,
-                "data": { "reason": "turn_failed" }
+                "data": { "reason": "turn_failed", "kind": "network", "message": message }
             })
         );
     }
