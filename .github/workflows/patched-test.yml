@@ -33,9 +33,9 @@ jobs:
             | tee /dev/stderr | grep -F 'vendor/agent-client-protocol-http'
       - name: Test patched modules
         run: |
-          run_filtered_tests() {
+          run_exact_tests() {
             local cargo_args=()
-            local filters=()
+            local tests=()
             local seen_sep=false
 
             for arg in "$@"; do
@@ -44,32 +44,67 @@ jobs:
                 continue
               fi
               if [ "$seen_sep" = true ]; then
-                filters+=("$arg")
+                tests+=("$arg")
               else
                 cargo_args+=("$arg")
               fi
             done
 
-            if [ ${#filters[@]} -gt 0 ]; then
-              echo "Asserting test filters match in cargo test ${cargo_args[*]}..."
-              local list
-              list="$(cargo test "${cargo_args[@]}" -- --list | grep -E ': (test|benchmark)$')"
-              for filter in "${filters[@]}"; do
-                local count
-                count="$(echo "$list" | grep -F -c "$filter" || true)"
-                if [ "$count" -eq 0 ]; then
-                  echo "Error: test filter '$filter' matched 0 tests in cargo test ${cargo_args[*]}" >&2
-                  exit 1
-                fi
-                echo "  filter '$filter': $count test(s) matched"
-              done
-            fi
+            echo "Verifying ${#tests[@]} exact test(s) exist for: cargo test ${cargo_args[*]}..."
+            local list
+            list="$(cargo test "${cargo_args[@]}" -- "${tests[@]}" --exact --list)"
+            for t in "${tests[@]}"; do
+              if ! echo "$list" | grep -q "^$t: \(test\|benchmark\)$"; then
+                echo "Error: exact test '$t' not found in cargo test ${cargo_args[*]}" >&2
+                exit 1
+              fi
+            done
+            echo "All ${#tests[@]} exact test(s) verified to exist."
 
-            cargo test "${cargo_args[@]}" -- "${filters[@]}"
+            cargo test "${cargo_args[@]}" -- "${tests[@]}" --exact
           }
 
           F=code-mode,tree-sitter,aws-providers,telemetry,otel,rustls-tls,live-voice,system-keyring,platform-apps,chat-recall,scheduler,acp-http,online-model-meta
-          run_filtered_tests --release -p goose --features "$F" --lib -- gcpvertexai session_context test_parent_link_is_visible_to_providers gcpauth cache_ttl global_skill recipe_thinking_effort recipe_without_thinking_effort thinking_effort_parsing invalid_thinking_effort toolshim_provider_stream thinking_deltas_before_transient_error
-          run_filtered_tests --release -p goose-provider-types --lib -- native_claude_thinking summarized_thinking_round_trips test_streaming_thinking test_streaming_omitted_thinking test_streamed_thinking test_streaming_redacted_thinking
-          run_filtered_tests --release -p goose-cli --lib -- cache_ttl
+          run_exact_tests --release -p goose --features "$F" --lib -- \
+            "providers::gcpvertexai::tests::test_build_vertex_url_proxy_host_keeps_target_location_in_path" \
+            "providers::gcpauth::tests::authorized_user_scope_defaults_and_overrides" \
+            "model_config::cache_ttl_tests::rederive_preserves_stored_ttl_when_config_absent" \
+            "model_config::cache_ttl_tests::rederive_replaces_stored_ttl_with_configured_value" \
+            "model_config::cache_ttl_tests::rederive_applies_configured_ttl_when_stored_absent" \
+            "model_config::cache_ttl_tests::rederive_leaves_unset_when_both_stored_and_config_absent" \
+            "skills::tests::global_skill_dirs_are_scanned_by_default" \
+            "skills::tests::global_skills_false_scans_only_project_dirs" \
+            "skills::tests::unrecognised_global_skills_value_fails_toward_project_only" \
+            "skills::tests::global_skills_false_also_refuses_path_resolution_into_home_roots" \
+            "providers::gcpvertexai::tests::test_route_host_sends_only_gemini_to_the_gemini_host" \
+            "session_context::tests::test_parse_header_names" \
+            "session_context::tests::test_session_id_request_builder_rejects_invalid_header_override" \
+            "session_context::tests::test_session_headers_builder_top_level_session_has_no_parent_header" \
+            "session_context::tests::test_session_headers_builder_sends_every_name_and_the_parent" \
+            "session::session_manager::tests::test_parent_link_is_visible_to_providers" \
+            "recipe::tests::test_format_serde_error_invalid_thinking_effort" \
+            "agents::platform_extensions::summon::tests::test_resolve_model_config_recipe_thinking_effort_overrides_parent_on_override" \
+            "agents::platform_extensions::summon::tests::test_resolve_model_config_recipe_thinking_effort_overrides_parent_on_clone" \
+            "agents::platform_extensions::summon::tests::test_resolve_model_config_recipe_without_thinking_effort_inherits_parent" \
+            "agents::platform_extensions::summon::tests::test_recipe_yaml_thinking_effort_parsing" \
+            "providers::formats::gcpvertexai::tests::claude_adaptive_thinking_requests_summarized_display" \
+            "agents::reply_parts::tests::toolshim_provider_stream_coalesces_streamed_thinking" \
+            "agents::reply_parts::tests::thinking_deltas_before_transient_error_retries_and_succeeds" \
+            "agents::reply_parts::tests::signed_thinking_close_before_transient_error_does_not_retry"
+
+          run_exact_tests --release -p goose-provider-types --lib -- \
+            "formats::anthropic::tests::native_claude_thinking_carries_display_and_block_binding" \
+            "formats::anthropic::tests::summarized_thinking_round_trips_with_its_signature" \
+            "formats::anthropic::tests::test_streaming_thinking_arrives_before_its_block_stops" \
+            "formats::anthropic::tests::test_streaming_omitted_thinking_yields_one_signed_block" \
+            "formats::anthropic::tests::test_streamed_thinking_text_and_tool_call_store_one_message" \
+            "formats::anthropic::tests::test_streaming_thinking_after_completed_tool_use" \
+            "formats::anthropic::tests::test_streaming_thinking_and_text" \
+            "formats::anthropic::tests::test_streaming_thinking_from_start_block_without_signature" \
+            "formats::anthropic::tests::test_streaming_thinking_text_then_tool_call" \
+            "formats::anthropic::tests::test_streaming_redacted_thinking"
+
+          run_exact_tests --release -p goose-cli --lib -- \
+            "session::builder::tests::resume_keeps_saved_cache_ttl_when_config_absent"
+
           cargo test --release -p agent-client-protocol-http --features server --lib
