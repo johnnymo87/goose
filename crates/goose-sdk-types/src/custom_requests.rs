@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: register the session_settings custom request module.
 use agent_client_protocol::schema::v1::{
     AvailableCommand, ContentBlock, McpServer, Meta, SessionInfo,
 };
@@ -10,6 +11,8 @@ mod recipe;
 pub use recipe::*;
 mod schedule;
 pub use schedule::*;
+mod session_settings;
+pub use session_settings::*;
 
 /// Schema descriptor for a single custom method, produced by the
 /// `#[custom_methods]` macro's generated `custom_method_schemas()` function.

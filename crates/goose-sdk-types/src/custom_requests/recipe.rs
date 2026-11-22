@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: accept jsonSchema alias in RecipeResponseDto.
 use std::collections::HashMap;
 
 use agent_client_protocol::{JsonRpcRequest, JsonRpcResponse};
@@ -82,7 +83,7 @@ pub struct RecipeSettingsDto {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RecipeResponseDto {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "jsonSchema", skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<serde_json::Value>,
 }
 

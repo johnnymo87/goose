@@ -811,6 +811,36 @@
       ],
       "description": "How a session system prompt update should be applied."
     },
+    "SetSessionSettingsRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "cacheTtl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recipe": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecipeDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "description": "Pin a session's prompt-cache TTL and recipe, persisted on the session row.\n\nOnly the recipe's `instructions` and `response` take effect; its `settings`,\n`extensions`, `prompt` and `parameters` are ignored, and the session keeps\nits model.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/settings/set"
+    },
     "SteerSessionRequest_unstable": {
       "type": "object",
       "properties": {
@@ -7339,6 +7369,15 @@
                   ],
                   "description": "Params for _goose/unstable/session/system-prompt/set",
                   "title": "SetSessionSystemPromptRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/SetSessionSettingsRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/session/settings/set",
+                  "title": "SetSessionSettingsRequest_unstable"
                 },
                 {
                   "allOf": [
