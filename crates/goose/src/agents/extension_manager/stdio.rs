@@ -8,7 +8,7 @@ use super::super::container::Container;
 use super::super::extension::{ExtensionError, ExtensionResult, ProcessExit};
 use super::super::extension_malware_check;
 use super::super::mcp_client::{ConnectContext, McpClient};
-use super::super::mcp_startup_timeout::{kill_process_group, StartupStderr};
+use super::super::mcp_startup_timeout::{FailedStartKill, StartupStderr};
 use crate::config::search_path::SearchPaths;
 use crate::subprocess::spawn_long_lived_mcp_subprocess;
 
@@ -82,16 +82,19 @@ pub(super) async fn spawn(mut command: Command, ctx: ConnectContext) -> Extensio
     }
 
     let (transport, stderr) = spawn_long_lived_mcp_subprocess(command).await?;
-    let child_pid = transport.id();
+    let failed_start_kill = FailedStartKill::new(transport.id());
     let stderr = stderr.ok_or_else(|| {
         ExtensionError::SetupError("failed to attach child process stderr".to_owned())
     })?;
     let stderr = StartupStderr::capture(stderr);
 
     match McpClient::connect(transport, ctx).await {
-        Ok(client) => Ok(client),
+        Ok(client) => {
+            failed_start_kill.disarm();
+            Ok(client)
+        }
         Err(error) => {
-            kill_process_group(child_pid);
+            drop(failed_start_kill);
             Err(ProcessExit::new(stderr.collect().await, error).into())
         }
     }

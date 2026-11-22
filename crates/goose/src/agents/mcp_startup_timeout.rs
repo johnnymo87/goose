@@ -103,27 +103,51 @@ impl StartupStderr {
 
 const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// The child is its own process-group leader (`configure_subprocess` sets
-/// `process_group(0)`), so this also reaches grandchildren such as `npx`'s node.
-pub(crate) fn kill_process_group(child_pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = child_pid.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
+/// Kills the child's process group when dropped, unless the start succeeded. The child is
+/// its own process-group leader (`configure_subprocess` sets `process_group(0)`), so this
+/// also reaches grandchildren such as `npx`'s node, which rmcp's drop of the leader misses.
+/// Being a drop guard, it also runs when the caller abandons a start midway.
+pub(crate) struct FailedStartKill {
+    child_pid: Option<u32>,
+}
+
+impl FailedStartKill {
+    pub(crate) fn new(child_pid: Option<u32>) -> Self {
+        Self { child_pid }
+    }
+
+    pub(crate) fn disarm(mut self) {
+        self.child_pid = None;
+    }
+}
+
+impl Drop for FailedStartKill {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self
+            .child_pid
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        {
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
         }
     }
-    #[cfg(not(unix))]
-    let _ = child_pid;
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::action_required_manager::ActionRequiredManager;
+    #[cfg(unix)]
     use crate::agents::mcp_client::{ConnectContext, GooseMcpClientCapabilities, McpClient};
+    #[cfg(unix)]
     use rmcp::model::ProtocolVersion;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicU64;
 
+    #[cfg(unix)]
     pub(crate) fn hung_server_ctx(
         working_dir: &std::path::Path,
         protocol_version: Option<ProtocolVersion>,
@@ -184,6 +208,7 @@ pub(crate) mod tests {
         panic!("process {pid} still alive 5s after startup timeout");
     }
 
+    #[cfg(unix)]
     pub(crate) fn assert_startup_timeout_message(msg: &str) {
         assert!(
             msg.contains("MCP server did not finish initializing within 500ms")
