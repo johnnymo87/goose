@@ -1,9 +1,9 @@
-// Modified by Jonathan Mohrbacher, 2026: subagent policy: with GOOSE_SUBAGENT_DEFAULT_RECIPE set, an extension that fails to start fails the delegate.
+// Modified by Jonathan Mohrbacher, 2026: subagent policy: with GOOSE_SUBAGENT_DEFAULT_RECIPE set, an extension that fails to start fails the delegate; cache-miss breaker stops a Gemini delegate whose prompt cache stopped hitting (see cache_miss_breaker.rs).
 use crate::agents::platform_extensions::summon::subagent_policy;
 use crate::{
     agents::{
-        final_output_tool::FinalOutputTool, state_machine::messages_since_kickoff, AgentEvent,
-        SessionConfig, StateMachineServices,
+        cache_miss_breaker, final_output_tool::FinalOutputTool,
+        state_machine::messages_since_kickoff, AgentEvent, SessionConfig, StateMachineServices,
     },
     conversation::message::{ActionRequiredData, Message, MessageContent},
     prompt_template::render_template,
@@ -121,12 +121,22 @@ impl ForegroundSubagentRunner {
         if subagent_policy::is_active() {
             subagent_policy::require_started_extensions(&self.services, &subagent.id).await?;
         }
+        // A child token, so the breaker can stop this delegate without touching its parent.
+        let cancel = cancel.child_token();
+        let mut breaker =
+            cache_miss_breaker::Breaker::from_env(&subagent.id).deferring_to_tool_results();
         let mut events = self
             .services
-            .run_subagent_turn(session_config, cancel)
+            .run_subagent_turn(session_config, cancel.clone())
             .await?;
         while let Some(event) = events.next().await {
-            if let AgentEvent::Message(message) = event? {
+            let event = event?;
+            if breaker.observe(&event) == cache_miss_breaker::Verdict::Stop {
+                cancel.cancel();
+                cache_miss_breaker::drain_after_stop(&mut events).await;
+                return Err(cache_miss_breaker::Stopped(breaker.stop_message(None)).into());
+            }
+            if let AgentEvent::Message(message) = event {
                 if asks_for_a_decision(&message) {
                     let _ = to_parent.send(forwarded(
                         message,
@@ -169,6 +179,13 @@ impl ForegroundSubagentRunner {
             return SubagentOutcome::Cancelled;
         }
         if let Err(error) = run_result {
+            if error.is::<cache_miss_breaker::Stopped>() {
+                let last = cache_miss_breaker::last_assistant_text(latest_turn);
+                return SubagentOutcome::Failed(cache_miss_breaker::with_last_output(
+                    error.to_string(),
+                    last,
+                ));
+            }
             return SubagentOutcome::Failed(error.to_string());
         }
         SubagentOutcome::Failed(failure_reason(latest_turn))
