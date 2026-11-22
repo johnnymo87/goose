@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort.
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::final_output_tool::FinalOutputTool;
 use crate::agents::mcp_client::Error;
@@ -954,6 +955,7 @@ impl SummonClient {
                 goose_model: None,
                 temperature: None,
                 max_turns: None,
+                thinking_effort: None,
             })
             .max_turns = Some(max_turns);
         if recipe
@@ -1217,6 +1219,7 @@ impl SummonClient {
             goose_provider: params.provider.clone(),
             temperature: params.temperature,
             max_turns: None,
+            thinking_effort: None,
         });
 
         let mut builder = Recipe::builder()
@@ -1390,6 +1393,10 @@ impl SummonClient {
             model_config = model_config.with_temperature(Some(temp));
         } else if let Some(temp) = recipe.settings.as_ref().and_then(|s| s.temperature) {
             model_config = model_config.with_temperature(Some(temp));
+        }
+
+        if let Some(effort) = recipe.settings.as_ref().and_then(|s| s.thinking_effort) {
+            model_config = model_config.with_thinking_effort(effort);
         }
 
         Ok(model_config)
@@ -2579,6 +2586,7 @@ You review code."#;
                 goose_model: None,
                 temperature: None,
                 max_turns: recipe_limit,
+                thinking_effort: None,
             });
             assert_eq!(
                 SummonClient::resolve_max_turns(&params, &recipe, &config),
@@ -2816,6 +2824,7 @@ You review code."#;
             goose_model: Some("recipe-model".to_string()),
             temperature: None,
             max_turns: None,
+            thinking_effort: None,
         });
         let result = client
             .resolve_model_config(
@@ -2850,6 +2859,7 @@ You review code."#;
             goose_model: None,
             temperature: None,
             max_turns: None,
+            thinking_effort: None,
         });
         let (provider_name, _) = client
             .resolve_provider_config(
@@ -2883,6 +2893,7 @@ You review code."#;
             goose_model: None,
             temperature: None,
             max_turns: None,
+            thinking_effort: None,
         });
         let session = crate::session::Session::default();
         let (_, result) = client
@@ -2992,5 +3003,144 @@ You review code."#;
         assert!(error
             .to_string()
             .contains("No model configured for provider 'lmstudio'"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_recipe_thinking_effort_overrides_parent_on_override() {
+        use goose_providers::thinking::ThinkingEffort;
+
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        let parent = parent_config().with_thinking_effort(ThinkingEffort::Medium);
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let params = DelegateParams {
+            model: Some(OVERRIDE_MODEL.to_string()),
+            ..Default::default()
+        };
+        let recipe = Recipe::from_content(
+            r#"
+version: "1.0.0"
+title: "Test"
+description: "Test"
+instructions: "Test"
+settings:
+  thinking_effort: high
+"#,
+        )
+        .expect("recipe with thinking_effort should parse");
+
+        let resolved = client
+            .resolve_model_config(&params, &recipe, &session_with(parent), PROVIDER, None)
+            .expect("resolve_model_config");
+
+        assert_eq!(
+            resolved.thinking_effort(),
+            Some(ThinkingEffort::High),
+            "recipe settings.thinking_effort must override inherited effort on model override"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_recipe_thinking_effort_overrides_parent_on_clone() {
+        use goose_providers::thinking::ThinkingEffort;
+
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        let parent = parent_config().with_thinking_effort(ThinkingEffort::Medium);
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let params = DelegateParams::default();
+        let recipe = Recipe::from_content(
+            r#"
+version: "1.0.0"
+title: "Test"
+description: "Test"
+instructions: "Test"
+settings:
+  thinking_effort: high
+"#,
+        )
+        .expect("recipe with thinking_effort should parse");
+
+        let resolved = client
+            .resolve_model_config(&params, &recipe, &session_with(parent), PROVIDER, None)
+            .expect("resolve_model_config");
+
+        assert_eq!(
+            resolved.thinking_effort(),
+            Some(ThinkingEffort::High),
+            "recipe settings.thinking_effort must override inherited effort on same-model clone"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_recipe_without_thinking_effort_inherits_parent() {
+        use goose_providers::thinking::ThinkingEffort;
+
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        let parent = parent_config().with_thinking_effort(ThinkingEffort::Medium);
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let params = DelegateParams {
+            model: Some(OVERRIDE_MODEL.to_string()),
+            ..Default::default()
+        };
+        let recipe = empty_recipe();
+
+        let resolved = client
+            .resolve_model_config(&params, &recipe, &session_with(parent), PROVIDER, None)
+            .expect("resolve_model_config");
+
+        assert_eq!(
+            resolved.thinking_effort(),
+            Some(ThinkingEffort::Medium),
+            "recipe without thinking_effort must inherit parent's medium effort"
+        );
+    }
+
+    #[test]
+    fn test_recipe_yaml_thinking_effort_parsing() {
+        use goose_providers::thinking::ThinkingEffort;
+
+        let valid_yaml = r#"
+version: "1.0.0"
+title: "Test"
+description: "Test"
+instructions: "Test"
+settings:
+  thinking_effort: high
+"#;
+        let recipe =
+            Recipe::from_content(valid_yaml).expect("recipe with thinking_effort should parse");
+        assert_eq!(
+            recipe.settings.as_ref().and_then(|s| s.thinking_effort),
+            Some(ThinkingEffort::High),
+            "recipe yaml with thinking_effort: high must parse to Some(High)"
+        );
+
+        let bogus_yaml = r#"
+version: "1.0.0"
+title: "Test"
+description: "Test"
+instructions: "Test"
+settings:
+  thinking_effort: bogus
+"#;
+        let result = Recipe::from_content(bogus_yaml);
+        assert!(result.is_err(), "thinking_effort: bogus must fail to parse");
     }
 }
