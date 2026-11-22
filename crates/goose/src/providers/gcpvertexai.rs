@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: GCP_VERTEX_HOST overrides the request host; GCP_VERTEX_SESSION_HEADER renames the session id header.
+// Modified by Jonathan Mohrbacher, 2026: GCP_VERTEX_HOST overrides the request host; GCP_VERTEX_GEMINI_HOST overrides it for Gemini models; GCP_VERTEX_SESSION_HEADER names the session id header(s); GCP_VERTEX_PARENT_SESSION_HEADER carries a subagent's parent session.
 use std::io;
 use std::time::Duration;
 
@@ -80,6 +80,21 @@ fn map_429_retry(
         },
         sleep_for,
     )
+}
+
+/// Picks the host for one request: GCP_VERTEX_GEMINI_HOST for Google-published models when
+/// set, otherwise the provider host. The bool says whether that host is an override (a proxy),
+/// in which case the target location stays in the path instead of choosing a regional host.
+fn route_host<'a>(
+    host: &'a str,
+    host_overridden: bool,
+    gemini_host: Option<&'a str>,
+    provider: &ModelProvider,
+) -> (&'a str, bool) {
+    match (gemini_host, provider) {
+        (Some(gemini_host), ModelProvider::Google) => (gemini_host, true),
+        _ => (host, host_overridden),
+    }
 }
 
 fn build_vertex_url(
@@ -185,6 +200,10 @@ pub struct GcpVertexAIProvider {
     /// True when GCP_VERTEX_HOST is set: every location then goes to that host.
     #[serde(skip)]
     host_overridden: bool,
+    /// GCP_VERTEX_GEMINI_HOST: host for Google-published (Gemini) models only, overriding
+    /// `host` for them, so Claude and Gemini can go through different proxies.
+    #[serde(skip)]
+    gemini_host: Option<String>,
 }
 
 impl GcpVertexAIProvider {
@@ -203,24 +222,33 @@ impl GcpVertexAIProvider {
         let location = Self::determine_location(config)?;
         // GCP_VERTEX_HOST points every request at a proxy that speaks the Vertex paths (for
         // example a local failover proxy) instead of Google's regional hosts.
-        let host_override: Option<String> = config
-            .get_param("GCP_VERTEX_HOST")
-            .ok()
-            .map(|h: String| h.trim().trim_end_matches('/').to_string())
-            .filter(|h| !h.is_empty());
+        let host_param = |key: &str| -> Option<String> {
+            config
+                .get_param(key)
+                .ok()
+                .map(|h: String| h.trim().trim_end_matches('/').to_string())
+                .filter(|h| !h.is_empty())
+        };
+        let host_override = host_param("GCP_VERTEX_HOST");
         let host_overridden = host_override.is_some();
         let host = host_override.unwrap_or_else(|| Self::build_host_url(&location));
-        // GCP_VERTEX_SESSION_HEADER renames the session-id header, so a proxy that keys session
-        // stickiness on its own header name (e.g. x-opencode-session) can see goose sessions.
-        let session_header: Option<String> = config
-            .get_param("GCP_VERTEX_SESSION_HEADER")
-            .ok()
-            .filter(|h: &String| !h.trim().is_empty());
-        let request_builder =
-            crate::session_context::session_id_request_builder_with_header_override(
-                session_header.as_deref().map(str::trim),
-            )
-            .map_err(|e| anyhow::anyhow!("invalid GCP_VERTEX_SESSION_HEADER: {e}"))?;
+        // GCP_VERTEX_GEMINI_HOST sends Google-published models to their own proxy (e.g. a
+        // cost-capture gateway) while GCP_VERTEX_HOST keeps serving the Claude models.
+        let gemini_host = host_param("GCP_VERTEX_GEMINI_HOST");
+        // GCP_VERTEX_SESSION_HEADER names the session-id header(s), comma-separated, so proxies
+        // that key on their own header names (cfp's x-opencode-session, a gateway's
+        // x-session-id) all see goose sessions. GCP_VERTEX_PARENT_SESSION_HEADER additionally
+        // names a delegated subagent's parent session.
+        let request_builder = Self::session_request_builder(
+            config
+                .get_param::<String>("GCP_VERTEX_SESSION_HEADER")
+                .ok()
+                .as_deref(),
+            config
+                .get_param::<String>("GCP_VERTEX_PARENT_SESSION_HEADER")
+                .ok()
+                .as_deref(),
+        )?;
 
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
@@ -242,7 +270,31 @@ impl GcpVertexAIProvider {
             name: GCP_VERTEX_AI_PROVIDER_NAME.to_string(),
             request_builder,
             host_overridden,
+            gemini_host,
         })
+    }
+
+    fn session_request_builder(
+        session_headers: Option<&str>,
+        parent_header: Option<&str>,
+    ) -> Result<RequestBuilderDecorator> {
+        use crate::session_context::{parse_header_names, session_headers_request_builder};
+        let mut names = parse_header_names(session_headers.unwrap_or(""))
+            .map_err(|e| anyhow::anyhow!("invalid GCP_VERTEX_SESSION_HEADER: {e}"))?;
+        if names.is_empty() {
+            names.push(reqwest::header::HeaderName::from_static(
+                crate::session_context::SESSION_ID_HEADER,
+            ));
+        }
+        let parent = match parent_header.map(str::trim).filter(|h| !h.is_empty()) {
+            Some(h) => Some(
+                reqwest::header::HeaderName::from_bytes(h.as_bytes()).map_err(|e| {
+                    anyhow::anyhow!("invalid GCP_VERTEX_PARENT_SESSION_HEADER: {e}")
+                })?,
+            ),
+            None => None,
+        };
+        Ok(session_headers_request_builder(names, parent))
     }
 
     /// Loads retry configuration from environment variables or uses defaults.
@@ -317,15 +369,21 @@ impl GcpVertexAIProvider {
         location: &str,
         streaming: bool,
     ) -> Result<Url, GcpVertexAIError> {
+        let (host, overridden) = route_host(
+            &self.host,
+            self.host_overridden,
+            self.gemini_host.as_deref(),
+            &provider,
+        );
         // With a host override, never switch to a Google regional host for another location; the
         // location stays in the path and the proxy forwards it.
-        let configured_location = if self.host_overridden {
+        let configured_location = if overridden {
             location
         } else {
             self.location.as_str()
         };
         build_vertex_url(
-            &self.host,
+            host,
             configured_location,
             &self.project_id,
             &model.model_name,
@@ -850,6 +908,51 @@ mod tests {
             url.as_str(),
             "http://127.0.0.1:8789/v1/projects/test-project/locations/us-east5/publishers/anthropic/models/claude-opus-5-5:streamRawPredict"
         );
+    }
+
+    #[test]
+    fn test_route_host_sends_only_gemini_to_the_gemini_host() {
+        let cfp = "http://127.0.0.1:8789";
+        let gw = Some("http://127.0.0.1:8080");
+        assert_eq!(
+            route_host(cfp, true, gw, &ModelProvider::Google),
+            ("http://127.0.0.1:8080", true)
+        );
+        assert_eq!(
+            route_host(cfp, true, gw, &ModelProvider::Anthropic),
+            (cfp, true)
+        );
+        assert_eq!(
+            route_host(cfp, true, gw, &ModelProvider::MaaS("qwen".to_string())),
+            (cfp, true)
+        );
+        // Without GCP_VERTEX_HOST, Claude keeps Google's regional hosts, Gemini still proxied.
+        let google = "https://aiplatform.googleapis.com";
+        assert_eq!(
+            route_host(google, false, gw, &ModelProvider::Anthropic),
+            (google, false)
+        );
+        assert_eq!(
+            route_host(google, false, gw, &ModelProvider::Google),
+            ("http://127.0.0.1:8080", true)
+        );
+        // Unset: unchanged behaviour.
+        assert_eq!(
+            route_host(cfp, true, None, &ModelProvider::Google),
+            (cfp, true)
+        );
+    }
+
+    #[test]
+    fn test_session_request_builder_config() {
+        assert!(GcpVertexAIProvider::session_request_builder(None, None).is_ok());
+        assert!(GcpVertexAIProvider::session_request_builder(
+            Some("x-opencode-session,x-session-id"),
+            Some("x-parent-session-id")
+        )
+        .is_ok());
+        assert!(GcpVertexAIProvider::session_request_builder(Some("bad header"), None).is_err());
+        assert!(GcpVertexAIProvider::session_request_builder(None, Some("bad header")).is_err());
     }
 
     #[test]

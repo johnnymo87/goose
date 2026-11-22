@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: session headers for proxies (several names, plus a subagent's parent session id).
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -64,6 +65,77 @@ fn session_id_request_builder_with_header_name(
         if let Some(session_id) = current_session_id() {
             let value = HeaderValue::from_str(&session_id)?;
             request.headers_mut().insert(session_header, value);
+        }
+
+        Ok(reqwest::RequestBuilder::from_parts(client, request))
+    })
+}
+
+/// Child session id -> parent session id, for every session linked to a parent in this
+/// process (delegated subagents). Filled by `SessionUpdateBuilder::apply`, so a provider can
+/// name the parent of the session it is serving without a database read on the request path.
+/// A process restart empties it; a subagent does not survive one anyway.
+static PARENT_SESSIONS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn set_parent_session(session_id: &str, parent_session_id: Option<&str>) {
+    let mut map = PARENT_SESSIONS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match parent_session_id {
+        Some(parent) if !parent.is_empty() => {
+            map.insert(session_id.to_string(), parent.to_string());
+        }
+        _ => {
+            map.remove(session_id);
+        }
+    }
+}
+
+pub fn parent_session_id(session_id: &str) -> Option<String> {
+    PARENT_SESSIONS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(session_id)
+        .cloned()
+}
+
+/// Parses a comma-separated list of header names; blank entries are ignored.
+pub(crate) fn parse_header_names(
+    list: &str,
+) -> Result<Vec<HeaderName>, reqwest::header::InvalidHeaderName> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| HeaderName::from_bytes(h.as_bytes()))
+        .collect()
+}
+
+/// Sends the current session id under every name in `session_headers`, and, when the session
+/// has a registered parent, the parent's id under `parent_header`. Every one of these headers
+/// is removed first, so a caller-supplied value can never contradict the session.
+pub(crate) fn session_headers_request_builder(
+    session_headers: Vec<HeaderName>,
+    parent_header: Option<HeaderName>,
+) -> goose_providers::api_client::RequestBuilderDecorator {
+    std::sync::Arc::new(move |request| {
+        let (client, request) = request.build_split();
+        let mut request = request?;
+        for name in session_headers.iter().chain(parent_header.iter()) {
+            request.headers_mut().remove(name);
+        }
+
+        if let Some(session_id) = current_session_id() {
+            let value = HeaderValue::from_str(&session_id)?;
+            for name in &session_headers {
+                request.headers_mut().insert(name.clone(), value.clone());
+            }
+            if let (Some(name), Some(parent)) = (&parent_header, parent_session_id(&session_id)) {
+                request
+                    .headers_mut()
+                    .insert(name.clone(), HeaderValue::from_str(&parent)?);
+            }
         }
 
         Ok(reqwest::RequestBuilder::from_parts(client, request))
@@ -211,6 +283,73 @@ mod tests {
             );
         })
         .await;
+    }
+
+    fn build_with(
+        decorate: &goose_providers::api_client::RequestBuilderDecorator,
+    ) -> reqwest::Request {
+        decorate(
+            reqwest::Client::new()
+                .get("http://localhost")
+                .header("x-session-id", "stale")
+                .header("x-parent-session-id", "stale"),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_session_headers_builder_sends_every_name_and_the_parent() {
+        set_parent_session("child-1", Some("parent-1"));
+        let decorate = session_headers_request_builder(
+            parse_header_names("x-opencode-session, x-session-id").unwrap(),
+            Some(HeaderName::from_static("x-parent-session-id")),
+        );
+        with_session_id(Some("child-1".to_string()), async {
+            let request = build_with(&decorate);
+            assert_eq!(
+                request.headers().get("x-opencode-session").unwrap(),
+                "child-1"
+            );
+            assert_eq!(request.headers().get("x-session-id").unwrap(), "child-1");
+            assert_eq!(
+                request.headers().get("x-parent-session-id").unwrap(),
+                "parent-1"
+            );
+            assert!(request.headers().get(SESSION_ID_HEADER).is_none());
+        })
+        .await;
+        set_parent_session("child-1", None);
+        assert_eq!(parent_session_id("child-1"), None);
+    }
+
+    #[tokio::test]
+    async fn test_session_headers_builder_top_level_session_has_no_parent_header() {
+        let decorate = session_headers_request_builder(
+            parse_header_names("x-session-id").unwrap(),
+            Some(HeaderName::from_static("x-parent-session-id")),
+        );
+        with_session_id(Some("top-level-1".to_string()), async {
+            let request = build_with(&decorate);
+            assert_eq!(
+                request.headers().get("x-session-id").unwrap(),
+                "top-level-1"
+            );
+            assert!(request.headers().get("x-parent-session-id").is_none());
+        })
+        .await;
+        // No session in scope: no session headers at all, and stale ones are stripped.
+        let request = build_with(&decorate);
+        assert!(request.headers().get("x-session-id").is_none());
+        assert!(request.headers().get("x-parent-session-id").is_none());
+    }
+
+    #[test]
+    fn test_parse_header_names() {
+        assert_eq!(parse_header_names(" a , ,b ").unwrap().len(), 2);
+        assert!(parse_header_names("").unwrap().is_empty());
+        assert!(parse_header_names("ok,bad header").is_err());
     }
 
     #[test]
