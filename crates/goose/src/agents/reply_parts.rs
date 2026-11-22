@@ -182,19 +182,20 @@ fn is_mergeable_assistant_chunk(message: &Message) -> bool {
         })
 }
 
-fn message_has_non_thinking_content(message: &Message) -> bool {
-    message.content.iter().any(|content| {
-        !matches!(
-            content,
-            MessageContent::Thinking(_) | MessageContent::RedactedThinking(_)
-        )
-    })
+fn block_closes_retry_window(block: &MessageContent) -> bool {
+    match block {
+        MessageContent::Thinking(t) => !t.signature.is_empty(),
+        MessageContent::RedactedThinking(_) => true,
+        _ => true,
+    }
 }
 
-fn item_has_non_thinking_content(item: &(Option<Message>, Option<ProviderUsage>)) -> bool {
-    item.0
-        .as_ref()
-        .is_some_and(message_has_non_thinking_content)
+fn message_closes_retry_window(message: &Message) -> bool {
+    message.content.iter().any(block_closes_retry_window)
+}
+
+fn item_closes_retry_window(item: &(Option<Message>, Option<ProviderUsage>)) -> bool {
+    item.0.as_ref().is_some_and(message_closes_retry_window)
 }
 
 pub(crate) fn prepare_inference_tools(
@@ -339,7 +340,7 @@ pub(crate) async fn stream_response_from_provider(
         if !provider.manages_own_context() {
             let retry_config = provider.retry_config().transient_only();
             let mut attempts = 0;
-            let mut yielded_non_thinking = false;
+            let mut retry_window_closed = false;
             let mut current_stream = stream;
 
             stream = Box::pin(try_stream! {
@@ -347,13 +348,13 @@ pub(crate) async fn stream_response_from_provider(
                     match current_stream.next().await {
                         None => break,
                         Some(Ok(item)) => {
-                            if !yielded_non_thinking && item_has_non_thinking_content(&item) {
-                                yielded_non_thinking = true;
+                            if !retry_window_closed && item_closes_retry_window(&item) {
+                                retry_window_closed = true;
                             }
                             yield item;
                         }
                         Some(Err(error)) => {
-                            if !yielded_non_thinking
+                            if !retry_window_closed
                                 && goose_providers::retry::should_retry(&error, &retry_config)
                                 && attempts < retry_config.max_retries
                             {
@@ -366,7 +367,7 @@ pub(crate) async fn stream_response_from_provider(
                                     _ => retry_config.delay_for_attempt(attempts),
                                 };
                                 warn!(
-                                    "Provider stream failed before its first non-thinking item, retrying ({}/{}): {:?}",
+                                    "Provider stream failed while retry window was open, retrying ({}/{}): {:?}",
                                     attempts, retry_config.max_retries, error
                                 );
 
@@ -1417,6 +1418,41 @@ mod tests {
         assert_eq!(item3.as_concat_text(), "ok");
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn signed_thinking_close_before_transient_error_does_not_retry() {
+        let provider = Arc::new(SequencedProvider::new(vec![Ok(vec![
+            Ok((
+                Some(Message::assistant().with_thinking("pondering...", "")),
+                None,
+            )),
+            Ok((
+                Some(Message::assistant().with_thinking("", "sig_123")),
+                None,
+            )),
+            Err(transient_error()),
+        ])]));
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        let item1 = stream.next().await.unwrap().unwrap().0.unwrap();
+        assert!(matches!(
+            item1.content.first(),
+            Some(MessageContent::Thinking(t)) if t.thinking == "pondering..." && t.signature.is_empty()
+        ));
+
+        let item2 = stream.next().await.unwrap().unwrap().0.unwrap();
+        assert!(matches!(
+            item2.content.first(),
+            Some(MessageContent::Thinking(t)) if t.signature == "sig_123"
+        ));
+
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::NetworkError(_))
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
