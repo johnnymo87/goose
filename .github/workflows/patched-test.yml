@@ -99,6 +99,11 @@ jobs:
             "acp::server::tests::test_authentication_message_maps_to_auth_required" \
             "acp::server::tests::test_other_error_messages_map_to_internal_error"
 
+          run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
+            "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \
+            "test_prompt_fails_and_streams_the_error" \
+            "test_manual_compaction_refusal_fails_without_replacing_context"
+
           run_exact_tests --release -p goose-provider-types --lib -- \
             "formats::anthropic::tests::native_claude_thinking_carries_display_and_block_binding" \
             "formats::anthropic::tests::summarized_thinking_round_trips_with_its_signature" \
