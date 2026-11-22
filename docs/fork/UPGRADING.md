@@ -143,8 +143,8 @@ upgrade. Say so to the coordinator and stop.
    commit per patch, and a squash would fold the stack (and the `fork-sync/` report)
    into one commit, which L1 refuses.
 6. Then run L1 for that version:
-   `gh workflow run upstream-sync.yml -R johnnymo87/goose -f prefix= -f target=vX.Y.Z`
-   (the empty prefix makes it a real run, not a `test-l1/` rehearsal). It re-applies
+   `gh workflow run upstream-sync.yml -R johnnymo87/goose -f real=true -f target=vX.Y.Z`
+   (without `real=true` it is a `test-l1/` rehearsal). It re-applies
    `base/vX.Y.Z` onto the bare tag, runs the patched test filter, pushes
    `patched/vX.Y.Z`, and tags `patched-X.Y.Z.0`; the release and then the pin PR
    follow. If the filter fails, the run is red and the report lands as a comment on
