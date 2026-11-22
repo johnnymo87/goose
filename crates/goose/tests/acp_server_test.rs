@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort.
+// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort; turn_failed errors carry data.kind.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -1585,7 +1585,9 @@ fn test_prompt_reports_context_error_when_compaction_limit_is_exhausted() {
         .unwrap_err();
         let error = prompt_acp_error(error);
         assert_eq!(error.code, ErrorCode::InternalError);
-        assert_eq!(error.data.unwrap()["reason"], "turn_failed");
+        let data = error.data.unwrap();
+        assert_eq!(data["reason"], "turn_failed");
+        assert_eq!(data["kind"], "context_length");
     });
 }
 
@@ -1598,6 +1600,7 @@ fn test_prompt_fails_and_streams_the_error() {
             prompt_and_stream("partial", vec![("partial", PARTIAL_THEN_STREAM_ERROR)]).await;
         let error = prompt_acp_error(result.unwrap_err());
         assert_eq!(error.code, ErrorCode::InternalError);
+        assert_eq!(error.data.as_ref().unwrap()["kind"], "provider");
         assert!(
             streamed.contains("partial answer") && streamed.contains("upstream exploded"),
             "streamed text: {streamed:?}"
@@ -1654,7 +1657,9 @@ fn test_manual_compaction_refusal_fails_without_replacing_context() {
         assert!(!streamed.contains("Compaction complete"), "{streamed:?}");
         let error = prompt_acp_error(result.unwrap_err());
         assert_eq!(error.code, ErrorCode::InternalError);
-        assert_eq!(error.data.unwrap()["reason"], "turn_failed");
+        let data = error.data.unwrap();
+        assert_eq!(data["reason"], "turn_failed");
+        assert_eq!(data["kind"], "compaction");
         let after = manager
             .get_session(&session.session_id().0, true)
             .await

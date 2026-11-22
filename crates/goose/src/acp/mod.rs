@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: turn_error module for session/prompt error.data.kind.
 mod common;
 mod handoff;
 #[cfg(feature = "acp-http")]
@@ -9,6 +10,7 @@ pub mod server_factory;
 pub(crate) mod tool_call_notifier;
 #[cfg(feature = "acp-http")]
 pub mod transport;
+mod turn_error;
 
 pub use common::{map_permission_response, PermissionDecision};
 pub use goose_sdk_types::{custom_notifications, custom_requests};

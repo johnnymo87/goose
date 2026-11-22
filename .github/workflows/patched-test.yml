@@ -90,7 +90,14 @@ jobs:
             "providers::formats::gcpvertexai::tests::claude_adaptive_thinking_requests_summarized_display" \
             "agents::reply_parts::tests::toolshim_provider_stream_coalesces_streamed_thinking" \
             "agents::reply_parts::tests::thinking_deltas_before_transient_error_retries_and_succeeds" \
-            "agents::reply_parts::tests::signed_thinking_close_before_transient_error_does_not_retry"
+            "agents::reply_parts::tests::signed_thinking_close_before_transient_error_does_not_retry" \
+            "acp::turn_error::tests::provider_errors_map_to_their_kind" \
+            "acp::turn_error::tests::loop_errors_map_to_their_kind" \
+            "acp::turn_error::tests::turn_failed_data_carries_reason_kind_and_message" \
+            "acp::turn_error::tests::turn_error_message_under_the_cap_is_kept_whole" \
+            "acp::turn_error::tests::turn_error_message_over_the_cap_is_cut_on_a_char_boundary" \
+            "acp::server::tests::test_authentication_message_maps_to_auth_required" \
+            "acp::server::tests::test_other_error_messages_map_to_internal_error"
 
           run_exact_tests --release -p goose-provider-types --lib -- \
             "formats::anthropic::tests::native_claude_thinking_carries_display_and_block_binding" \
