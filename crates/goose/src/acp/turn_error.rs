@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: session/prompt turn errors carry a kind and a bounded message in error.data.
+// Modified by Jonathan Mohrbacher, 2026: session/prompt turn errors carry a kind and a bounded message in error.data; max turns is recognised as a normal stop.
 //! Why a turn failed, for clients that only see the `session/prompt` error.
 //!
 //! Upstream fails the prompt with `data: {reason: "turn_failed"}` and the full
@@ -8,7 +8,7 @@
 //! error message, which is all the server has once the turn has ended.
 
 use crate::agents::state_machine::{is_compaction_failure_message, is_retry_failure_message};
-use crate::conversation::message::{ErrorContent, MessageErrorKind};
+use crate::conversation::message::{ErrorContent, Message, MessageContent, MessageErrorKind};
 use goose_agent::max_turns::MAX_TURNS_MESSAGE;
 use goose_providers::errors::ProviderError;
 use serde::Serialize;
@@ -60,6 +60,17 @@ fn kind_from_message(message: &str) -> TurnErrorKind {
     }
 }
 
+/// Reaching the turn limit is a normal stop (`stopReason: max_turn_requests`),
+/// not a failed turn, even though the notice is persisted as an error.
+pub(crate) fn is_max_turns_message(message: &Message) -> bool {
+    message.content.iter().any(|content| {
+        matches!(
+            content,
+            MessageContent::Error(error) if turn_error_kind(error) == TurnErrorKind::MaxTurns
+        )
+    })
+}
+
 pub(crate) fn turn_failed_data(error: &ErrorContent) -> serde_json::Value {
     serde_json::json!({
         "reason": crate::acp::TURN_FAILED_REASON,
@@ -87,7 +98,6 @@ fn truncate_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::message::Message;
 
     fn kind_of(message: Message) -> TurnErrorKind {
         turn_error_kind(message.error().expect("message carries an error"))
@@ -95,6 +105,17 @@ mod tests {
 
     fn provider_error_kind(err: ProviderError) -> TurnErrorKind {
         kind_of(Message::from_provider_error(&err))
+    }
+
+    #[test]
+    fn only_the_max_turns_error_is_a_normal_stop() {
+        let error =
+            |text: &str| Message::assistant().with_error(MessageErrorKind::ResourceExhausted, text);
+        assert!(is_max_turns_message(&error(MAX_TURNS_MESSAGE)));
+        assert!(!is_max_turns_message(&error("Rate limit exceeded")));
+        assert!(!is_max_turns_message(
+            &Message::assistant().with_text(MAX_TURNS_MESSAGE)
+        ));
     }
 
     #[test]

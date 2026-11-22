@@ -130,7 +130,9 @@ jobs:
             "acp::server::truncate_from_message::tests::message_id_from_meta_reads_goose_message_id" \
             "acp::server::truncate_from_message::tests::message_id_from_meta_rejects_empty_or_non_string" \
             "acp::server::truncate_from_message::tests::agent_capabilities_advertise_truncate_from_message" \
-            "session::session_manager::tests::test_truncate_conversation_from_message_keeps_same_second_previous_rows"
+            "session::session_manager::tests::test_truncate_conversation_from_message_keeps_same_second_previous_rows" \
+            "acp::turn_error::tests::only_the_max_turns_error_is_a_normal_stop" \
+            "acp::server::tests::test_prompt_stop_reason_reports_max_turn_requests"
 
           run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
             "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \
