@@ -1,0 +1,43 @@
+# CI workflow for pull requests targeting the fork's patched branches (patched/**).
+# Runs upstream's Linux CLI build workflow and the shared patched-test.yml suite.
+on:
+  pull_request:
+    branches:
+      - "patched/**"
+  workflow_dispatch:
+
+name: "Patched CI"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-linux
+    uses: ./.github/workflows/build-cli-linux.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  test-patches:
+    name: test-patches
+    uses: ./.github/workflows/patched-test.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  gate:
+    name: "patched-ci"
+    needs: [build, test-patches]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check status of build and test-patches
+        run: |
+          if [ "${{ needs.build.result }}" != "success" ] || [ "${{ needs.test-patches.result }}" != "success" ]; then
+            echo "CI checks failed: build=${{ needs.build.result }}, test-patches=${{ needs.test-patches.result }}" >&2
+            exit 1
+          fi
+          echo "All CI checks succeeded."
