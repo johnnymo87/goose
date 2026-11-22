@@ -46,7 +46,7 @@ upgrade. Say so to the coordinator and stop.
   binary run without it stamped production `sessions.db` to schema v18 while
   production was still 1.54.
 - **Merge fork PRs only with `--rebase`.** Never squash and never make a merge
-  commit. The stack must stay one commit per patch, because L1 rebases it with
+  commit (the fork's settings allow only rebase merges). The stack must stay one commit per patch, because L1 rebases it with
   `git rebase --onto`. You may auto-merge your own fork PRs this way, under the
   standing green light for the johnnymo87 org.
 - **Worktrees only.** Never work at a shared root. Commit bare, without an
@@ -128,22 +128,33 @@ upgrade. Say so to the coordinator and stop.
      files. Touch upstream files only for registration lines, such as a
      `mod`, a match arm, or a builder call. That keeps the next rebase
      mechanical. Port the patch's tests with it, and keep its test names, so
-     the CI filter (below) still matches them.
+     the CI filter (below) still matches them. **Keep the patch's original
+     commit subject**: L1 matches patches across a carry-forward by subject.
 3. After each patch, build and run that patch's tests. Run the whole patched
    filter at the end. The filter must match at least one test per entry:
    cargo exits 0 on a filter that matches nothing.
-4. Open a PR into `base/vX.Y.Z`, and run `adversarial-reviewer-opus` on the
-   diff before you open it.
-5. When it merges, L1's next daily run (or
-   `gh workflow run upstream-sync.yml -R johnnymo87/goose -f prefix=`; the empty
-   prefix makes it a real run, not a `test-l1/` rehearsal) tags
-   `patched-X.Y.Z.0`, and the pin PR follows. Continue with the clean path.
+4. Push your commits onto `upstream-sync/vX.Y.Z` itself (one commit per patch, never
+   a merge), mark the draft PR ready, and run `adversarial-reviewer-opus` on its diff.
+5. Merge it with `gh pr merge <N> -R johnnymo87/goose --rebase`. The fork allows only
+   rebase merges, and `base/*` and `patched/*` require linear history: L1 needs one
+   commit per patch, and a squash would fold the stack (and the `fork-sync/` report)
+   into one commit, which L1 refuses.
+6. Then run L1 for that version:
+   `gh workflow run upstream-sync.yml -R johnnymo87/goose -f prefix= -f target=vX.Y.Z`
+   (the empty prefix makes it a real run, not a `test-l1/` rehearsal). It re-applies
+   `base/vX.Y.Z` onto the bare tag, runs the patched test filter, pushes
+   `patched/vX.Y.Z`, and tags `patched-X.Y.Z.0`; the release and then the pin PR
+   follow. If the filter fails, the run is red and the report lands as a comment on
+   your PR. Continue with the clean path.
 
-**Superseded.** If a newer release lands while you are working,
-L1 carries your `upstream-sync` branch forward, so your conflict work is
-kept, and it closes the old draft PR. Fetch the new `upstream-sync/vNEW`
-instead of rebasing onto it, and carry on under the new version. If a newer
-*clean* pin PR replaces yours, stop and tell the coordinator.
+**Superseded.** If a newer release lands while you are working, L1 carries your
+`upstream-sync` branch forward onto it, so the work you pushed is kept, and closes the
+old draft PR. The new report lists any original patch whose subject is not on your
+branch; L1 does not re-apply those (you may have dropped one on purpose), so port or
+drop each one. Fetch the new `upstream-sync/vNEW` instead of rebasing onto it, and carry
+on under the new version. A port you already merged into `base/vX.Y.Z` is not lost:
+L1 tags it before it moves on to a newer release. If a newer *clean* pin PR replaces
+yours, stop and tell the coordinator.
 
 **Majors.** A major-version pin PR gets the `goose-major` label. Cutover also
 needs a human-applied `goose-major-ok`. Do everything above, then report to

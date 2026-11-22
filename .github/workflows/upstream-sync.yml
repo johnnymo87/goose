@@ -17,7 +17,12 @@
 # Repo variable GOOSE_HOLD: any non-empty value pauses the watcher.
 #
 # Manual runs default to the test-l1/ prefix: branches test-l1/..., tags test-l1-patched-*
-# (which do not start a release). Clear the prefix only to do the real thing by hand.
+# (which do not start a release). Clear the prefix only to do the real thing by hand;
+# skip_tests and allow_same are refused without a test- prefix.
+#
+# Two jobs so the push token never shares a runner with the candidate's build scripts:
+# prepare (no write credential) decides, cherry-picks, builds and tests, and hands a plan
+# plus a git bundle to publish (GOOSE_SYNC_TOKEN), which runs no candidate code.
 name: Upstream sync
 
 on:
@@ -52,22 +57,31 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  pull-requests: read
+  contents: read
 
 jobs:
-  sync:
+  # Builds and tests a new upstream release's code, so it holds no write credential:
+  # the token-like variables are also stripped from the test steps' environment.
+  prepare:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      work: ${{ steps.prepare.outputs.work }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
       - name: Watcher self-test
-        run: python3 .github/fork/test_upstream_sync.py
-      - name: Sync
+        run: PYTHONDONTWRITEBYTECODE=1 python3 .github/fork/test_upstream_sync.py
+      - name: python3-yaml (the watcher reads the candidate's patched-test.yml)
+        run: sudo apt-get update -q && sudo apt-get install -y -q python3-yaml
+      - name: Prepare
+        id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
-          GOOSE_SYNC_TOKEN: ${{ secrets.GOOSE_SYNC_TOKEN }}
-          L1_FALLBACK_TOKEN: ${{ github.token }}
           GOOSE_HOLD: ${{ vars.GOOSE_HOLD }}
           L1_PREFIX: ${{ inputs.prefix }}
           L1_TARGET: ${{ inputs.target }}
@@ -75,4 +89,35 @@ jobs:
           L1_SKIP_TESTS: ${{ inputs.skip_tests && '1' || '' }}
           L1_ALLOW_SAME: ${{ inputs.allow_same && '1' || '' }}
           L1_PLAN_ONLY: ${{ inputs.plan_only && '1' || '' }}
-        run: python3 .github/fork/upstream_sync.py
+        run: python3 .github/fork/upstream_sync.py prepare "$RUNNER_TEMP/l1"
+      - uses: actions/upload-artifact@v4
+        if: steps.prepare.outputs.work == 'true'
+        with:
+          name: upstream-sync
+          path: ${{ runner.temp }}/l1
+          retention-days: 7
+
+  # Performs exactly the pushes and PR edits prepare wrote down; runs nothing from the
+  # candidate tree. contents/pull-requests write is used only by a test-l1/ rehearsal's
+  # GITHUB_TOKEN fallback; a real run pushes with GOOSE_SYNC_TOKEN.
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.work == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-sync
+          path: ${{ runner.temp }}/l1
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOOSE_SYNC_TOKEN: ${{ secrets.GOOSE_SYNC_TOKEN }}
+          L1_FALLBACK_TOKEN: ${{ github.token }}
+        run: python3 .github/fork/upstream_sync.py publish "$RUNNER_TEMP/l1"
