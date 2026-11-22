@@ -1,0 +1,17 @@
+# Checks for this branch's own machinery.
+name: fork-main CI
+
+on:
+  pull_request:
+    branches: [fork-main]
+
+permissions:
+  contents: read
+
+jobs:
+  watcher-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - run: python3 .github/fork/test_upstream_sync.py
+      - run: python3 -m py_compile .github/fork/upstream_sync.py
