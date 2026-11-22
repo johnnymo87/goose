@@ -182,6 +182,21 @@ fn is_mergeable_assistant_chunk(message: &Message) -> bool {
         })
 }
 
+fn message_has_non_thinking_content(message: &Message) -> bool {
+    message.content.iter().any(|content| {
+        !matches!(
+            content,
+            MessageContent::Thinking(_) | MessageContent::RedactedThinking(_)
+        )
+    })
+}
+
+fn item_has_non_thinking_content(item: &(Option<Message>, Option<ProviderUsage>)) -> bool {
+    item.0
+        .as_ref()
+        .is_some_and(message_has_non_thinking_content)
+}
+
 pub(crate) fn prepare_inference_tools(
     mut tools: Vec<Tool>,
     code_execution_active: bool,
@@ -324,61 +339,68 @@ pub(crate) async fn stream_response_from_provider(
         if !provider.manages_own_context() {
             let retry_config = provider.retry_config().transient_only();
             let mut attempts = 0;
+            let mut yielded_non_thinking = false;
+            let mut current_stream = stream;
 
-            loop {
-                match stream.next().await {
-                    None => break,
-                    Some(Ok(item)) => {
-                        stream = Box::pin(
-                            futures::stream::once(std::future::ready(Ok(item))).chain(stream),
-                        );
-                        break;
-                    }
-                    Some(Err(error))
-                        if goose_providers::retry::should_retry(&error, &retry_config)
-                            && attempts < retry_config.max_retries =>
-                    {
-                        attempts += 1;
-                        let delay = match &error {
-                            ProviderError::RateLimitExceeded {
-                                retry_delay: Some(provider_delay),
-                                ..
-                            } => *provider_delay,
-                            _ => retry_config.delay_for_attempt(attempts),
-                        };
-                        warn!(
-                            "Provider stream failed before its first item, retrying ({}/{}): {:?}",
-                            attempts, retry_config.max_retries, error
-                        );
-
-                        let skip_backoff = std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
-                            .unwrap_or_default()
-                            .parse::<bool>()
-                            .unwrap_or(false);
-                        if !skip_backoff {
-                            tokio::time::sleep(delay).await;
-                        }
-
-                        stream = match crate::session_context::with_session_id(
-                            Some(session_id.clone()),
-                            provider.stream(
-                                &model_config,
-                                system_prompt.as_str(),
-                                messages_for_provider.messages(),
-                                &tools,
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                Err(enhance_model_error(error, &provider, config.toolshim).await)?
+            stream = Box::pin(try_stream! {
+                loop {
+                    match current_stream.next().await {
+                        None => break,
+                        Some(Ok(item)) => {
+                            if !yielded_non_thinking && item_has_non_thinking_content(&item) {
+                                yielded_non_thinking = true;
                             }
-                        };
+                            yield item;
+                        }
+                        Some(Err(error)) => {
+                            if !yielded_non_thinking
+                                && goose_providers::retry::should_retry(&error, &retry_config)
+                                && attempts < retry_config.max_retries
+                            {
+                                attempts += 1;
+                                let delay = match &error {
+                                    ProviderError::RateLimitExceeded {
+                                        retry_delay: Some(provider_delay),
+                                        ..
+                                    } => *provider_delay,
+                                    _ => retry_config.delay_for_attempt(attempts),
+                                };
+                                warn!(
+                                    "Provider stream failed before its first non-thinking item, retrying ({}/{}): {:?}",
+                                    attempts, retry_config.max_retries, error
+                                );
+
+                                let skip_backoff = std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
+                                    .unwrap_or_default()
+                                    .parse::<bool>()
+                                    .unwrap_or(false);
+                                if !skip_backoff {
+                                    tokio::time::sleep(delay).await;
+                                }
+
+                                current_stream = match crate::session_context::with_session_id(
+                                    Some(session_id.clone()),
+                                    provider.stream(
+                                        &model_config,
+                                        system_prompt.as_str(),
+                                        messages_for_provider.messages(),
+                                        &tools,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(new_stream) => new_stream,
+                                    Err(error) => {
+                                        Err(enhance_model_error(error, &provider, config.toolshim).await)?
+                                    }
+                                };
+                            } else {
+                                Err(error)?;
+                            }
+                        }
                     }
-                    Some(Err(error)) => Err(error)?,
                 }
-            }
+            });
         }
 
         if config.toolshim {
@@ -1355,6 +1377,45 @@ mod tests {
                 .as_concat_text(),
             "ok"
         );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn thinking_deltas_before_transient_error_retries_and_succeeds() {
+        let provider = Arc::new(SequencedProvider::new(vec![
+            Ok(vec![
+                Ok((
+                    Some(Message::assistant().with_thinking("pondering...", "")),
+                    None,
+                )),
+                Err(transient_error()),
+            ]),
+            Ok(vec![
+                Ok((
+                    Some(Message::assistant().with_thinking("thinking again...", "")),
+                    None,
+                )),
+                successful_item(),
+            ]),
+        ]));
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        let item1 = stream.next().await.unwrap().unwrap().0.unwrap();
+        assert!(matches!(
+            item1.content.first(),
+            Some(MessageContent::Thinking(_))
+        ));
+
+        let item2 = stream.next().await.unwrap().unwrap().0.unwrap();
+        assert!(matches!(
+            item2.content.first(),
+            Some(MessageContent::Thinking(_))
+        ));
+
+        let item3 = stream.next().await.unwrap().unwrap().0.unwrap();
+        assert_eq!(item3.as_concat_text(), "ok");
+
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
