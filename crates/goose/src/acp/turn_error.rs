@@ -9,6 +9,7 @@
 
 use crate::agents::state_machine::{is_compaction_failure_message, is_retry_failure_message};
 use crate::conversation::message::{ErrorContent, MessageErrorKind};
+use goose_agent::max_turns::MAX_TURNS_MESSAGE;
 use goose_providers::errors::ProviderError;
 use serde::Serialize;
 
@@ -23,10 +24,12 @@ pub(crate) enum TurnErrorKind {
     Authentication,
     Compaction,
     ContextLength,
+    CreditsExhausted,
     MaxTurns,
     Network,
     Provider,
     Refusal,
+    ResourceExhausted,
     RetryExhausted,
 }
 
@@ -34,10 +37,12 @@ pub(crate) fn turn_error_kind(error: &ErrorContent) -> TurnErrorKind {
     match error.kind {
         MessageErrorKind::Authentication => TurnErrorKind::Authentication,
         MessageErrorKind::ContextLengthExceeded => TurnErrorKind::ContextLength,
-        MessageErrorKind::ResourceExhausted => TurnErrorKind::MaxTurns,
-        MessageErrorKind::CreditsExhausted | MessageErrorKind::Other => {
-            kind_from_message(&error.message)
+        MessageErrorKind::CreditsExhausted => TurnErrorKind::CreditsExhausted,
+        MessageErrorKind::ResourceExhausted if error.message == MAX_TURNS_MESSAGE => {
+            TurnErrorKind::MaxTurns
         }
+        MessageErrorKind::ResourceExhausted => TurnErrorKind::ResourceExhausted,
+        MessageErrorKind::Other => kind_from_message(&error.message),
     }
 }
 
@@ -67,11 +72,16 @@ fn truncate_message(message: &str) -> String {
     if message.len() <= TURN_ERROR_MESSAGE_MAX_BYTES {
         return message.to_string();
     }
-    let mut end = TURN_ERROR_MESSAGE_MAX_BYTES - TRUNCATION_MARKER.len();
-    while !message.is_char_boundary(end) {
-        end -= 1;
+    let budget = TURN_ERROR_MESSAGE_MAX_BYTES - TRUNCATION_MARKER.len();
+    let mut kept = String::with_capacity(TURN_ERROR_MESSAGE_MAX_BYTES);
+    for c in message.chars() {
+        if kept.len() + c.len_utf8() > budget {
+            break;
+        }
+        kept.push(c);
     }
-    format!("{}{TRUNCATION_MARKER}", &message[..end])
+    kept.push_str(TRUNCATION_MARKER);
+    kept
 }
 
 #[cfg(test)]
@@ -140,11 +150,19 @@ mod tests {
             )),
             TurnErrorKind::Compaction
         );
+        let exhausted =
+            |text: &str| Message::assistant().with_error(MessageErrorKind::ResourceExhausted, text);
         assert_eq!(
-            kind_of(
-                Message::assistant().with_error(MessageErrorKind::ResourceExhausted, "max turns")
-            ),
+            kind_of(exhausted(MAX_TURNS_MESSAGE)),
             TurnErrorKind::MaxTurns
+        );
+        assert_eq!(
+            kind_of(exhausted("turn budget exhausted")),
+            TurnErrorKind::ResourceExhausted
+        );
+        assert_eq!(
+            kind_of(Message::assistant().with_error(MessageErrorKind::CreditsExhausted, "top up")),
+            TurnErrorKind::CreditsExhausted
         );
     }
 
