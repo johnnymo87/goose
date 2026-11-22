@@ -1,7 +1,9 @@
-# Modified by Jonathan Mohrbacher, 2026: gemm-f16 dev opt-level for aarch64-linux.
+# Modified by Jonathan Mohrbacher, 2026: vendored agent-client-protocol-http as workspace member and [patch.crates-io]; gemm-f16 dev opt-level for aarch64-linux.
 [workspace]
 members = [
     "crates/*",
+    # Vendored + patched ACP HTTP transport; a member so `cargo test -p` can run its tests.
+    "vendor/agent-client-protocol-http",
 ]
 resolver = "2"
 
@@ -108,6 +110,7 @@ llama-cpp-2 = { version = "=0.1.146", default-features = false, features = ["sam
 llama-cpp-sys-2 = { version = "=0.1.146", default-features = false }
 
 [patch.crates-io]
+agent-client-protocol-http = { path = "vendor/agent-client-protocol-http" }
 cudaforge = { git = "https://github.com/jbg/cudaforge", rev = "e7c1967340e40673db98dc9e17da0f04834a456f" }
 
 # Dependencies don't need debug info. You rarely step-debug into third-party
