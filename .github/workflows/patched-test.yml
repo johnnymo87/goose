@@ -108,7 +108,25 @@ jobs:
             "agents::mcp_startup_timeout::tests::test_mcp_client_startup_timeout_discover_lifecycle" \
             "agents::mcp_startup_timeout::tests::test_mcp_client_startup_timeout_initialize_lifecycle" \
             "agents::extension_manager::stdio::startup_tests::test_mcp_client_startup_timeout_stdio_kills_process_group" \
-            "agents::extension_manager::stdio::startup_tests::test_mcp_client_startup_timeout_stdio_abandoned_start_kills_process_group"
+            "agents::extension_manager::stdio::startup_tests::test_mcp_client_startup_timeout_stdio_abandoned_start_kills_process_group" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_roles_dir_wins_over_local_sources" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_roles_dir_unset_keeps_upstream_order" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_roles_dir_tilde_expanded" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_roles_dir_invalid_recipe_fails_closed_without_shadowing" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_declared_extensions_replace_parent" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_filter_only_narrows_declared" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_undeclared_inherits_parent_when_unconfigured" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_unscoped_gets_default_recipe_extensions" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_declared_recipe_ignores_default" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_missing_default_recipe_fails_closed" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_default_recipe_without_extensions_fails_closed" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_default_recipe_tilde_expanded" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_unscoped_delegate_gets_default_recipe_instructions" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_delegate_tool_description_reflects_default_recipe" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_strict_start_accepts_extensions_that_start" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_strict_start_fails_on_an_extension_that_does_not_start" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_delegate_fails_when_its_extension_does_not_start" \
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_delegate_without_policy_runs_on_after_a_failed_extension"
 
           run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
             "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \
