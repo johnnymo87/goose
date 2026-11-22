@@ -123,7 +123,10 @@ upgrade. Say so to the coordinator and stop.
    - **Absorbed upstream?** Search the upstream changelog and PRs since the
      old base. If upstream now does the same thing, drop the patch. Record
      the absorbing upstream PR in the drop line (step 3 of the clean path) and
-     in the PR body.
+     in the PR body. On the branch, record the drop as an **empty commit with the
+     patch's original subject** (`git commit --allow-empty -m '<original subject>'`,
+     the absorbing PR in the body). L1 counts a patch whose subject is missing as
+     owed and will not tag while any is owed; it drops empty commits when it tags.
    - **Otherwise, port it.** Keep the fork's code in fork-only modules and
      files. Touch upstream files only for registration lines, such as a
      `mod`, a match arm, or a builder call. That keeps the next rebase
