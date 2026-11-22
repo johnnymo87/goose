@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: ProcessExit Display includes the source error (e.g. the startup timeout).
 use std::collections::HashMap;
 
 use once_cell::sync::Lazy;
@@ -29,7 +30,7 @@ pub fn name_to_key(name: &str) -> String {
 }
 
 #[derive(Error, Debug)]
-#[error("process quit before initialization: stderr = {stderr}")]
+#[error("process quit before initialization: {source}; stderr = {stderr}")]
 pub struct ProcessExit {
     stderr: String,
     #[source]

@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: register mcp_startup_timeout.
 mod active_run;
 pub mod container;
 pub mod context_report;
@@ -10,6 +11,7 @@ pub mod final_output_tool;
 pub(crate) mod gen_ai_telemetry;
 mod large_response_handler;
 pub mod mcp_client;
+pub(crate) mod mcp_startup_timeout;
 pub mod moim;
 pub mod platform_extensions;
 #[cfg(feature = "scheduler")]

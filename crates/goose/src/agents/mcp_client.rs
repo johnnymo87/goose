@@ -1,4 +1,6 @@
+// Modified by Jonathan Mohrbacher, 2026: MCP server startup is bounded by GOOSE_EXTENSION_STARTUP_TIMEOUT (see mcp_startup_timeout.rs).
 use crate::action_required_manager::{ActionRequiredManager, ElicitationOutcome};
+use crate::agents::mcp_startup_timeout::bound_startup;
 
 use crate::session_context::{SESSION_ID_HEADER, TOOL_CALL_REQUEST_ID_HEADER, WORKING_DIR_HEADER};
 #[expect(deprecated)]
@@ -519,6 +521,7 @@ impl std::fmt::Debug for GooseMcpClientCapabilities {
 #[derive(Clone)]
 pub(crate) struct ConnectContext {
     pub timeout: Duration,
+    pub startup_timeout: Option<Duration>,
     pub client_name: String,
     pub capabilities: GooseMcpClientCapabilities,
     pub working_dir: PathBuf,
@@ -547,6 +550,7 @@ impl McpClient {
     {
         let ConnectContext {
             timeout,
+            startup_timeout,
             client_name,
             capabilities,
             working_dir,
@@ -574,10 +578,15 @@ impl McpClient {
                 } else {
                     ClientLifecycleMode::Initialize
                 };
-                client.serve_with_lifecycle(transport, lifecycle).await?
+                bound_startup(
+                    startup_timeout,
+                    client.serve_with_lifecycle(transport, lifecycle),
+                )
+                .await?
             } else {
-                client
-                    .serve_with_lifecycle(
+                bound_startup(
+                    startup_timeout,
+                    client.serve_with_lifecycle(
                         transport,
                         ClientLifecycleMode::Auto {
                             preferred_versions: vec![
@@ -586,8 +595,9 @@ impl McpClient {
                             ],
                             legacy_version: Some(ProtocolVersion::V_2025_11_25),
                         },
-                    )
-                    .await?
+                    ),
+                )
+                .await?
             };
         let server_info = client.peer_info().map(|info| {
             let mut initialize_result = InitializeResult::new(info.capabilities.clone())
