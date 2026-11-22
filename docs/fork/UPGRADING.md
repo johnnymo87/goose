@@ -113,8 +113,12 @@ upgrade. Say so to the coordinator and stop.
 ## Conflicted path
 
 1. Check out `upstream-sync/vX.Y.Z` in a fork worktree. Then go through the
-   failing patches **one at a time**, as listed in the draft PR. Regenerate
-   `Cargo.lock` (`cargo generate-lockfile`, or a build). Never rebase it.
+   failing patches **one at a time**, as listed in the draft PR. The PR's top
+   commit adds `fork-sync/vX.Y.Z.md`, the watcher's report (the same table). Leave it:
+   L1 drops `fork-sync/` commits and `Cargo.lock`-only commits when it tags. Regenerate
+   `Cargo.lock` with a build or `cargo metadata`, which change only what the patches
+   need (not `cargo generate-lockfile`, which moves every dependency off the versions
+   upstream released with). Never rebase it.
 2. For each failing patch:
    - **Absorbed upstream?** Search the upstream changelog and PRs since the
      old base. If upstream now does the same thing, drop the patch. Record
@@ -130,7 +134,9 @@ upgrade. Say so to the coordinator and stop.
    cargo exits 0 on a filter that matches nothing.
 4. Open a PR into `base/vX.Y.Z`, and run `adversarial-reviewer-opus` on the
    diff before you open it.
-5. When it merges, L1's next run (or a `workflow_dispatch`) tags
+5. When it merges, L1's next daily run (or
+   `gh workflow run upstream-sync.yml -R johnnymo87/goose -f prefix=`; the empty
+   prefix makes it a real run, not a `test-l1/` rehearsal) tags
    `patched-X.Y.Z.0`, and the pin PR follows. Continue with the clean path.
 
 **Superseded.** If a newer release lands while you are working,
