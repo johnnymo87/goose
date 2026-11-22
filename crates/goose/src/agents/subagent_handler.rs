@@ -1,3 +1,5 @@
+// Modified by Jonathan Mohrbacher, 2026: subagent policy: with GOOSE_SUBAGENT_DEFAULT_RECIPE set, an extension that fails to start fails the delegate.
+use crate::agents::platform_extensions::summon::subagent_policy;
 use crate::{
     agents::{
         final_output_tool::FinalOutputTool, state_machine::messages_since_kickoff, AgentEvent,
@@ -116,6 +118,9 @@ impl ForegroundSubagentRunner {
             .as_deref()
             .ok_or_else(|| anyhow!("Subagent {} has no parent", subagent.id))?;
         let session_config = prepare_subagent(&self.services, subagent).await?;
+        if subagent_policy::is_active() {
+            subagent_policy::require_started_extensions(&self.services, &subagent.id).await?;
+        }
         let mut events = self
             .services
             .run_subagent_turn(session_config, cancel)

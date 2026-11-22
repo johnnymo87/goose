@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort.
+// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort; subagent policy hooks (see subagent_policy.rs).
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::final_output_tool::FinalOutputTool;
 use crate::agents::mcp_client::Error;
@@ -30,6 +30,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+#[path = "subagent_policy.rs"]
+pub(crate) mod subagent_policy;
 
 pub static EXTENSION_NAME: &str = "summon";
 
@@ -293,6 +296,8 @@ pub fn discover_filesystem_sources(working_dir: &Path) -> Vec<SourceEntry> {
     .flatten()
     .collect();
 
+    subagent_policy::scan_roles_dir(&mut sources, &mut seen);
+
     scan_recipes_from_dir(
         working_dir,
         SourceType::Recipe,
@@ -540,9 +545,9 @@ impl SummonClient {
              - Delegates know only instructions + source content\n\
              - Delegates cannot coordinate. Same-file work = conflicts.\n\
              - You get a delegate's result back once it finishes.\n\n\
-             Research (read-only): delegates explore and report back.\n\
-             Work (writes): partition files strictly - no two delegates touch the same file."
-                .to_string(),
+             Research (read-only): delegates explore and report back.\n"
+                .to_string()
+                + subagent_policy::work_guidance(),
             schema.as_object().unwrap().clone(),
         )
     }
@@ -934,6 +939,7 @@ impl SummonClient {
         let mut recipe = self
             .build_delegate_recipe(&params, &parent.id, &parent.working_dir)
             .await?;
+        subagent_policy::apply_unscoped_defaults(&mut recipe).map_err(|e| e.to_string())?;
         let subagent_config = self
             .resolve_subagent_config(&params, &recipe, parent)
             .await
