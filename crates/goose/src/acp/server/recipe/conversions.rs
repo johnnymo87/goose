@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort.
 use anyhow::Result;
 use goose_sdk_types::custom_requests::{
     RecipeAuthorDto, RecipeDto, RecipeExtensionDto, RecipeParameterDto,
