@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: is_busy visible to truncate_from_message.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -189,7 +190,7 @@ impl SessionRuntime {
 
     /// A Live conversation runs without a turn, and a prompt registers its run before
     /// its turn starts.
-    fn is_busy(&self, session_id: &str) -> bool {
+    pub(crate) fn is_busy(&self, session_id: &str) -> bool {
         self.confirmations.has_active_turn(session_id) || self.runs.is_active(session_id)
     }
 
