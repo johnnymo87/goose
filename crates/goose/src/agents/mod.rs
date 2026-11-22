@@ -1,5 +1,6 @@
-// Modified by Jonathan Mohrbacher, 2026: register mcp_startup_timeout.
+// Modified by Jonathan Mohrbacher, 2026: register mcp_startup_timeout; cache-miss breaker module.
 mod active_run;
+pub mod cache_miss_breaker;
 pub mod container;
 pub mod context_report;
 pub mod execute_commands;
