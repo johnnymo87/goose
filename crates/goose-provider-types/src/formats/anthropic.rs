@@ -1024,7 +1024,6 @@ where
     }
 
     struct ThinkingState {
-        text: String,
         signature: String,
     }
 
@@ -1115,18 +1114,23 @@ where
                                 }
                             }
                             Some(THINKING_TYPE) => {
-                                thinking = Some(ThinkingState {
-                                    text: content_block
-                                        .get(THINKING_TYPE)
-                                        .and_then(|t| t.as_str())
-                                        .unwrap_or_default()
-                                        .to_string(),
+                                let state = ThinkingState {
                                     signature: content_block
                                         .get(SIGNATURE_FIELD)
                                         .and_then(|s| s.as_str())
                                         .unwrap_or_default()
                                         .to_string(),
-                                });
+                                };
+                                let initial = content_block
+                                    .get(THINKING_TYPE)
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or_default();
+                                if !initial.is_empty() {
+                                    let mut message = Message::assistant().with_thinking(initial, "");
+                                    message.id = message_id.clone();
+                                    yield (Some(message), None);
+                                }
+                                thinking = Some(state);
                             }
                             Some(REDACTED_THINKING_TYPE) => {
                                 if let Some(data) = content_block.get(DATA_FIELD).and_then(|d| d.as_str()) {
@@ -1159,8 +1163,10 @@ where
                                 }
                             }
                             Ok(ContentBlockDelta::ThinkingDelta { thinking: t }) => {
-                                if let Some(ref mut state) = thinking {
-                                    state.text.push_str(&t);
+                                if thinking.is_some() && !t.is_empty() {
+                                    let mut message = Message::assistant().with_thinking(t, "");
+                                    message.id = message_id.clone();
+                                    yield (Some(message), None);
                                 }
                             }
                             Ok(ContentBlockDelta::SignatureDelta { signature: s }) => {
@@ -1177,10 +1183,13 @@ where
                 }
                 EVENT_CONTENT_BLOCK_STOP => {
                     if let Some(state) = thinking.take() {
-                        // Omitted thinking arrives as an empty string with a signature and must still be replayed.
-                        if !state.text.is_empty() || !state.signature.is_empty() {
+                        // Streamed text was already yielded as unsigned deltas; the
+                        // signature-only closing delta is merged into that block by
+                        // Conversation::push and collect_stream. Omitted thinking has
+                        // no deltas and still needs its signed empty block replayed.
+                        if !state.signature.is_empty() {
                             let mut message = Message::assistant()
-                                .with_thinking(state.text, state.signature);
+                                .with_thinking("", state.signature);
                             message.id = message_id.clone();
                             yield (Some(message), None);
                         }
@@ -1960,15 +1969,15 @@ mod tests {
             "\n",
             r#"data: {"type":"message_stop"}"#,
         );
-        let parts = collect_stream(events).await;
+        let stored = pushed_thinking(events).await;
         assert_eq!(
-            parts.thinking,
+            stored,
             vec![(
                 "Summary of my reasoning.".to_string(),
                 "sig_full".to_string()
             )]
         );
-        let (text, signature) = parts.thinking[0].clone();
+        let (text, signature) = stored[0].clone();
 
         let history = vec![
             Message::user().with_text("Question"),
@@ -2669,10 +2678,144 @@ mod tests {
         );
 
         let parts = collect_stream(events).await;
-        assert_eq!(parts.thinking.len(), 1);
-        assert_eq!(parts.thinking[0].0, "Let me analyze this problem.");
-        assert_eq!(parts.thinking[0].1, "sig_abc123");
+        assert_eq!(
+            parts.thinking,
+            vec![
+                ("Let me analyze".to_string(), String::new()),
+                (" this problem.".to_string(), String::new()),
+                (String::new(), "sig_abc123".to_string()),
+            ]
+        );
         assert_eq!(parts.text, vec!["Here is the answer."]);
+
+        let expected = vec![(
+            "Let me analyze this problem.".to_string(),
+            "sig_abc123".to_string(),
+        )];
+        assert_eq!(pushed_thinking(events).await, expected);
+        assert_eq!(collected_thinking(events).await, expected);
+    }
+
+    fn thinking_blocks(messages: &[Message]) -> Vec<(String, String)> {
+        messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match c {
+                MessageContentBlock::Thinking(t) => Some((t.thinking.clone(), t.signature.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn pushed_conversation(events: &str) -> crate::conversation::Conversation {
+        let mut conversation = crate::conversation::Conversation::default();
+        for result in collect_stream_results(events).await {
+            if let Ok((Some(msg), _)) = result {
+                conversation.push(msg);
+            }
+        }
+        conversation
+    }
+
+    async fn pushed_thinking(events: &str) -> Vec<(String, String)> {
+        thinking_blocks(pushed_conversation(events).await.messages())
+    }
+
+    async fn collected_thinking(events: &str) -> Vec<(String, String)> {
+        use futures::StreamExt;
+
+        let lines: Vec<Result<String, anyhow::Error>> =
+            events.lines().map(|l| Ok(l.to_string())).collect();
+        let stream = response_to_streaming_message(Box::pin(futures::stream::iter(lines)))
+            .map(|r| r.map_err(|e| ProviderError::ExecutionError(e.to_string())));
+        let (message, _) = crate::base::collect_stream(Box::pin(stream))
+            .await
+            .expect("stream collects");
+        thinking_blocks(std::slice::from_ref(&message))
+    }
+
+    #[tokio::test]
+    async fn test_streaming_thinking_arrives_before_its_block_stops() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"First thought."}}"#,
+        );
+
+        let results = collect_stream_results(events).await;
+        let messages: Vec<Message> = results
+            .into_iter()
+            .filter_map(|r| r.ok().and_then(|(m, _)| m))
+            .collect();
+        assert_eq!(
+            thinking_blocks(&messages),
+            vec![("First thought.".to_string(), String::new())]
+        );
+        assert_eq!(messages[0].id.as_deref(), Some("msg_1"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_omitted_thinking_yields_one_signed_block() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_omitted"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+
+        let expected = vec![(String::new(), "sig_omitted".to_string())];
+        assert_eq!(collect_stream(events).await.thinking, expected);
+        assert_eq!(pushed_thinking(events).await, expected);
+        assert_eq!(collected_thinking(events).await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_streamed_thinking_text_and_tool_call_store_one_message() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_3","role":"assistant","content":[],"model":"claude-opus-5-5","usage":{"input_tokens":8,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"I should "}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"search."}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"tool_sig"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Searching."}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"search","input":{}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":2}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+
+        let conversation = pushed_conversation(events).await;
+        assert_eq!(conversation.len(), 1);
+        let content = &conversation.messages()[0].content;
+        assert_eq!(content.len(), 3);
+        assert!(matches!(
+            &content[0],
+            MessageContentBlock::Thinking(t) if t.thinking == "I should search." && t.signature == "tool_sig"
+        ));
+        assert!(matches!(&content[1], MessageContentBlock::Text(t) if t.text == "Searching."));
+        assert!(matches!(&content[2], MessageContentBlock::ToolRequest(_)));
     }
 
     #[tokio::test]
@@ -2690,9 +2833,17 @@ mod tests {
         );
 
         let parts = collect_stream(events).await;
-        assert_eq!(parts.thinking.len(), 1);
-        assert_eq!(parts.thinking[0].0, "Initial reasoning continues.");
-        assert_eq!(parts.thinking[0].1, "");
+        assert_eq!(
+            parts.thinking,
+            vec![
+                ("Initial reasoning ".to_string(), String::new()),
+                ("continues.".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(
+            pushed_thinking(events).await,
+            vec![("Initial reasoning continues.".to_string(), String::new())]
+        );
     }
 
     #[tokio::test]
@@ -2751,13 +2902,12 @@ mod tests {
         );
 
         let parts = collect_stream(events).await;
-        assert_eq!(parts.thinking.len(), 1);
         assert_eq!(
-            parts.thinking[0],
-            (
+            pushed_thinking(events).await,
+            vec![(
                 "I should search for this.".to_string(),
                 "tool_sig_xyz".to_string()
-            )
+            )]
         );
         assert_eq!(parts.text, vec!["Let me search for that."]);
         assert_eq!(parts.tool_calls, vec!["search"]);

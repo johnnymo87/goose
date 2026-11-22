@@ -572,6 +572,7 @@ pub(crate) async fn stream_response_from_provider(
                     }
                     accumulated_message = Some(match accumulated_message {
                         Some(mut prev) => {
+                            let is_single_block_delta = msg.content.len() == 1;
                             for new_content in msg.content {
                                 match (&mut prev.content.last_mut(), &new_content) {
                                     (
@@ -580,6 +581,19 @@ pub(crate) async fn stream_response_from_provider(
                                     ) if last_text.annotations.as_ref().and_then(|a| a.audience.as_ref())
                                         == new_text.annotations.as_ref().and_then(|a| a.audience.as_ref()) => {
                                         last_text.text.push_str(&new_text.text);
+                                    }
+                                    // Same rules as collect_stream: streamed thinking deltas join
+                                    // the unsigned block and the closing delta signs it.
+                                    (
+                                        Some(MessageContent::Thinking(last_thinking)),
+                                        MessageContent::Thinking(new_thinking),
+                                    ) if is_single_block_delta
+                                        && (last_thinking.signature.is_empty()
+                                            || new_thinking.signature == last_thinking.signature) => {
+                                        last_thinking.thinking.push_str(&new_thinking.thinking);
+                                        if !new_thinking.signature.is_empty() {
+                                            last_thinking.signature = new_thinking.signature.clone();
+                                        }
                                     }
                                     _ => {
                                         prev.content.push(new_content);
@@ -1618,6 +1632,50 @@ mod tests {
             .as_deref()
             .expect("toolshim provider message should have an ID");
         assert!(id.starts_with("msg_"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn toolshim_provider_stream_coalesces_streamed_thinking() -> anyhow::Result<()> {
+        let provider = Arc::new(ToolshimMessageIdProvider {
+            messages: vec![
+                Message::assistant()
+                    .with_id("m")
+                    .with_thinking("Let me ", ""),
+                Message::assistant()
+                    .with_id("m")
+                    .with_thinking("think.", ""),
+                Message::assistant().with_id("m").with_thinking("", "sig"),
+                Message::assistant().with_id("m").with_text("Answer"),
+            ],
+        });
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_toolshim(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("hi")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut messages = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let (Some(message), _) = item? {
+                messages.push(message);
+            }
+        }
+
+        assert_eq!(messages.len(), 1);
+        let content = &messages[0].content;
+        assert_eq!(content.len(), 2);
+        assert!(matches!(
+            &content[0],
+            MessageContent::Thinking(t) if t.thinking == "Let me think." && t.signature == "sig"
+        ));
+        assert_eq!(messages[0].as_concat_text(), "Answer");
 
         Ok(())
     }
