@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort.
 use crate::recipe::read_recipe_file_content::RecipeFile;
 use crate::recipe::template_recipe::{
     parse_recipe_content, parse_recipe_template, prepare_recipe_template, ParsedRecipeTemplate,
