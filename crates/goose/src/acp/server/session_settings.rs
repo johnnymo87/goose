@@ -169,21 +169,13 @@ impl AcpConnection {
         }
 
         if let Some(v) = req.rolling_memory {
-            let session = self
-                .services
-                .session_manager
-                .get_session(session_id, false)
-                .await
-                .internal_err_ctx("Failed to re-read session")?;
-            let mut data = session.extension_data;
-            crate::context_mgmt::rolling::write_settings(&mut data, v.map(Into::into));
-            self.services
-                .session_manager
-                .update(session_id)
-                .extension_data(data)
-                .apply()
-                .await
-                .internal_err_ctx("Failed to persist rolling memory settings to session")?;
+            crate::context_mgmt::rolling::persist_settings(
+                &self.services.session_manager,
+                session_id,
+                v.map(Into::into),
+            )
+            .await
+            .internal_err_ctx("Failed to persist rolling memory settings to session")?;
         }
 
         let Some(recipe) = recipe else {

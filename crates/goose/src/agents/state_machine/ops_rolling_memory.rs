@@ -14,11 +14,12 @@ use crate::agents::state_machine::{
 use crate::agents::PromptManager;
 use crate::agents::StateMachineServices;
 use crate::context_mgmt::rolling::{self, FoldOutcome, PlanOutcome};
-use crate::conversation::message::{Message, SystemNotificationType};
+use crate::conversation::message::{Message, MessageUsage, SystemNotificationType};
 use crate::conversation::Conversation;
 use crate::providers::base::Provider;
 use crate::session::{Session, SessionManager};
 use goose_providers::model::ModelConfig;
+use rmcp::model::Role;
 
 pub struct RollingMemoryOperation {
     session_manager: Arc<SessionManager>,
@@ -108,8 +109,11 @@ impl Operation<Session, GooseEffect> for RollingMemoryOperation {
             return not_applicable();
         };
 
+        // Turn start: nothing but user messages since the kickoff. Slash commands
+        // append an agent-only prompt before the first inference, so a length
+        // check alone would never fold on those turns.
         let messages = messages_since_kickoff(conversation)?;
-        if messages.len() != 1 {
+        if messages.is_empty() || messages[1..].iter().any(|m| m.role != Role::User) {
             return not_applicable();
         }
 
@@ -235,18 +239,31 @@ impl Operation<Session, GooseEffect> for RollingMemoryOperation {
                     format!("Rolling memory fold skipped: {reason}"),
                 ));
 
-                let mut effects: Vec<GooseEffect> =
-                    usage.into_iter().map(GooseEffect::RecordUsage).collect();
-                effects.push(
-                    ConversationEffect::SetMessageOperationNote {
-                        message_id: kickoff_id,
-                        operation: "rolling_memory".to_string(),
-                        key: "folded".to_string(),
-                        value: serde_json::json!(true),
+                // Ledger only: the failed memory call must not replace the
+                // session's current usage, which anchors the next estimate.
+                for usage in &usage {
+                    let ledger = MessageUsage::from_provider_usage(usage, false);
+                    if let Err(e) = self
+                        .session_manager
+                        .record_usage_metrics(
+                            &session.id,
+                            session.schedule_id.clone(),
+                            session.usage,
+                            &usage.model,
+                            &ledger,
+                        )
+                        .await
+                    {
+                        tracing::warn!(session_id = %session.id, %e, "failed to record rolling memory usage");
                     }
-                    .into(),
-                );
-                applied(effects)
+                }
+                applied([ConversationEffect::SetMessageOperationNote {
+                    message_id: kickoff_id,
+                    operation: "rolling_memory".to_string(),
+                    key: "folded".to_string(),
+                    value: serde_json::json!(true),
+                }
+                .into()])
             }
             FoldOutcome::NotNeeded | FoldOutcome::BackedOff => not_applicable(),
         }
