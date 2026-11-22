@@ -2,7 +2,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
-use goose::agents::{AgentEvent, SessionConfig, StateMachineServices, StateMachineServicesConfig};
+use goose::agents::{
+    AgentEvent, GoosePlatform, SessionConfig, StateMachineServices, StateMachineServicesConfig,
+};
+use goose::config::permission::PermissionManager;
 use goose::config::GooseMode;
 use goose::context_mgmt::rolling::{self, RollingMemorySettings};
 use goose::conversation::message::{Message, MessageContent, MessageUsage};
@@ -11,7 +14,7 @@ use goose::providers::base::{
     stream_from_single_message, MessageStream, Provider, ProviderDef, ProviderMetadata,
 };
 use goose::session::session_manager::SessionType;
-use goose::session::Session;
+use goose::session::{Session, SessionManager};
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use goose_providers::errors::ProviderError;
 use goose_providers::model::ModelConfig;
@@ -257,8 +260,40 @@ impl ProviderDef for MockRollingProvider {
     }
 }
 
-async fn open_test_db() -> Result<sqlx::Pool<sqlx::Sqlite>> {
-    let db_path = goose::config::paths::Paths::data_dir()
+static PROCESS_ROOT: std::sync::LazyLock<TempDir> =
+    std::sync::LazyLock::new(|| TempDir::new().unwrap());
+
+/// Process-wide lazies (Config::global, the global SessionManager that
+/// telemetry uses, the telemetry switch) keep whatever they see first, so the
+/// isolation has to be in place before the first goose call of the binary.
+fn isolate_process() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("GOOSE_PATH_ROOT", PROCESS_ROOT.path());
+        std::env::set_var("GOOSE_TELEMETRY_OFF", "1");
+        std::env::set_var("GOOSE_DISABLE_KEYRING", "1");
+        std::env::remove_var(rolling::ENV_BUDGET);
+        std::env::remove_var(rolling::ENV_TAIL);
+    });
+}
+
+/// Sessions live under the test's own temp dir, never the default data dir:
+/// a test that opened the default dir once migrated a production sessions DB.
+fn isolated_services(temp_dir: &TempDir) -> Arc<StateMachineServices> {
+    isolate_process();
+    StateMachineServices::with_config(StateMachineServicesConfig::new(
+        Arc::new(SessionManager::new(temp_dir.path().join("data"))),
+        Arc::new(PermissionManager::new(temp_dir.path().join("config"))),
+        None,
+        true,
+        GoosePlatform::GooseCli,
+    ))
+}
+
+async fn open_test_db(temp_dir: &TempDir) -> Result<sqlx::Pool<sqlx::Sqlite>> {
+    let db_path = temp_dir
+        .path()
+        .join("data")
         .join(goose::session::session_manager::SESSIONS_FOLDER)
         .join(goose::session::session_manager::DB_NAME);
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -318,7 +353,7 @@ fn build_long_message(role: rmcp::model::Role, text_prefix: &str, repeat_words: 
 #[tokio::test]
 async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()> {
     let temp_dir = TempDir::new()?;
-    let services = StateMachineServices::with_config(StateMachineServicesConfig::cli());
+    let services = isolated_services(&temp_dir);
 
     // Build 6 messages that exceed a 12000-token budget with a 3000-token tail
     // Messages 0, 1: Turn 1 (will be folded)
@@ -465,7 +500,7 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
         "last message seen by main call must be the new prompt"
     );
 
-    let pool = open_test_db().await?;
+    let pool = open_test_db(&temp_dir).await?;
     let compaction_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM usage_ledger WHERE session_id = ? AND is_compaction = 1",
     )
@@ -483,7 +518,7 @@ async fn rolling_fold_happens_and_next_call_sees_memory_plus_tail() -> Result<()
 #[tokio::test]
 async fn rolling_off_by_default_no_memory_call() -> Result<()> {
     let temp_dir = TempDir::new()?;
-    let services = StateMachineServices::with_config(StateMachineServicesConfig::cli());
+    let services = isolated_services(&temp_dir);
 
     let messages = vec![
         build_long_message(rmcp::model::Role::User, "prompt 1", 300),
@@ -532,7 +567,7 @@ async fn rolling_off_by_default_no_memory_call() -> Result<()> {
 async fn rolling_skips_threshold_auto_compaction() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let _guard = env_lock::lock_env([("GOOSE_AUTO_COMPACT_THRESHOLD", Some("0.001"))]);
-    let services = StateMachineServices::with_config(StateMachineServicesConfig::cli());
+    let services = isolated_services(&temp_dir);
 
     let messages = vec![
         build_long_message(rmcp::model::Role::User, "prompt 1", 100),
@@ -619,7 +654,7 @@ async fn rolling_skips_threshold_auto_compaction() -> Result<()> {
 #[tokio::test]
 async fn rolling_failure_proceeds_and_counts() -> Result<()> {
     let temp_dir = TempDir::new()?;
-    let services = StateMachineServices::with_config(StateMachineServicesConfig::cli());
+    let services = isolated_services(&temp_dir);
 
     let mut messages = vec![
         build_long_message(rmcp::model::Role::User, "prompt 1", 12_000),
@@ -787,7 +822,7 @@ async fn rolling_failure_proceeds_and_counts() -> Result<()> {
 #[tokio::test]
 async fn rolling_metrics_use_retained_form() -> Result<()> {
     let temp_dir = TempDir::new()?;
-    let services = StateMachineServices::with_config(StateMachineServicesConfig::cli());
+    let services = isolated_services(&temp_dir);
 
     let mut messages = vec![
         build_long_message(rmcp::model::Role::User, "prompt 1", 1500),
@@ -893,7 +928,7 @@ async fn rolling_metrics_use_retained_form() -> Result<()> {
 #[tokio::test]
 async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
     let temp_dir = TempDir::new()?;
-    let services = StateMachineServices::with_config(StateMachineServicesConfig::cli());
+    let services = isolated_services(&temp_dir);
 
     let mut messages = vec![
         build_long_message(rmcp::model::Role::User, "prompt 1", 1500),
@@ -1026,7 +1061,7 @@ async fn rolling_cancel_during_memory_call_drops_cleanly() -> Result<()> {
 #[tokio::test]
 async fn rolling_decide_skip_yields_no_folding_notice_and_no_memory_call() -> Result<()> {
     let temp_dir = TempDir::new()?;
-    let services = StateMachineServices::with_config(StateMachineServicesConfig::cli());
+    let services = isolated_services(&temp_dir);
 
     // Budget: 50_000, Tail: 10_000.
     // Pre-cut: 100 words (~150 tokens) -> ratio * new_material < 30_000 MIN_PROGRESS_TOKENS.
@@ -1132,7 +1167,7 @@ async fn rolling_decide_skip_yields_no_folding_notice_and_no_memory_call() -> Re
 #[tokio::test]
 async fn rolling_fires_only_once_across_turns() -> Result<()> {
     let temp_dir = TempDir::new()?;
-    let services = StateMachineServices::with_config(StateMachineServicesConfig::cli());
+    let services = isolated_services(&temp_dir);
 
     // Budget: 12_000, Tail: 3_000.
     // Turn 1 setup: over 24_000 tokens (hard cap triggers fold).
@@ -1244,7 +1279,7 @@ async fn rolling_fires_only_once_across_turns() -> Result<()> {
     );
 
     // Assert exactly one is_compaction row in usage_ledger
-    let pool = open_test_db().await?;
+    let pool = open_test_db(&temp_dir).await?;
     let compaction_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM usage_ledger WHERE session_id = ? AND is_compaction = 1",
     )

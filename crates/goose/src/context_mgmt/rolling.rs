@@ -187,11 +187,31 @@ pub fn write_state(data: &mut ExtensionData, state: &RollingState) {
 
 /// Write the setting: Some -> object, None -> JSON null.
 pub fn write_settings(data: &mut ExtensionData, settings: Option<RollingMemorySettings>) {
-    let val = match settings {
+    data.set_extension_state(SETTINGS_KEY.0, SETTINGS_KEY.1, settings_value(settings));
+}
+
+pub fn settings_value(settings: Option<RollingMemorySettings>) -> Value {
+    match settings {
         Some(s) => serde_json::to_value(s).expect("serialize RollingMemorySettings"),
         None => Value::Null,
-    };
-    data.set_extension_state(SETTINGS_KEY.0, SETTINGS_KEY.1, val);
+    }
+}
+
+/// Writes only the rolling memory setting, in one transaction, so concurrent
+/// changes to other extension_data keys are not lost.
+pub async fn persist_settings(
+    session_manager: &SessionManager,
+    session_id: &str,
+    settings: Option<RollingMemorySettings>,
+) -> anyhow::Result<()> {
+    session_manager
+        .set_extension_value(
+            session_id,
+            SETTINGS_KEY.0,
+            SETTINGS_KEY.1,
+            settings_value(settings),
+        )
+        .await
 }
 
 /// Role user, agent-visible AND user-visible (this excludes every agent-only nudge: goal/grind
@@ -988,14 +1008,14 @@ async fn persist_state(
     session_id: &str,
     state: &RollingState,
 ) -> anyhow::Result<()> {
-    let mut fresh = session_manager.get_session(session_id, false).await?;
-    write_state(&mut fresh.extension_data, state);
     session_manager
-        .update(session_id)
-        .extension_data(fresh.extension_data)
-        .apply()
-        .await?;
-    Ok(())
+        .set_extension_value(
+            session_id,
+            STATE_KEY.0,
+            STATE_KEY.1,
+            serde_json::to_value(state)?,
+        )
+        .await
 }
 
 pub async fn plan_fold(
