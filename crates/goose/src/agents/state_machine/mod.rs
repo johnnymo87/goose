@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: export retry and compaction failure checks for turn errors.
+// Modified by Jonathan Mohrbacher, 2026: export retry and compaction failure checks for turn errors; self-compaction operation.
 //! Runs an ordered, re-entrant pipeline over persisted conversation state.
 //!
 //! Callers persist incoming messages, construct `Step`s from their own operations,
@@ -19,6 +19,7 @@ mod ops_project;
 mod ops_recipe;
 mod ops_remaining_tool_calls;
 mod ops_retry;
+pub mod ops_self_compact;
 mod ops_skills;
 mod ops_status;
 mod ops_stop_hook;
@@ -72,6 +73,7 @@ pub(super) use ops_remaining_tool_calls::RemainingToolCallsOperation;
 pub(super) use ops_remaining_tool_calls::UNCLAIMED_TOOL_ERROR;
 pub(crate) use ops_retry::is_retry_failure_message;
 pub(super) use ops_retry::RetryOperation;
+pub(super) use ops_self_compact::{SelfCompactOperation, SelfCompactTurnLimitOperation};
 pub(super) use ops_skills::{GooseSkillSource, NO_SKILLS_HELP};
 pub(super) use ops_status::StatusOperation;
 pub(super) use ops_stop_hook::{StopHookOperation, DEFAULT_BLOCK_CAP};

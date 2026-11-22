@@ -132,7 +132,40 @@ jobs:
             "acp::server::truncate_from_message::tests::agent_capabilities_advertise_truncate_from_message" \
             "session::session_manager::tests::test_truncate_conversation_from_message_keeps_same_second_previous_rows" \
             "acp::turn_error::tests::only_the_max_turns_error_is_a_normal_stop" \
-            "acp::server::tests::test_prompt_stop_reason_reports_max_turn_requests"
+            "acp::server::tests::test_prompt_stop_reason_reports_max_turn_requests" \
+            "context_mgmt::tests::self_compact_kind_selects_continuation_and_drops_preserved_prompt" \
+            "context_mgmt::tests::manual_compact_kind_selects_continuation_and_drops_preserved_prompt" \
+            "agents::state_machine::ops_self_compact::tests::test_self_compact_tool_schema_and_annotations" \
+            "agents::state_machine::ops_self_compact::tests::test_validate_self_compact_args_valid" \
+            "agents::state_machine::ops_self_compact::tests::test_validate_self_compact_args_missing" \
+            "agents::state_machine::ops_self_compact::tests::test_validate_self_compact_args_not_a_string" \
+            "agents::state_machine::ops_self_compact::tests::test_validate_self_compact_args_empty_after_trim" \
+            "agents::state_machine::ops_self_compact::tests::test_validate_self_compact_args_oversized" \
+            "agents::state_machine::ops_self_compact::tests::test_self_compact_messages_properties_self_compact" \
+            "agents::state_machine::ops_self_compact::tests::test_armed_prompt_derivation" \
+            "agents::state_machine::ops_self_compact::tests::test_compacted_turns_before_derivation" \
+            "agents::state_machine::ops_self_compact::tests::test_self_compact_turn_limit_operation" \
+            "agents::state_machine::ops_self_compact::tests::test_finalize_cancellation_guards" \
+            "agents::state_machine::ops_self_compact::tests::test_finalize_cancellation_skips_prompt_with_persisted_outcome"
+
+          run_exact_tests --release -p goose --features "$F" --test self_compact -- \
+            "test_happy_path_self_compact" \
+            "test_reload_order_and_metadata_self_compact" \
+            "test_turns_taken_not_reset_self_compact" \
+            "test_second_call_in_same_run_returns_error_self_compact" \
+            "test_new_run_can_compact_again_self_compact" \
+            "test_last_call_wins_and_failed_call_does_not_arm_self_compact" \
+            "test_summary_provider_error_self_compact" \
+            "test_cancel_during_summary_self_compact" \
+            "test_max_turns_skips_compaction_self_compact" \
+            "test_tool_not_advertised_when_self_compact_disabled_by_config" \
+            "test_tool_not_advertised_for_subagent_session" \
+            "test_tool_not_advertised_when_recipe_retry_configured" \
+            "test_tool_not_advertised_when_recipe_response_configured" \
+            "test_tool_not_advertised_when_provider_manages_own_context" \
+            "test_sibling_tool_call_compaction_waits_for_siblings" \
+            "test_rebuilt_machine_mid_turn_at_most_once_per_turn" \
+            "test_recheck_availability_when_about_to_compact_self_compact"
 
           run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
             "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \

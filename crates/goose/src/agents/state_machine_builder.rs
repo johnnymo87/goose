@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: register self-compaction operation.
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -19,10 +20,11 @@ use crate::agents::state_machine::{
     CompactionOperation, ContextRelevanceOperation, DoctorOperation, FinalOutputOperation,
     GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer, GooseSkillSource,
     GooseToolApproval, InferenceRunner, Operation, PlatformExtensionOperation, ProjectOperation,
-    RecipeOperation, RemainingToolCallsOperation, RetryOperation, SkillOperation,
-    SlashCommandOperation, StateMachine, StatusOperation, Step, StopHookOperation,
-    SubagentOperation, ToolApprovalOperation, ToolExecutionOperation, ToolPairCompactionOperation,
-    UnavailableDecisions, UnhandledToolCallsOperation, NO_SKILLS_HELP,
+    RecipeOperation, RemainingToolCallsOperation, RetryOperation, SelfCompactOperation,
+    SelfCompactTurnLimitOperation, SkillOperation, SlashCommandOperation, StateMachine,
+    StatusOperation, Step, StopHookOperation, SubagentOperation, ToolApprovalOperation,
+    ToolExecutionOperation, ToolPairCompactionOperation, UnavailableDecisions,
+    UnhandledToolCallsOperation, NO_SKILLS_HELP,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::tool_execution::DECLINED_RESPONSE;
@@ -159,6 +161,18 @@ pub(crate) fn build_state_machine(
         Arc::new(BangCommandOperation::new("shell", "command")),
     ];
     if !manages_own_context {
+        let before_tool_approval = operations
+            .iter()
+            .position(|operation| operation.name() == "tool_approval")
+            .unwrap_or(0);
+        operations.insert(
+            before_tool_approval,
+            Arc::new(SelfCompactOperation::new(
+                provider.clone(),
+                model_config.clone(),
+                max_turns,
+            )),
+        );
         if let Some(decisions) = context_relevance {
             operations.push(Arc::new(ContextRelevanceOperation::new(
                 decisions,
@@ -173,7 +187,7 @@ pub(crate) fn build_state_machine(
             compaction_threshold,
         )));
     }
-    let remaining_operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
+    let mut remaining_operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
         Arc::new(ToolPairCompactionOperation::new(
             provider.clone(),
             model_config.clone(),
@@ -189,6 +203,16 @@ pub(crate) fn build_state_machine(
         Arc::new(MaxTurnsOperation::new(max_turns)),
         Arc::new(StatusOperation::new(provider.clone(), model_config.clone())),
     ];
+    if !manages_own_context {
+        let before_max_turns = remaining_operations
+            .iter()
+            .position(|operation| operation.name() == "max_turns")
+            .unwrap_or(remaining_operations.len());
+        remaining_operations.insert(
+            before_max_turns,
+            Arc::new(SelfCompactTurnLimitOperation::new(max_turns)),
+        );
+    }
     operations.extend(remaining_operations);
     operations.extend(extra_operations);
     let request_preparer = GooseInferenceRequestPreparer {
