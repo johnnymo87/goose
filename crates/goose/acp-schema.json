@@ -837,7 +837,7 @@
       "required": [
         "sessionId"
       ],
-      "description": "Pin a session's prompt-cache TTL and recipe, persisted on the session row.\n\nOnly the recipe's `instructions` and `response` take effect; its `settings`,\n`extensions`, `prompt` and `parameters` are ignored, and the session keeps\nits model.",
+      "description": "Pin a session's prompt-cache TTL and recipe, persisted on the session row.\n\nThe recipe is stored on the session and read every turn: its `title`,\n`instructions` and `response` take effect. Its `settings`, `extensions`,\n`prompt` and `parameters` are ignored, `retry` and `sub_recipes` are\ndropped, and the session keeps its model.",
       "x-side": "agent",
       "x-method": "_goose/unstable/session/settings/set"
     },

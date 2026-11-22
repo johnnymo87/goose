@@ -174,6 +174,12 @@ fn test_session_settings_set_persists_and_survives_reload() {
         let session_id = session.session_id().0.to_string();
         let session_manager = SessionManager::new(temp_data.path().to_path_buf());
 
+        let mut recipe = summary_recipe();
+        recipe["retry"] = serde_json::json!({
+            "max_retries": 1,
+            "checks": [{ "type": "shell", "command": "false" }]
+        });
+        recipe["sub_recipes"] = serde_json::json!([{ "name": "child", "path": "child.yaml" }]);
         for _ in 0..2 {
             let res = send_custom(
                 conn.cx(),
@@ -181,7 +187,7 @@ fn test_session_settings_set_persists_and_survives_reload() {
                 serde_json::json!({
                     "sessionId": session_id,
                     "cacheTtl": "1h",
-                    "recipe": summary_recipe(),
+                    "recipe": recipe,
                 }),
             )
             .await
@@ -196,6 +202,12 @@ fn test_session_settings_set_persists_and_survives_reload() {
         assert_eq!(
             stored.model_config.as_ref().and_then(|mc| mc.cache_ttl()),
             Some("1h".to_string())
+        );
+        let stored_recipe = stored.recipe.expect("recipe stored");
+        assert!(stored_recipe.retry.is_none(), "retry must not be stored");
+        assert!(
+            stored_recipe.sub_recipes.is_none(),
+            "sub_recipes must not be stored"
         );
         let out = session
             .prompt("Hello with recipe", PermissionDecision::AllowOnce)
