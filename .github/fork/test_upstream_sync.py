@@ -101,12 +101,14 @@ class StackFilterTest(unittest.TestCase):
         ]
         self.assertEqual([c.sha for c in us.filter_stack(commits)], ["a", "d"])
 
-    def test_carry_forward_appends_patches_missing_by_subject(self):
+    def test_a_squashed_marker_and_code_commit_is_refused(self):
+        with self.assertRaises(ValueError):
+            us.filter_stack([us.Commit("s", "squash", ["fork-sync/v1.60.2.md", "crates/goose/src/a.rs"])])
+
+    def test_owed_names_original_patches_missing_by_subject_without_reapplying(self):
         original = [us.Commit("1", "p1", ["x"]), us.Commit("2", "p2", ["y"]), us.Commit("3", "p3", ["z"])]
         carried = [us.Commit("1b", "p1", ["x"]), us.Commit("w", "port p2 by hand", ["y"]), us.Commit("3b", "p3", ["z"])]
-        # p2's subject is not in the carried branch: it is still owed, so it is
-        # appended (it will fail again and be named, or apply if upstream moved).
-        self.assertEqual([c.sha for c in us.carry_forward(carried, original)], ["1b", "w", "3b", "2"])
+        self.assertEqual([c.sha for c in us.owed(carried, original)], ["2"])
 
 
 class DecideTest(unittest.TestCase):
@@ -162,6 +164,20 @@ class DecideTest(unittest.TestCase):
         d = us.decide(self.state(sync_prs=prs))
         self.assertEqual((d.kind, d.carry_from, d.close_prs), ("fresh", "v1.60.9", [7, 6]))
 
+    def test_a_finished_older_port_goes_before_a_newer_target(self):
+        prs = [us.SyncPR(7, "v1.60.9", "MERGED"), us.SyncPR(8, "v1.60.9", "OPEN")]
+        d = us.decide(self.state(pending_base="v1.60.9", sync_prs=prs))
+        self.assertEqual((d.kind, d.target, d.close_prs), ("from-base-branch", "v1.60.9", [8]))
+
+    def test_untagged_target_branch_is_left_to_whoever_made_it(self):
+        self.assertEqual(us.decide(self.state(target_branch_exists=True)).kind, "branch-exists")
+        # a tag wins: the branch is then simply the released one
+        self.assertEqual(us.decide(self.state(target_branch_exists=True, target_tags=["patched-1.61.0.0"])).kind, "tagged")
+
+    def test_fresh_and_base_branch_decisions_carry_the_target(self):
+        self.assertEqual(us.decide(self.state()).target, "v1.61.0")
+        self.assertEqual(us.decide(self.state(base_branch_ahead=True)).target, "v1.61.0")
+
     def test_major(self):
         self.assertTrue(us.decide(self.state(target="v2.0.0")).major)
         self.assertFalse(us.decide(self.state()).major)
@@ -181,11 +197,26 @@ class ReportTest(unittest.TestCase):
         self.assertIn("docs/fork/UPGRADING.md", body)
         self.assertIn("log line", body)
 
+    def test_report_lists_still_owed_patches(self):
+        body = us.render_report("v1.61.0", "v1.60.2", [], "", major=False, carried_from="v1.60.9",
+                                still_owed=[us.Commit("dddddddddddd", "p4", ["q"])])
+        self.assertIn("- `dddddddddddd` p4", body)
+
     def test_test_failure_report(self):
         body = us.render_report("v1.61.0", "v1.60.2", [], "boom\n", major=True, carried_from="v1.60.9", tests_failed=True)
         self.assertIn("patched test filter failed", body)
         self.assertIn("major", body)
         self.assertIn("v1.60.9", body)
+
+
+class ScrubTest(unittest.TestCase):
+    def test_candidate_code_sees_no_credential(self):
+        import os
+        from unittest import mock
+        env = {"PATH": "/bin", "HOME": "/h", "GOOSE_SYNC_TOKEN": "x", "L1_FALLBACK_TOKEN": "x", "GH_TOKEN": "x",
+               "GITHUB_TOKEN": "x", "ACTIONS_RUNTIME_TOKEN": "x", "ACTIONS_ID_TOKEN_REQUEST_URL": "x", "GH_ENTERPRISE": "x"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(sorted(us.scrubbed_env()), ["HOME", "PATH"])
 
 
 if __name__ == "__main__":

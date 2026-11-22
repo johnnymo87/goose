@@ -17,6 +17,7 @@ The upgrade worker's brief is docs/fork/UPGRADING.md on this branch.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -118,13 +119,26 @@ def filter_stack(commits: list[Commit]) -> list[Commit]:
     def regenerated(path: str) -> bool:
         return path == "Cargo.lock" or path.startswith(MARKER_DIR)
 
-    return [c for c in commits if not c.files or not all(regenerated(f) for f in c.files)]
+    kept = []
+    for c in commits:
+        markers = [f for f in c.files if f.startswith(MARKER_DIR)]
+        if markers and len(markers) != len(c.files):
+            raise ValueError(
+                f"{c.sha[:12]} mixes {MARKER_DIR} with code (a squash merge?); the stack must stay one commit per patch"
+            )
+        if not c.files or not all(regenerated(f) for f in c.files):
+            kept.append(c)
+    return kept
 
 
-def carry_forward(carried: list[Commit], original: list[Commit]) -> list[Commit]:
-    """A superseded upstream-sync branch, plus the original patches it does not hold yet."""
+def owed(carried: list[Commit], original: list[Commit]) -> list[Commit]:
+    """Original patches whose subject is not on a carried-forward branch.
+
+    Named in the report, never re-applied: the worker may have dropped one as absorbed
+    upstream or ported it under a new subject, and re-adding it would undo that.
+    """
     have = {c.subject for c in carried}
-    return carried + [c for c in original if c.subject not in have]
+    return [c for c in original if c.subject not in have]
 
 
 @dataclass
@@ -143,12 +157,15 @@ class State:
     sync_prs: list[SyncPR]
     base_branch_ahead: bool
     allow_same: bool = False
+    pending_base: Optional[str] = None
+    target_branch_exists: bool = False
 
 
 @dataclass
 class Decision:
     kind: str
     reason: str = ""
+    target: Optional[str] = None
     carry_from: Optional[str] = None
     close_prs: list[int] = field(default_factory=list)
     major: bool = False
@@ -169,12 +186,24 @@ def decide(s: State) -> Decision:
     major = new[0] > old_v[0]
     if new < old_v or (new == old_v and not s.allow_same):
         return Decision("up-to-date", f"{s.target} is not newer than {s.base_tag}")
+    if s.pending_base:
+        pv = parse_version(s.pending_base)
+        return Decision(
+            "from-base-branch",
+            f"base/{s.pending_base} holds a finished port that was never tagged; it goes first",
+            target=s.pending_base,
+            close_prs=[p.number for p in s.sync_prs if p.version == s.pending_base and p.state == "OPEN"],
+            major=bool(pv and pv[0] > old_v[0]),
+        )
     if s.target_tags:
         return Decision("tagged", f"{', '.join(s.target_tags)} already exist", major=major)
+    if s.target_branch_exists:
+        return Decision("branch-exists", f"patched/{s.target} exists untagged; whoever made it tags it", major=major)
     for_target = [p for p in s.sync_prs if p.version == s.target]
     open_target = [p.number for p in for_target if p.state == "OPEN"]
     if s.base_branch_ahead:
-        return Decision("from-base-branch", f"base/{s.target} holds the stack", close_prs=open_target, major=major)
+        return Decision("from-base-branch", f"base/{s.target} holds the stack", target=s.target,
+                        close_prs=open_target, major=major)
     if open_target:
         return Decision("worker-owns", f"upstream-sync PR #{open_target[0]} is open", major=major)
     if for_target:
@@ -187,6 +216,7 @@ def decide(s: State) -> Decision:
     return Decision(
         "fresh",
         "",
+        target=s.target,
         carry_from=older_open[0].version if older_open else None,
         close_prs=[p.number for p in older_open],
         major=major,
@@ -209,6 +239,7 @@ def render_report(
     major: bool,
     carried_from: Optional[str],
     tests_failed: bool = False,
+    still_owed: Optional[list[Commit]] = None,
 ) -> str:
     failed = [r for r in results if r.status in ("conflict", "error")]
     out = [f"# upstream-sync {target}", ""]
@@ -236,14 +267,24 @@ def render_report(
                 f"{'yes' if r.conflicts_with_bare_target else 'no'} |"
             )
         out += ["", "`empty` means the patch's change is already in upstream: check which upstream PR absorbed it."]
+    if still_owed:
+        out += ["", f"Patches of the {old} stack whose subject is not on the carried branch (not re-applied; "
+                "port them, or record the drop):", ""]
+        out += [f"- `{c.sha[:12]}` {c.subject}" for c in still_owed]
     out += ["", "<details><summary>log tail</summary>", "", "```", log_tail.rstrip()[-20000:], "```", "</details>", ""]
     return "\n".join(out)
 
 
 # ---------------------------------------------------------------- side effects
-
+#
+# Two phases, so the push token never shares a machine with the candidate's code:
+#   prepare  decides, cherry-picks, builds and tests (build scripts of a new upstream
+#            release run here). Holds no write credential. Writes plan.json + sync.bundle.
+#   publish  fetches the bundle and performs exactly the pushes and PR edits in plan.json
+#            with GOOSE_SYNC_TOKEN. Runs nothing from the candidate tree.
 
 LOG: list[str] = []
+SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSWORD|^ACTIONS_|^GH_|^GITHUB_TOKEN$")
 
 
 def log(msg: str) -> None:
@@ -254,52 +295,54 @@ def log(msg: str) -> None:
 def run(argv: list[str], cwd: Optional[str] = None, check: bool = True, env: Optional[dict] = None) -> subprocess.CompletedProcess:
     p = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, env=env)
     if check and p.returncode != 0:
-        raise RuntimeError(f"{' '.join(argv)} exited {p.returncode}: {p.stderr.strip()[-2000:]}")
+        raise RuntimeError(f"{' '.join(argv[:4])} exited {p.returncode}: {p.stderr.strip()[-2000:]}")
     return p
 
 
+def scrubbed_env() -> dict:
+    return {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+
+
 class Repo:
-    def __init__(self, workdir: str, fork: str, prefix: str, push_token: str):
+    def __init__(self, workdir: str, fork: str, push_token: str = ""):
         self.dir = workdir
         self.fork = fork
-        self.prefix = prefix
-        self.tag_prefix = prefix.replace("/", "-")
         self.push_token = push_token
 
     def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return run(["git", *args], cwd=self.dir, check=check)
 
-    def gh(self, *args: str, write: bool = False) -> str:
-        env = dict(os.environ)
-        if write and self.push_token:
-            env["GH_TOKEN"] = self.push_token
-        return run(["gh", *args], env=env).stdout
-
     def init(self, reference: Optional[str]) -> None:
+        os.makedirs(self.dir, exist_ok=True)
         self.git("init", "-q")
         if reference:
             with open(os.path.join(self.dir, ".git/objects/info/alternates"), "w") as f:
                 f.write(os.path.join(reference, "objects") + "\n")
         self.git("remote", "add", "upstream", f"https://github.com/{UPSTREAM}.git")
-        url = f"https://github.com/{self.fork}.git"
-        if self.push_token and os.environ.get("GITHUB_ACTIONS"):
-            url = f"https://x-access-token:{self.push_token}@github.com/{self.fork}.git"
-        self.git("remote", "add", "fork", url)
+        self.git("remote", "add", "fork", f"https://github.com/{self.fork}.git")
         if os.environ.get("GITHUB_ACTIONS"):
             self.git("config", "user.name", "github-actions[bot]")
             self.git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
 
-    def fetch_tag(self, remote: str, tag: str) -> None:
-        self.git("fetch", "-q", "--no-tags", remote, f"+refs/tags/{tag}:refs/tags/{tag}")
+    def fetch(self, remote: str, ref: str) -> None:
+        local = ref if ref.startswith("refs/tags/") else "refs/remotes/fork/" + ref.removeprefix("refs/heads/")
+        self.git("fetch", "-q", "--no-tags", remote, f"+{ref}:{local}")
+
+    def fetch_tag(self, tag: str) -> str:
+        self.fetch("upstream", f"refs/tags/{tag}")
+        return f"refs/tags/{tag}"
 
     def fetch_branch(self, branch: str) -> str:
-        self.git("fetch", "-q", "--no-tags", "fork", f"+refs/heads/{branch}:refs/remotes/fork/{branch}")
+        self.fetch("fork", f"refs/heads/{branch}")
         return f"refs/remotes/fork/{branch}"
 
     def remote_refs(self, pattern: str) -> list[str]:
         out = self.git("ls-remote", "fork", pattern).stdout
         refs = [line.split("\t", 1)[1] for line in out.splitlines() if "\t" in line]
         return [r for r in refs if not r.endswith("^{}")]
+
+    def sha(self, ref: str) -> str:
+        return self.git("rev-parse", f"{ref}^{{commit}}").stdout.strip()
 
     def commits(self, rng: str) -> list[Commit]:
         merges = self.git("rev-list", "--merges", rng).stdout.split()
@@ -335,18 +378,16 @@ class Repo:
                         conflicts = [(p.stderr.strip().splitlines() or ["?"])[-1]]
                     self.git("cherry-pick", "--abort", check=False)
                     self.git("reset", "-q", "--hard", before)
-            if status == "applied":
-                if not self.git("diff", "--quiet", before, "HEAD", check=False).returncode:
-                    self.git("reset", "-q", "--hard", before)
-                    status = "empty"
-            r = PatchResult(c, status, conflicts, self.conflicts_with(c, target))
+            if status == "applied" and not self.git("diff", "--quiet", before, "HEAD", check=False).returncode:
+                self.git("reset", "-q", "--hard", before)
+                status = "empty"
             log(f"  {status:8} {c.sha[:12]} {c.subject}" + (f"  [{', '.join(conflicts)}]" if conflicts else ""))
-            results.append(r)
+            results.append(PatchResult(c, status, conflicts, self.conflicts_with(c, target)))
         return results
 
     def regenerate_lock(self, target: str, required: bool) -> None:
         try:
-            p = run(["cargo", "metadata", "--format-version", "1"], cwd=self.dir, check=False)
+            p = run(["cargo", "metadata", "--format-version", "1"], cwd=self.dir, check=False, env=scrubbed_env())
             err = (p.stderr or f"exit {p.returncode}") if p.returncode else ""
         except FileNotFoundError:
             err = "cargo is not on PATH"
@@ -360,23 +401,26 @@ class Repo:
             self.git("commit", "-q", "-m", LOCK_REGEN_SUBJECT.format(v=target), "--", "Cargo.lock")
             log("Cargo.lock regenerated")
 
-    def push(self, src: str, ref: str, force: bool = False) -> None:
-        self.git("push", "-q", *(["--force"] if force else []), "fork", f"{src}:{ref}")
-        log(f"pushed {ref}")
+    def push(self, refspecs: list[str], atomic: bool) -> None:
+        auth = []
+        if self.push_token:
+            basic = base64.b64encode(f"x-access-token:{self.push_token}".encode()).decode()
+            auth = ["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"]
+        run(["git", *auth, "push", "-q", "--porcelain", *(["--atomic"] if atomic else []), "fork", *refspecs], cwd=self.dir)
+        for r in refspecs:
+            log(f"pushed {r.split(':', 1)[1]}")
 
 
 def run_patched_tests(workdir: str) -> tuple[bool, str]:
     """Run the run-steps of the tree's own patched-test.yml, in order, as CI would."""
-    try:
-        import yaml  # type: ignore
-    except ImportError:
-        run([sys.executable, "-m", "pip", "install", "-q", "pyyaml"])
-        import yaml  # type: ignore
+    import yaml  # python3-yaml: installed by upstream-sync.yml; system python refuses pip (PEP 668)
+
     with open(os.path.join(workdir, TEST_WORKFLOW)) as f:
         wf = yaml.safe_load(f)
     steps = wf["jobs"]["test-patches"]["steps"]
-    env = dict(os.environ, GOOSE_PATH_ROOT=tempfile.mkdtemp(prefix="goose-path-root-"))
+    env = dict(scrubbed_env(), GOOSE_PATH_ROOT=tempfile.mkdtemp(prefix="goose-path-root-"))
     tail: list[str] = []
+    ran = 0
     for step in steps:
         if "uses" in step:
             continue
@@ -386,16 +430,18 @@ def run_patched_tests(workdir: str) -> tuple[bool, str]:
         log(f"== {step.get('name')}")
         with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as script:
             script.write(step["run"])
-        p = subprocess.Popen(
-            ["bash", "--noprofile", "--norc", "-eo", "pipefail", script.name],
-            cwd=workdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
+        # GitHub's default `run` shell when a step names none (patched-test.yml names none).
+        p = subprocess.Popen(["bash", "-e", script.name], cwd=workdir, env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         assert p.stdout
         for line in p.stdout:
             print(line, end="")
             tail = (tail + [line])[-150:]
         if p.wait() != 0:
             return False, "".join(tail)
+        ran += 1
+    if not ran:
+        return False, f"{TEST_WORKFLOW} has no run steps"
     return True, "".join(tail)
 
 
@@ -406,22 +452,20 @@ def write_summary(text: str) -> None:
             f.write(text + "\n")
 
 
-def main() -> int:
+def prepare(out: str) -> dict:
     fork = os.environ.get("GITHUB_REPOSITORY") or "johnnymo87/goose"
     prefix = os.environ.get("L1_PREFIX", "")
-    if prefix and not prefix.endswith("/"):
-        raise SystemExit("L1_PREFIX must end with '/' (e.g. test-l1/)")
-    push_token = os.environ.get("GOOSE_SYNC_TOKEN", "")
-    if not push_token and prefix:
-        # A rehearsal may push with GITHUB_TOKEN; that only works while it adds no new
-        # workflow blob, which a stack re-applied onto its own base does not.
-        push_token = os.environ.get("L1_FALLBACK_TOKEN", "")
-    in_actions = bool(os.environ.get("GITHUB_ACTIONS"))
-    plan_only = os.environ.get("L1_PLAN_ONLY") == "1"
+    if prefix and not (prefix.startswith("test-") and prefix.endswith("/")):
+        raise SystemExit("L1_PREFIX must be empty (a real run) or look like test-<name>/")
+    tp = prefix.replace("/", "-")
     skip_tests = os.environ.get("L1_SKIP_TESTS") == "1"
+    allow_same = os.environ.get("L1_ALLOW_SAME") == "1"
+    if (skip_tests or allow_same) and not prefix:
+        raise SystemExit("L1_SKIP_TESTS and L1_ALLOW_SAME are for test-prefixed rehearsals only")
     workdir = os.environ.get("L1_WORKDIR") or tempfile.mkdtemp(prefix="upstream-sync-")
-    repo = Repo(workdir, fork, prefix, push_token)
-    tp = repo.tag_prefix
+    repo = Repo(workdir, fork)
+    plan: dict = {"fork": fork, "prefix": prefix, "fetch": [], "refspecs": [], "atomic": False, "pr": None,
+                  "close": [], "comment": [], "label_major": False, "fail": None, "summary": ""}
 
     now = datetime.now(timezone.utc)
     up_releases = json.loads(run(["gh", "api", f"repos/{UPSTREAM}/releases?per_page=100"]).stdout)
@@ -431,9 +475,11 @@ def main() -> int:
     log(f"target={target} base={base_tag} prefix={prefix!r}")
 
     repo.init(os.environ.get("L1_REFERENCE"))
-    target_tags, base_ahead, sync_prs = [], False, []
-    if target and parse_version(target):
+    target_tags, base_ahead, sync_prs, pending, branch_exists = [], False, [], None, False
+    tv, bv = parse_version(target or ""), parse_patched_tag(base_tag or "")
+    if tv and bv:
         target_tags = [r.rsplit("/", 1)[1] for r in repo.remote_refs(f"refs/tags/{tp}patched-{target[1:]}.*")]
+        branch_exists = bool(repo.remote_refs(f"refs/heads/{prefix}patched/{target}"))
         raw = json.loads(run(["gh", "pr", "list", "-R", fork, "--state", "all", "--limit", "200",
                               "--json", "number,headRefName,state"]).stdout)
         sync_head = re.compile(re.escape(prefix) + r"upstream-sync/(v\d+\.\d+\.\d+)")
@@ -441,38 +487,46 @@ def main() -> int:
             m = sync_head.fullmatch(pr["headRefName"])
             if m:
                 sync_prs.append(SyncPR(pr["number"], m.group(1), pr["state"]))
-        if repo.remote_refs(f"refs/heads/{prefix}base/{target}"):
-            repo.fetch_tag("upstream", target)
-            b = repo.fetch_branch(f"{prefix}base/{target}")
-            base_ahead = int(repo.git("rev-list", "--count", f"{target}..{b}").stdout) > 0
+        # Every base/v* ahead of its upstream tag and untagged is a finished port. One older
+        # than the target goes first, or a newer release would strand it.
+        bases = []
+        for ref in repo.remote_refs(f"refs/heads/{prefix}base/v*"):
+            v = ref.rsplit("/", 1)[1]
+            pv = parse_version(v)
+            if pv and bv[0] < pv <= tv and not repo.remote_refs(f"refs/tags/{tp}patched-{v[1:]}.*"):
+                repo.fetch_tag(v)
+                b = repo.fetch_branch(f"{prefix}base/{v}")
+                if int(repo.git("rev-list", "--count", f"{v}..{b}").stdout) > 0:
+                    bases.append(pv)
+        bases.sort()
+        if bases and bases[0] < tv:
+            pending = vstr(bases[0])
+        base_ahead = tv in bases
 
-    # L1_ALLOW_SAME re-applies a stack onto its own base: the only way to rehearse the clean
-    # path (tests, push, tag) when upstream has nothing newer. Test prefixes only.
-    allow_same = bool(prefix) and os.environ.get("L1_ALLOW_SAME") == "1"
-    d = decide(State(os.environ.get("GOOSE_HOLD", ""), target, base_tag, target_tags, sync_prs, base_ahead, allow_same))
+    d = decide(State(os.environ.get("GOOSE_HOLD", ""), target, base_tag, target_tags, sync_prs, base_ahead,
+                     allow_same=allow_same and bool(prefix), pending_base=pending, target_branch_exists=branch_exists))
     log(f"decision: {d.kind} {d.reason}".rstrip())
-    if d.kind not in ("fresh", "from-base-branch") or plan_only:
-        write_summary(f"upstream-sync: **{d.kind}** {d.reason} (target {target}, base {base_tag})")
-        return 0
-    if not push_token and in_actions:
-        write_summary("upstream-sync: work to do but the GOOSE_SYNC_TOKEN secret is missing")
-        raise SystemExit(
-            "::error::GOOSE_SYNC_TOKEN is not set. GITHUB_TOKEN cannot push refs that add workflow files, "
-            "which every upstream release does; see the header of .github/workflows/upstream-sync.yml."
-        )
+    plan["summary"] = f"upstream-sync: **{d.kind}** {d.reason} (target {target}, base {base_tag})"
+    if d.kind not in ("fresh", "from-base-branch") or os.environ.get("L1_PLAN_ONLY") == "1":
+        return plan
 
-    assert target and base_tag
+    assert d.target and base_tag
+    target = d.target
     old_v = vstr(parse_patched_tag(base_tag)[0])  # type: ignore[index]
-    repo.fetch_tag("upstream", target)
-    repo.fetch_tag("upstream", old_v)
+    repo.fetch_tag(target)
+    repo.fetch_tag(old_v)
     stack_ref = repo.fetch_branch(f"patched/{old_v}")
+    plan["fetch"] = [["upstream", f"refs/tags/{target}"], ["fork", f"refs/heads/patched/{old_v}"]]
     original = filter_stack(repo.commits(f"{old_v}..{stack_ref}"))
+    still_owed: list[Commit] = []
     if d.kind == "from-base-branch":
         stack = filter_stack(repo.commits(f"{target}..refs/remotes/fork/{prefix}base/{target}"))
     elif d.carry_from:
-        repo.fetch_tag("upstream", d.carry_from)
-        carried = repo.fetch_branch(f"{prefix}upstream-sync/{d.carry_from}")
-        stack = carry_forward(filter_stack(repo.commits(f"{d.carry_from}..{carried}")), original)
+        repo.fetch_tag(d.carry_from)
+        carried_ref = repo.fetch_branch(f"{prefix}upstream-sync/{d.carry_from}")
+        stack = filter_stack(repo.commits(f"{d.carry_from}..{carried_ref}"))
+        still_owed = owed(stack, original)
+        plan["fetch"].append(["fork", f"refs/heads/{prefix}upstream-sync/{d.carry_from}"])
     else:
         stack = original
     log(f"applying {len(stack)} commits onto {target}")
@@ -484,56 +538,140 @@ def main() -> int:
     if not failed:
         repo.regenerate_lock(target, required=not skip_tests)
         if skip_tests:
-            log("tests skipped (L1_SKIP_TESTS=1)")
+            log("tests skipped (L1_SKIP_TESTS=1, a rehearsal)")
         else:
             ok, test_tail = run_patched_tests(workdir)
             tests_failed = not ok
             log("patched test filter: " + ("PASS" if ok else "FAIL"))
 
+    head = repo.sha("HEAD")
     if not failed and not tests_failed:
         branch, tag = f"{prefix}patched/{target}", f"{tp}patched-{target[1:]}.0"
-        repo.push("HEAD", f"refs/heads/{branch}")
-        repo.git("tag", tag, "HEAD")
-        repo.push(f"refs/tags/{tag}", f"refs/tags/{tag}")
-        for n in d.close_prs:
-            repo.gh("pr", "close", str(n), "-R", fork, "--comment", f"Superseded: {target} applied cleanly as {tag}.", write=True)
-        write_summary(f"upstream-sync: **clean** {target} -> {branch}, tagged {tag}")
-        return 0
-
-    if d.kind == "from-base-branch":
+        repo.git("tag", "-a", tag, "-m", f"{target} plus the fork's patches (fork watcher)", head)
+        plan["refspecs"] = [f"{head}:refs/heads/{branch}", f"refs/tags/{tag}:refs/tags/{tag}"]
+        plan["atomic"] = True
+        plan["close"] = [[n, f"Superseded: {target} applied cleanly as {tag}."] for n in d.close_prs]
+        plan["summary"] = f"upstream-sync: **clean** {target} -> {branch}, tagged {tag}"
+    elif d.kind == "from-base-branch":
         body = render_report(target, old_v, results, "\n".join(LOG) + "\n" + test_tail, d.major, None, tests_failed)
-        for n in d.close_prs:
-            repo.gh("pr", "comment", str(n), "-R", fork, "--body", body, write=True)
-        raise SystemExit(f"::error::base/{target} does not pass: see the comment on the upstream-sync PR")
+        plan["comment"] = [[n, body] for n in d.close_prs]
+        plan["fail"] = f"base/{target} does not pass; see the comment on its upstream-sync PR"
+        plan["summary"] = f"upstream-sync: **red** {plan['fail']}"
+    else:
+        base_branch, sync_branch = f"{prefix}base/{target}", f"{prefix}upstream-sync/{target}"
+        if failed:
+            repo.regenerate_lock(target, required=False)
+        body = render_report(target, old_v, results, "\n".join(LOG) + "\n" + test_tail, d.major, d.carry_from,
+                             tests_failed, still_owed)
+        marker = os.path.join(MARKER_DIR, f"{target}.md")
+        os.makedirs(os.path.join(workdir, MARKER_DIR), exist_ok=True)
+        with open(os.path.join(workdir, marker), "w") as f:
+            f.write(body)
+        repo.git("add", marker)
+        repo.git("commit", "-q", "-m", f"fork-sync: {target} upstream-sync report (fork watcher)")
+        head = repo.sha("HEAD")
+        if not repo.remote_refs(f"refs/heads/{base_branch}"):
+            plan["refspecs"].append(f"{repo.sha(target)}:refs/heads/{base_branch}")
+        plan["refspecs"].append(f"+{head}:refs/heads/{sync_branch}")
+        what = "tests failed" if tests_failed else f"{len(failed)} of {len(results)} patches failed"
+        title = (f"[{prefix.rstrip('/')}] " if prefix else "") + f"upstream-sync: {target} ({what})"
+        plan["pr"] = {"base": base_branch, "head": sync_branch, "title": title, "body": body}
+        plan["label_major"] = d.major
+        plan["close"] = [[n, "Superseded by {pr_url}, which carries this branch forward."] for n in d.close_prs]
+        plan["summary"] = f"upstream-sync: **conflict** {title}"
 
-    base_branch, sync_branch = f"{prefix}base/{target}", f"{prefix}upstream-sync/{target}"
-    if not repo.remote_refs(f"refs/heads/{base_branch}"):
-        repo.push(f"refs/tags/{target}^{{commit}}", f"refs/heads/{base_branch}")
-    if failed:
-        repo.regenerate_lock(target, required=False)
-    body = render_report(target, old_v, results, "\n".join(LOG) + "\n" + test_tail, d.major, d.carry_from, tests_failed)
-    os.makedirs(os.path.join(workdir, MARKER_DIR), exist_ok=True)
-    marker = os.path.join(MARKER_DIR, f"{target}.md")
-    with open(os.path.join(workdir, marker), "w") as f:
-        f.write(body)
-    repo.git("add", marker)
-    repo.git("commit", "-q", "-m", f"fork-sync: {target} upstream-sync report (fork watcher)")
-    repo.push("HEAD", f"refs/heads/{sync_branch}", force=True)
-    title = f"upstream-sync: {target} ({'tests failed' if tests_failed else f'{len(failed)} of {len(results)} patches failed'})"
-    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as bf:
-        bf.write(body)
-    url = repo.gh("pr", "create", "-R", fork, "--draft", "--base", base_branch, "--head", sync_branch,
-                  "--title", (f"[{prefix.rstrip('/')}] " if prefix else "") + title, "--body-file", bf.name, write=True).strip()
-    log(f"opened {url}")
-    if d.major:
-        repo.gh("label", "create", "goose-major", "-R", fork, "--force", "--color", "5319e7",
-                "--description", "upstream major-version upgrade", write=True)
-        repo.gh("pr", "edit", url, "-R", fork, "--add-label", "goose-major", write=True)
-    for n in d.close_prs:
-        repo.gh("pr", "close", str(n), "-R", fork, "--comment", f"Superseded by {url}, which carries this branch forward.", write=True)
-    write_summary(f"upstream-sync: **conflict** {title}: {url}")
+    # The bundle holds only what the fork lacks; publish fetches plan["fetch"] first.
+    os.makedirs(out, exist_ok=True)
+    tips = [r.split(":", 1)[0].lstrip("+") for r in plan["refspecs"]]
+    for i, t in enumerate(tips):
+        repo.git("update-ref", f"refs/l1/{i}", t)
+    have = [ref for _, ref in plan["fetch"] if ref.startswith("refs/tags/")]
+    have += ["refs/remotes/fork/" + ref.removeprefix("refs/heads/") for r, ref in plan["fetch"] if r == "fork"]
+    tag_refs = [r.split(":", 1)[0] for r in plan["refspecs"] if r.startswith("refs/tags/")]
+    p = repo.git("bundle", "create", os.path.join(out, "sync.bundle"), "--glob=refs/l1/*", *tag_refs,
+                 "--not", *have, check=False)
+    if p.returncode != 0 and "empty bundle" not in p.stderr:
+        raise RuntimeError(f"git bundle create: {p.stderr.strip()}")
+    return plan
+
+
+def publish(out: str, plan: dict) -> int:
+    fork = plan["fork"]
+    token = os.environ.get("GOOSE_SYNC_TOKEN", "")
+    if not token and plan["prefix"]:
+        # A rehearsal may push with GITHUB_TOKEN; that works only while it adds no new
+        # workflow blob, which a stack re-applied onto its own base does not.
+        token = os.environ.get("L1_FALLBACK_TOKEN", "")
+    if not token and os.environ.get("GITHUB_ACTIONS"):
+        raise SystemExit(
+            "::error::GOOSE_SYNC_TOKEN is not set. GITHUB_TOKEN cannot push refs that add workflow files, "
+            "which every upstream release does; see the header of .github/workflows/upstream-sync.yml."
+        )
+    gh_env = dict(os.environ, **({"GH_TOKEN": token} if token else {}))
+
+    def gh(*args: str) -> str:
+        return run(["gh", *args], env=gh_env).stdout
+
+    if plan["refspecs"]:
+        repo = Repo(os.environ.get("L1_PUBLISH_DIR") or tempfile.mkdtemp(prefix="upstream-sync-publish-"), fork, token)
+        repo.init(os.environ.get("L1_REFERENCE"))
+        for remote, ref in plan["fetch"]:
+            repo.fetch(remote, ref)
+        bundle = os.path.join(out, "sync.bundle")
+        if os.path.exists(bundle):
+            repo.git("fetch", "-q", bundle, "+refs/l1/*:refs/l1/*")
+        tags = [r for r in plan["refspecs"] if r.startswith("refs/tags/")]
+        for r in tags:
+            t = r.split(":", 1)[0].removeprefix("refs/tags/")
+            repo.git("fetch", "-q", bundle, f"+refs/tags/{t}:refs/tags/{t}")
+        repo.push(plan["refspecs"], plan["atomic"])
+    pr_url = ""
+    if plan["pr"]:
+        pr = plan["pr"]
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as bf:
+            bf.write(pr["body"])
+        pr_url = gh("pr", "create", "-R", fork, "--draft", "--base", pr["base"], "--head", pr["head"],
+                    "--title", pr["title"], "--body-file", bf.name).strip()
+        log(f"opened {pr_url}")
+        if plan["label_major"]:
+            gh("label", "create", "goose-major", "-R", fork, "--force", "--color", "5319e7",
+               "--description", "upstream major-version upgrade")
+            gh("pr", "edit", pr_url, "-R", fork, "--add-label", "goose-major")
+    for n, body in plan["comment"]:
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as bf:
+            bf.write(body)
+        gh("pr", "comment", str(n), "-R", fork, "--body-file", bf.name)
+    for n, comment in plan["close"]:
+        gh("pr", "close", str(n), "-R", fork, "--comment", comment.replace("{pr_url}", pr_url))
+    write_summary(plan["summary"] + (f": {pr_url}" if pr_url else ""))
+    if plan["fail"]:
+        raise SystemExit("::error::" + plan["fail"])
     return 0
 
 
+def has_work(plan: dict) -> bool:
+    return bool(plan["refspecs"] or plan["pr"] or plan["comment"] or plan["close"] or plan["fail"])
+
+
+def main(argv: list[str]) -> int:
+    mode = argv[1] if len(argv) > 1 else "local"
+    out = argv[2] if len(argv) > 2 else tempfile.mkdtemp(prefix="upstream-sync-out-")
+    if mode in ("prepare", "local"):
+        plan = prepare(out)
+        with open(os.path.join(out, "plan.json"), "w") as f:
+            json.dump(plan, f, indent=1)
+        work = has_work(plan)
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                f.write(f"work={'true' if work else 'false'}\n")
+        if not work:
+            write_summary(plan["summary"])
+        if mode == "prepare" or not work:
+            return 0
+    with open(os.path.join(out, "plan.json")) as f:
+        plan = json.load(f)
+    return publish(out, plan)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv))
