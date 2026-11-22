@@ -101,7 +101,13 @@ jobs:
             "acp::server::session_settings::tests::max_turns_from_meta_absent_or_null_is_default" \
             "acp::server::session_settings::tests::max_turns_from_meta_accepts_positive_integer" \
             "acp::server::session_settings::tests::max_turns_from_meta_rejects_invalid_values" \
-            "acp::server::session_settings::tests::cache_ttl_is_normalized_and_validated"
+            "acp::server::session_settings::tests::cache_ttl_is_normalized_and_validated" \
+            "agents::mcp_startup_timeout::tests::test_mcp_client_startup_timeout_format" \
+            "agents::mcp_startup_timeout::tests::test_mcp_client_startup_timeout_resolve" \
+            "agents::mcp_startup_timeout::tests::test_mcp_client_startup_timeout_auto_lifecycle" \
+            "agents::mcp_startup_timeout::tests::test_mcp_client_startup_timeout_discover_lifecycle" \
+            "agents::mcp_startup_timeout::tests::test_mcp_client_startup_timeout_initialize_lifecycle" \
+            "agents::extension_manager::stdio::startup_tests::test_mcp_client_startup_timeout_stdio_kills_process_group"
 
           run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
             "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \

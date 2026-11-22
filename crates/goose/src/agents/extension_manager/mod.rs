@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: ConnectContext startup_timeout.
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::Stream;
@@ -763,6 +764,7 @@ impl ExtensionManager {
         let tools_version = Arc::new(AtomicU64::new(0));
         let ctx = |timeout: Option<u64>, working_dir: PathBuf| ConnectContext {
             timeout: Duration::from_secs(resolve_timeout(timeout)),
+            startup_timeout: None,
             client_name: client.name.clone(),
             capabilities: client.capabilities.clone(),
             working_dir,

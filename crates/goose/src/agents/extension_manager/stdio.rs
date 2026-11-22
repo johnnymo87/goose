@@ -1,13 +1,14 @@
+// Modified by Jonathan Mohrbacher, 2026: a failed start kills the child's process group and stops waiting for stderr (see mcp_startup_timeout.rs).
 use std::collections::HashMap;
 
 use rmcp::transport::ConfigureCommandExt;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::super::container::Container;
 use super::super::extension::{ExtensionError, ExtensionResult, ProcessExit};
 use super::super::extension_malware_check;
 use super::super::mcp_client::{ConnectContext, McpClient};
+use super::super::mcp_startup_timeout::{kill_process_group, StartupStderr};
 use crate::config::search_path::SearchPaths;
 use crate::subprocess::spawn_long_lived_mcp_subprocess;
 
@@ -80,22 +81,22 @@ pub(super) async fn spawn(mut command: Command, ctx: ConnectContext) -> Extensio
         );
     }
 
-    let (transport, mut stderr) = spawn_long_lived_mcp_subprocess(command).await?;
-    let mut stderr = stderr.take().ok_or_else(|| {
+    let (transport, stderr) = spawn_long_lived_mcp_subprocess(command).await?;
+    let child_pid = transport.id();
+    let stderr = stderr.ok_or_else(|| {
         ExtensionError::SetupError("failed to attach child process stderr".to_owned())
     })?;
-
-    let stderr_task = tokio::spawn(async move {
-        let mut all_stderr = Vec::new();
-        stderr.read_to_end(&mut all_stderr).await?;
-        Ok::<String, std::io::Error>(String::from_utf8_lossy(&all_stderr).into())
-    });
+    let stderr = StartupStderr::capture(stderr);
 
     match McpClient::connect(transport, ctx).await {
         Ok(client) => Ok(client),
-        Err(error) => Err(match stderr_task.await? {
-            Ok(stderr_content) => ProcessExit::new(stderr_content, error).into(),
-            Err(e) => e.into(),
-        }),
+        Err(error) => {
+            kill_process_group(child_pid);
+            Err(ProcessExit::new(stderr.collect().await, error).into())
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "stdio_startup_tests.rs"]
+mod startup_tests;
