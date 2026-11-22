@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: session/prompt turn_failed errors carry data.kind and data.message.
+// Modified by Jonathan Mohrbacher, 2026: session/prompt turn_failed errors carry data.kind and data.message; register session_settings (settings/set) and honour session/prompt _meta.goose.maxTurns.
 use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 pub(super) use crate::acp::response_builder::{
@@ -123,6 +123,7 @@ mod providers;
 mod recipe;
 mod resources;
 mod schedule;
+mod session_settings;
 mod slash_commands;
 mod sources;
 mod tool_calls;
@@ -2242,6 +2243,7 @@ impl AcpConnection {
         cx: &ConnectionTo<Client>,
         args: PromptRequest,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
+        let max_turns = session_settings::max_turns_from_meta(args.meta.as_ref())?;
         // The ACP session_id IS the thread ID.
         let session_id = args.session_id.0.to_string();
 
@@ -2290,7 +2292,7 @@ impl AcpConnection {
         let session_config = SessionConfig {
             id: session_id.clone(),
             schedule_id: None,
-            max_turns: None,
+            max_turns,
         };
 
         let reply = self

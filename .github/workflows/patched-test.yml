@@ -97,12 +97,24 @@ jobs:
             "acp::turn_error::tests::turn_error_message_under_the_cap_is_kept_whole" \
             "acp::turn_error::tests::turn_error_message_over_the_cap_is_cut_on_a_char_boundary" \
             "acp::server::tests::test_authentication_message_maps_to_auth_required" \
-            "acp::server::tests::test_other_error_messages_map_to_internal_error"
+            "acp::server::tests::test_other_error_messages_map_to_internal_error" \
+            "acp::server::session_settings::tests::max_turns_from_meta_absent_or_null_is_default" \
+            "acp::server::session_settings::tests::max_turns_from_meta_accepts_positive_integer" \
+            "acp::server::session_settings::tests::max_turns_from_meta_rejects_invalid_values" \
+            "acp::server::session_settings::tests::cache_ttl_is_normalized_and_validated"
 
           run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
             "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \
             "test_prompt_fails_and_streams_the_error" \
             "test_manual_compaction_refusal_fails_without_replacing_context"
+
+          run_exact_tests --release -p goose --features "$F" --test acp_session_settings_test -- \
+            "test_session_settings_set_rejects_invalid_input" \
+            "test_session_settings_set_persists_and_survives_reload" \
+            "test_session_settings_set_activates_cold_session" \
+            "test_prompt_max_turns_bounds_run" \
+            "test_session_settings_idempotent_prompts_byte_identical" \
+            "test_session_settings_templated_recipe_renders_consistently"
 
           run_exact_tests --release -p goose-provider-types --lib -- \
             "formats::anthropic::tests::native_claude_thinking_carries_display_and_block_binding" \
