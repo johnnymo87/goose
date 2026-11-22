@@ -1162,7 +1162,11 @@ where
                                 if !initial.is_empty() {
                                     let mut message = Message::assistant().with_thinking(initial, "");
                                     message.id = message_id.clone();
-                                    yield (Some(message), None);
+                                    if held.is_empty() {
+                                        yield (Some(message), None);
+                                    } else {
+                                        held.push(message);
+                                    }
                                 }
                                 thinking = Some(state);
                             }
@@ -1200,7 +1204,11 @@ where
                                 if thinking.is_some() && !t.is_empty() {
                                     let mut message = Message::assistant().with_thinking(t, "");
                                     message.id = message_id.clone();
-                                    yield (Some(message), None);
+                                    if held.is_empty() {
+                                        yield (Some(message), None);
+                                    } else {
+                                        held.push(message);
+                                    }
                                 }
                             }
                             Ok(ContentBlockDelta::SignatureDelta { signature: s }) => {
@@ -2999,6 +3007,59 @@ mod tests {
         );
         assert_eq!(parts.text, vec!["Let me search for that."]);
         assert_eq!(parts.tool_calls, vec!["search"]);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_thinking_after_completed_tool_use() {
+        let events = concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_tool_then_think","role":"assistant","content":[],"model":"claude-sonnet-4-6","usage":{"input_tokens":8,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_1","name":"search","input":{}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust\"}"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Post-tool reflection."}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"post_sig"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+        );
+
+        let results = collect_stream_results(events).await;
+        let messages: Vec<Message> = results
+            .into_iter()
+            .filter_map(|r| r.ok().and_then(|(m, _)| m))
+            .collect();
+
+        // The tool_use was completed at index 0 and held. The subsequent thinking block
+        // (both the delta and the signature close) must also be held, preserving the invariant
+        // that once a tool_use completes, it and everything after wait until message_stop.
+        // Thus, tool_use is yielded first, followed by the thinking messages.
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            messages[0].content.first(),
+            Some(MessageContentBlock::ToolRequest(_))
+        ));
+        assert!(matches!(
+            messages[1].content.first(),
+            Some(MessageContentBlock::Thinking(t)) if t.thinking == "Post-tool reflection."
+        ));
+        assert!(matches!(
+            messages[2].content.first(),
+            Some(MessageContentBlock::Thinking(t)) if t.signature == "post_sig"
+        ));
+        assert_eq!(
+            pushed_thinking(events).await,
+            vec![("Post-tool reflection.".to_string(), "post_sig".to_string())]
+        );
     }
 
     async fn collect_stream_results(
