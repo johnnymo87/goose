@@ -1,0 +1,75 @@
+# Reusable workflow to run unit tests and graph checks for the fork's patches.
+# Shared by patched-release.yml (on tag release) and patched-ci.yml (on PRs to patched/**).
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit ref to test"
+        required: true
+        type: string
+
+name: "Patched tests"
+
+permissions:
+  contents: read
+
+jobs:
+  test-patches:
+    name: test-patches
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libdbus-1-dev libxcb1-dev protobuf-compiler cmake clang libclang-dev
+      - name: Vendored acp-http is the one in the build graph
+        # An unused [patch] is only a cargo warning; fail loudly instead. --locked also
+        # fails if Cargo.lock is stale (build-cli-linux.yml does not pass --locked).
+        run: |
+          cargo tree --locked -p goose-cli --features acp-http -i agent-client-protocol-http --depth 0 \
+            | tee /dev/stderr | grep -F 'vendor/agent-client-protocol-http'
+      - name: Test patched modules
+        run: |
+          run_filtered_tests() {
+            local cargo_args=()
+            local filters=()
+            local seen_sep=false
+
+            for arg in "$@"; do
+              if [ "$arg" = "--" ]; then
+                seen_sep=true
+                continue
+              fi
+              if [ "$seen_sep" = true ]; then
+                filters+=("$arg")
+              else
+                cargo_args+=("$arg")
+              fi
+            done
+
+            if [ ${#filters[@]} -gt 0 ]; then
+              echo "Asserting test filters match in cargo test ${cargo_args[*]}..."
+              local list
+              list="$(cargo test "${cargo_args[@]}" -- --list | grep -E ': (test|benchmark)$')"
+              for filter in "${filters[@]}"; do
+                local count
+                count="$(echo "$list" | grep -F -c "$filter" || true)"
+                if [ "$count" -eq 0 ]; then
+                  echo "Error: test filter '$filter' matched 0 tests in cargo test ${cargo_args[*]}" >&2
+                  exit 1
+                fi
+                echo "  filter '$filter': $count test(s) matched"
+              done
+            fi
+
+            cargo test "${cargo_args[@]}" -- "${filters[@]}"
+          }
+
+          F=code-mode,tree-sitter,aws-providers,telemetry,otel,rustls-tls,live-voice,system-keyring,platform-apps,chat-recall,scheduler,acp-http,online-model-meta
+          run_filtered_tests --release -p goose --features "$F" --lib -- gcpvertexai session_context test_parent_link_is_visible_to_providers gcpauth cache_ttl global_skill recipe_thinking_effort recipe_without_thinking_effort thinking_effort_parsing invalid_thinking_effort toolshim_provider_stream thinking_deltas_before_transient_error
+          run_filtered_tests --release -p goose-provider-types --lib -- native_claude_thinking summarized_thinking_round_trips test_streaming_thinking test_streaming_omitted_thinking test_streamed_thinking test_streaming_redacted_thinking
+          run_filtered_tests --release -p goose-cli --lib -- cache_ttl
+          cargo test --release -p agent-client-protocol-http --features server --lib
