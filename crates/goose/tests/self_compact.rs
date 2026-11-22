@@ -16,6 +16,7 @@ use goose::context_mgmt::SELF_COMPACT_CONTINUATION_TEXT;
 use goose::conversation::message::{Message, MessageContent};
 use goose::providers::base::{stream_from_single_message, MessageStream, Provider};
 use goose::recipe::Recipe;
+use goose::session::extension_data::{EnabledExtensionsState, ExtensionState};
 use goose::session::session_manager::{Session, SessionManager, SessionType};
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use goose_providers::errors::ProviderError;
@@ -1135,6 +1136,54 @@ async fn test_tool_not_advertised_when_provider_manages_own_context() -> Result<
             .iter()
             .any(|t| t.name == SELF_COMPACT_TOOL_NAME),
         "tool must not be advertised when provider manages own context"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tools_not_advertised_when_session_has_zero_extensions() -> Result<()> {
+    let ctx = TestContext::new().await?;
+
+    let mut extension_data = ctx.session.extension_data.clone();
+    EnabledExtensionsState::new(Vec::new()).to_extension_data(&mut extension_data)?;
+    ctx.services
+        .session_manager
+        .update(&ctx.session.id)
+        .extension_data(extension_data)
+        .apply()
+        .await?;
+
+    let turn1_msg = Message::assistant().with_text("done");
+    let provider = Arc::new(ScriptedSelfCompactProvider::new(vec![turn1_msg]));
+    let recorded = provider.recorded_calls.clone();
+
+    ctx.services
+        .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
+        .await?;
+
+    let stream = ctx
+        .services
+        .reply(
+            Message::user().with_text("hi"),
+            ctx.session_config(Some(1)),
+            None,
+        )
+        .await?;
+    tokio::pin!(stream);
+    while let Some(res) = stream.next().await {
+        res?;
+    }
+
+    let calls = recorded.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0].tools.is_empty(),
+        "no tools must be offered when session has zero extensions: {:?}",
+        calls[0].tools
+    );
+    assert!(
+        !calls[0].system_prompt.contains("# Skills"),
+        "skills prompt must not be included when session has zero extensions"
     );
     Ok(())
 }
