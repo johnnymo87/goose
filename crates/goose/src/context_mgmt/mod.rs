@@ -1,4 +1,5 @@
-// Modified by Jonathan Mohrbacher, 2026: self-compaction kind.
+// Modified by Jonathan Mohrbacher, 2026: self-compaction kind; rolling memory module.
+pub mod rolling;
 pub use goose_context_management::structured;
 
 use crate::conversation::message::MessageMetadata;

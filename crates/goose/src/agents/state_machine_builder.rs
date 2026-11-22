@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: register self-compaction operation.
+// Modified by Jonathan Mohrbacher, 2026: register self-compaction operation; register RollingMemoryOperation before CompactionOperation.
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -20,11 +20,11 @@ use crate::agents::state_machine::{
     CompactionOperation, ContextRelevanceOperation, DoctorOperation, FinalOutputOperation,
     GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer, GooseSkillSource,
     GooseToolApproval, InferenceRunner, Operation, PlatformExtensionOperation, ProjectOperation,
-    RecipeOperation, RemainingToolCallsOperation, RetryOperation, SelfCompactOperation,
-    SelfCompactTurnLimitOperation, SkillOperation, SlashCommandOperation, StateMachine,
-    StatusOperation, Step, StopHookOperation, SubagentOperation, ToolApprovalOperation,
-    ToolExecutionOperation, ToolPairCompactionOperation, UnavailableDecisions,
-    UnhandledToolCallsOperation, NO_SKILLS_HELP,
+    RecipeOperation, RemainingToolCallsOperation, RetryOperation, RollingMemoryOperation,
+    SelfCompactOperation, SelfCompactTurnLimitOperation, SkillOperation, SlashCommandOperation,
+    StateMachine, StatusOperation, Step, StopHookOperation, SubagentOperation,
+    ToolApprovalOperation, ToolExecutionOperation, ToolPairCompactionOperation,
+    UnavailableDecisions, UnhandledToolCallsOperation, NO_SKILLS_HELP,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::tool_execution::DECLINED_RESPONSE;
@@ -180,6 +180,12 @@ pub(crate) fn build_state_machine(
                 compaction_threshold,
             )));
         }
+        operations.push(Arc::new(RollingMemoryOperation::new(
+            session_manager.clone(),
+            provider.clone(),
+            model_config.clone(),
+            Arc::clone(&services),
+        )));
         operations.push(Arc::new(CompactionOperation::new(
             provider.clone(),
             model_config.clone(),
