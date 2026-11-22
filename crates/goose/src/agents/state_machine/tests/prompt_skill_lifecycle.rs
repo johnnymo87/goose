@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: subdirectory hints arrive in the conversation once, not in the system prompt.
 use anyhow::Result;
 use serde_json::json;
 
@@ -27,8 +28,25 @@ async fn prompt_and_skill_lifecycle() -> Result<()> {
     api.on("result: 1").reply("nested work complete");
     pipeline.run(["work in nested"]).await?;
     let calls = api.calls();
-    assert!(!calls[calls.len() - 2].system_contains("NESTED_PROJECT_INSTRUCTION"));
-    assert!(calls[calls.len() - 1].system_contains("NESTED_PROJECT_INSTRUCTION"));
+    assert!(!calls[calls.len() - 2].input_contains("NESTED_PROJECT_INSTRUCTION"));
+    let after_tool = &calls[calls.len() - 1];
+    assert!(!after_tool.system_contains("NESTED_PROJECT_INSTRUCTION"));
+    assert_eq!(
+        after_tool.input_occurrences("NESTED_PROJECT_INSTRUCTION"),
+        1
+    );
+    assert!(after_tool.input_contains("<subdirectory-hints dir="));
+
+    api.on("again in nested")
+        .call(ADD, json!({ "value": 1, "path": "nested/other.rs" }));
+    api.on("result: 2").reply("still nested");
+    pipeline.run(["again in nested"]).await?;
+    let delivered_once = api.calls().pop().unwrap();
+    assert!(!delivered_once.system_contains("NESTED_PROJECT_INSTRUCTION"));
+    assert_eq!(
+        delivered_once.input_occurrences("NESTED_PROJECT_INSTRUCTION"),
+        1
+    );
 
     api.on("Please summarize the conversation history")
         .reply("summary");

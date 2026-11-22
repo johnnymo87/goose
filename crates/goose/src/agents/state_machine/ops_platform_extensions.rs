@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: platform tool responses carry subdirectory hints.
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -121,11 +122,19 @@ impl Operation<Session, GooseEffect> for PlatformExtensionOperation {
         if calls.is_empty() {
             return not_applicable();
         }
-        let mut session = session.clone();
+        let mut call_session = session.clone();
         if let Some(directory) = tools.working_dir() {
-            session.working_dir = directory.to_path_buf();
+            call_session.working_dir = directory.to_path_buf();
         }
-        self.execution.run(calls, &session, emit).await
+        self.execution
+            .run(
+                calls,
+                &call_session,
+                conversation,
+                &session.working_dir,
+                emit,
+            )
+            .await
     }
 
     async fn finalize_cancellation(

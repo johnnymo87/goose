@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: subdirectory hints are delivered in tool responses, not the system prompt.
 //! Exposes extension capabilities and executes requests that belong to them.
 
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,7 @@ use crate::agents::extension::ExtensionInfo;
 use crate::agents::extension_manager::CallRequest;
 use crate::agents::reply_parts::is_tool_visible_to_model;
 use crate::agents::state_machine::ops_llm::{ADVERTISED_TOOLS_NOTE, LLM_OPERATION_NAME};
+use crate::agents::state_machine::subdirectory_hints::deliver_subdirectory_hints;
 use crate::agents::state_machine::{
     applied, messages_since_kickoff, not_applicable, yielded_with, Command, ConversationEffect,
     Emitter, GooseEffect, Operation, OperationResult,
@@ -27,7 +29,6 @@ use crate::conversation::message::{
     ActionRequiredData, Message, MessageContent, ProviderMetadata, ToolRequest,
 };
 use crate::conversation::Conversation;
-use crate::hints::load_hints::SubdirectoryHintTracker;
 use crate::session::Session;
 
 pub(super) const EXPIRED_APPROVAL_RESPONSE: &str =
@@ -698,23 +699,9 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation {
     async fn prompt_parts(
         &self,
         session: &Session,
-        conversation: &Conversation,
+        _conversation: &Conversation,
     ) -> Result<Vec<(String, String)>> {
-        let mut hints = SubdirectoryHintTracker::new();
-        for message in conversation
-            .messages()
-            .iter()
-            .filter(|message| message.is_agent_visible())
-        {
-            for content in &message.content {
-                if let MessageContent::ToolRequest(request) = content {
-                    if let Ok(tool_call) = &request.tool_call {
-                        hints.record_tool_arguments(&tool_call.arguments, &session.working_dir);
-                    }
-                }
-            }
-        }
-        let mut prompt_parts = hints.load_new_hints(&session.working_dir);
+        let mut prompt_parts = Vec::new();
 
         let tools = ToolSnapshot::for_session(&self.tools, &self.services, &session.id).await?;
         #[cfg(feature = "code-mode")]
@@ -847,7 +834,15 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation {
             };
             calls.push((request, result));
         }
-        self.execution.run(calls, &call_session, emit).await
+        self.execution
+            .run(
+                calls,
+                &call_session,
+                conversation,
+                &session.working_dir,
+                emit,
+            )
+            .await
     }
 }
 
@@ -882,6 +877,8 @@ impl ToolExecution {
         &self,
         calls: Vec<(ToolRequest, ToolCallResult)>,
         session: &Session,
+        conversation: &Conversation,
+        hint_working_dir: &Path,
         emit: &Emitter,
     ) -> Result<OperationResult<GooseEffect>> {
         let mut tool_streams = Vec::new();
@@ -929,7 +926,8 @@ impl ToolExecution {
         }
 
         let (actions, response) = self.take_batch();
-        let response = response.ok_or_else(|| anyhow!("tool batch produced no responses"))?;
+        let mut response = response.ok_or_else(|| anyhow!("tool batch produced no responses"))?;
+        deliver_subdirectory_hints(&mut response, conversation, hint_working_dir);
         emit.emit(AgentEvent::Message(response.user_visible_content()));
         applied(actions.into_iter().chain([response]).map(GooseEffect::from))
     }

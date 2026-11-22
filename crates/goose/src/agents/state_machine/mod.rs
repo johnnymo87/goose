@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: export retry and compaction failure checks for turn errors; self-compaction operation; rolling memory operation.
+// Modified by Jonathan Mohrbacher, 2026: export retry and compaction failure checks for turn errors; self-compaction operation; rolling memory operation; subdirectory_hints module.
 //! Runs an ordered, re-entrant pipeline over persisted conversation state.
 //!
 //! Callers persist incoming messages, construct `Step`s from their own operations,
@@ -29,6 +29,7 @@ mod ops_tool_pair_compaction;
 mod ops_toolcalling;
 mod proactive_compaction;
 mod session;
+mod subdirectory_hints;
 pub(crate) use session::run as run_goose;
 mod tool_approval;
 mod tool_confirmation;
