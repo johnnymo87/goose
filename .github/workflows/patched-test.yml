@@ -190,7 +190,14 @@ jobs:
             "context_mgmt::rolling::tests::rolling_settings_write_null" \
             "context_mgmt::rolling::tests::rolling_state_default_absent" \
             "context_mgmt::rolling::tests::rolling_state_invalid_defaults" \
-            "context_mgmt::rolling::tests::rolling_state_roundtrip"
+            "context_mgmt::rolling::tests::rolling_state_roundtrip" \
+            "agents::state_machine::subdirectory_hints::tests::hints_are_appended_to_the_tool_response_for_the_agent_only" \
+            "agents::state_machine::subdirectory_hints::tests::hints_already_in_the_conversation_are_not_delivered_again" \
+            "agents::state_machine::subdirectory_hints::tests::hints_hidden_from_the_agent_return_with_the_next_call_into_the_directory" \
+            "agents::state_machine::subdirectory_hints::tests::a_quoted_marker_does_not_count_as_delivered" \
+            "agents::state_machine::subdirectory_hints::tests::failed_tool_responses_do_not_carry_hints" \
+            "agents::state_machine::subdirectory_hints::tests::hints_go_to_the_last_successful_response_in_directory_order" \
+            "agents::state_machine::tests::prompt_skill_lifecycle::prompt_and_skill_lifecycle"
 
           run_exact_tests --release -p goose --features "$F" --test self_compact -- \
             "test_happy_path_self_compact" \
