@@ -126,12 +126,17 @@ jobs:
             "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_strict_start_accepts_extensions_that_start" \
             "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_strict_start_fails_on_an_extension_that_does_not_start" \
             "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_delegate_fails_when_its_extension_does_not_start" \
-            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_delegate_without_policy_runs_on_after_a_failed_extension"
+            "agents::platform_extensions::summon::subagent_policy::tests::subagent_policy_delegate_without_policy_runs_on_after_a_failed_extension" \
+            "acp::server::truncate_from_message::tests::message_id_from_meta_reads_goose_message_id" \
+            "acp::server::truncate_from_message::tests::message_id_from_meta_rejects_empty_or_non_string" \
+            "acp::server::truncate_from_message::tests::agent_capabilities_advertise_truncate_from_message" \
+            "session::session_manager::tests::test_truncate_conversation_from_message_keeps_same_second_previous_rows"
 
           run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
             "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \
             "test_prompt_fails_and_streams_the_error" \
-            "test_manual_compaction_refusal_fails_without_replacing_context"
+            "test_manual_compaction_refusal_fails_without_replacing_context" \
+            "test_prompt_message_id_and_truncate_from_message"
 
           run_exact_tests --release -p goose --features "$F" --test acp_session_settings_test -- \
             "test_session_settings_set_rejects_invalid_input" \

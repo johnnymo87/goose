@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort; turn_failed errors carry data.kind.
+// Modified by Jonathan Mohrbacher, 2026: recipe settings.thinking_effort overrides the inherited delegate effort; turn_failed errors carry data.kind; session/prompt messageId and truncate_from_message.
 #![recursion_limit = "256"]
 #[allow(dead_code)]
 #[path = "acp_common_tests/mod.rs"]
@@ -33,7 +33,8 @@ use common_tests::{
 use goose::config::GooseMode;
 use goose::conversation::message::{Message, MessageMetadata};
 use goose::custom_requests::{
-    GetSessionInfoRequest, GetSessionInfoResponse, UpdateSessionProjectRequest,
+    GetSessionInfoRequest, GetSessionInfoResponse, TruncateSessionConversationFromMessageRequest,
+    UpdateSessionProjectRequest,
 };
 use goose::recipe::{Recipe, Settings};
 use goose::recipe_deeplink;
@@ -1681,5 +1682,89 @@ fn test_manual_compaction_refusal_fails_without_replacing_context() {
                 .text,
             "2"
         );
+    });
+}
+
+#[test]
+fn test_prompt_message_id_and_truncate_from_message() {
+    run_test(async {
+        let expected_session_id = <AcpServerConnection as Connection>::expected_session_id();
+        let openai = OpenAiFixture::new(
+            vec![(
+                format!("what is 1+1{TURN_CONTEXT_OPEN}"),
+                include_str!("acp_test_data/openai_basic.txt"),
+            )],
+            expected_session_id.clone(),
+        )
+        .await;
+        let mut conn =
+            <AcpServerConnection as Connection>::new(TestConnectionConfig::default(), openai).await;
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().0.to_string();
+        expected_session_id.set(&session_id);
+        let manager = SessionManager::new(conn.data_root());
+        let stored = || async {
+            manager
+                .get_session(&session_id, true)
+                .await
+                .unwrap()
+                .conversation
+                .map(|conversation| conversation.messages().to_vec())
+                .unwrap_or_default()
+        };
+        let prompt = |message_id: serde_json::Value| {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "goose".to_string(),
+                serde_json::json!({ "messageId": message_id }),
+            );
+            conn.cx()
+                .send_request(
+                    PromptRequest::new(
+                        agent_client_protocol::schema::v1::SessionId::new(session_id.clone()),
+                        vec![ContentBlock::Text(TextContent::new("what is 1+1"))],
+                    )
+                    .meta(meta),
+                )
+                .block_task()
+        };
+        let truncate = |message_id: &str| {
+            conn.cx()
+                .send_request(TruncateSessionConversationFromMessageRequest {
+                    session_id: session_id.clone(),
+                    message_id: message_id.to_string(),
+                })
+                .block_task()
+        };
+
+        let bad = prompt(serde_json::json!("")).await.unwrap_err();
+        assert_eq!(bad.code, ErrorCode::InvalidParams);
+        assert!(
+            stored().await.is_empty(),
+            "a rejected prompt stores nothing"
+        );
+
+        let done = prompt(serde_json::json!("msg_honk_test_1")).await.unwrap();
+        assert_eq!(done.stop_reason, StopReason::EndTurn);
+        let before = stored().await;
+        assert!(
+            before.len() >= 2,
+            "expected user + assistant rows: {before:?}"
+        );
+        assert_eq!(before[0].id.as_deref(), Some("msg_honk_test_1"));
+
+        let unknown = truncate("msg_honk_unknown").await.unwrap();
+        assert!(!unknown.found);
+        assert_eq!(stored().await.len(), before.len());
+
+        assert!(truncate("msg_honk_test_1").await.unwrap().found);
+        assert!(
+            stored().await.is_empty(),
+            "truncating from the first message must remove the whole turn"
+        );
+        assert!(!truncate("msg_honk_test_1").await.unwrap().found);
+
+        let empty = truncate(" ").await.unwrap_err();
+        assert_eq!(empty.code, ErrorCode::InvalidParams);
     });
 }
