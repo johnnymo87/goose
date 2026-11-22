@@ -17,7 +17,7 @@
 # Repo variable GOOSE_HOLD: any non-empty value pauses the watcher.
 #
 # Manual runs default to the test-l1/ prefix: branches test-l1/..., tags test-l1-patched-*
-# (which do not start a release). Clear the prefix only to do the real thing by hand;
+# (which do not start a release). Pass -f real=true only to do the real thing by hand;
 # skip_tests and allow_same are refused without a test- prefix.
 #
 # Two jobs so the push token never shares a runner with the candidate's build scripts:
@@ -30,8 +30,12 @@ on:
     - cron: "23 10 * * *"
   workflow_dispatch:
     inputs:
+      real:
+        description: "A real run (no prefix). An empty prefix cannot say this: dispatch replaces it with the default."
+        type: boolean
+        default: false
       prefix:
-        description: "Branch prefix; tags get it with / replaced by -. Empty = real run."
+        description: "Rehearsal prefix (test-<name>/); tags get it with / replaced by -. Ignored when real."
         default: "test-l1/"
       target:
         description: "Upstream tag to move to (default: newest release latest for 48 h)"
@@ -83,7 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GOOSE_HOLD: ${{ vars.GOOSE_HOLD }}
-          L1_PREFIX: ${{ inputs.prefix }}
+          L1_PREFIX: ${{ github.event_name == 'workflow_dispatch' && !inputs.real && inputs.prefix || '' }}
           L1_TARGET: ${{ inputs.target }}
           L1_BASE: ${{ inputs.base }}
           L1_SKIP_TESTS: ${{ inputs.skip_tests && '1' || '' }}
@@ -122,5 +126,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GOOSE_SYNC_TOKEN: ${{ secrets.GOOSE_SYNC_TOKEN }}
           L1_FALLBACK_TOKEN: ${{ github.token }}
-          L1_PREFIX: ${{ inputs.prefix }}
+          L1_PREFIX: ${{ github.event_name == 'workflow_dispatch' && !inputs.real && inputs.prefix || '' }}
         run: python3 .github/fork/upstream_sync.py publish "$RUNNER_TEMP/l1"
