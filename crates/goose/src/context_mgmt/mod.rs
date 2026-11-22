@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: self-compaction kind.
 pub use goose_context_management::structured;
 
 use crate::conversation::message::MessageMetadata;
@@ -73,6 +74,16 @@ const MANUAL_COMPACT_CONTINUATION_TEXT: &str =
 Do not mention that you read a summary or that conversation summarization occurred.
 Just continue the conversation naturally based on the summarized context.";
 
+pub const SELF_COMPACT_CONTINUATION_TEXT: &str =
+    "You compacted your own context. The previous message contains a summary of the conversation so far.\nThe next user message is the resumption prompt you wrote before compacting. Act on it.\nDo not mention that you read a summary or that conversation summarization occurred.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionKind {
+    Auto,
+    Manual,
+    SelfRequested,
+}
+
 /// Summaries persisted before the `compaction_summary` flag existed are known
 /// by the continuation text compaction merges into them. Conversation repair
 /// may have concatenated it onto the summary text, so match the tail.
@@ -85,6 +96,7 @@ pub fn is_compaction_summary(message: &Message) -> bool {
                     CONVERSATION_CONTINUATION_TEXT,
                     TOOL_LOOP_CONTINUATION_TEXT,
                     MANUAL_COMPACT_CONTINUATION_TEXT,
+                    SELF_COMPACT_CONTINUATION_TEXT,
                 ]
                 .iter()
                 .any(|continuation| text.text.ends_with(continuation)),
@@ -113,13 +125,13 @@ pub struct CompactionResult {
 /// * `provider` - The provider to use for summarization
 /// * `session_id` - The session to use for summarization
 /// * `conversation` - The current conversation history
-/// * `manual_compact` - If true, this is a manual compaction (don't preserve user message)
-pub async fn compact_messages(
+/// * `kind` - The kind of compaction (Auto, Manual, SelfRequested)
+pub async fn compact_messages_with_kind(
     provider: &dyn Provider,
     model_config: &ModelConfig,
     session_id: &str,
     conversation: &Conversation,
-    manual_compact: bool,
+    kind: CompactionKind,
 ) -> Result<CompactionResult> {
     info!("Performing message compaction");
 
@@ -140,7 +152,7 @@ pub async fn compact_messages(
     };
 
     // Turn-context events are agent-appended, never the message to preserve.
-    let (preserved_user_message, preserved_idx, is_most_recent) = if !manual_compact {
+    let (preserved_user_message, preserved_idx, is_most_recent) = if kind == CompactionKind::Auto {
         let found_msg = messages.iter().enumerate().rev().find_map(|(idx, msg)| {
             if !msg.is_agent_visible()
                 || msg.is_turn_context()
@@ -197,12 +209,16 @@ pub async fn compact_messages(
 
     let mut continuation_messages = vec![summary_msg];
 
-    let continuation_text = if manual_compact {
-        MANUAL_COMPACT_CONTINUATION_TEXT
-    } else if is_most_recent {
-        CONVERSATION_CONTINUATION_TEXT
-    } else {
-        TOOL_LOOP_CONTINUATION_TEXT
+    let continuation_text = match kind {
+        CompactionKind::SelfRequested => SELF_COMPACT_CONTINUATION_TEXT,
+        CompactionKind::Manual => MANUAL_COMPACT_CONTINUATION_TEXT,
+        CompactionKind::Auto => {
+            if is_most_recent {
+                CONVERSATION_CONTINUATION_TEXT
+            } else {
+                TOOL_LOOP_CONTINUATION_TEXT
+            }
+        }
     };
 
     let continuation_msg = Message::assistant()
@@ -252,6 +268,27 @@ pub async fn compact_messages(
         usage: summarization_usage,
         retained_context_tokens,
     })
+}
+
+pub async fn compact_messages(
+    provider: &dyn Provider,
+    model_config: &ModelConfig,
+    session_id: &str,
+    conversation: &Conversation,
+    manual_compact: bool,
+) -> Result<CompactionResult> {
+    compact_messages_with_kind(
+        provider,
+        model_config,
+        session_id,
+        conversation,
+        if manual_compact {
+            CompactionKind::Manual
+        } else {
+            CompactionKind::Auto
+        },
+    )
+    .await
 }
 
 /// Estimate the tokens of the agent-visible messages, counted the same way
@@ -1255,5 +1292,86 @@ mod tests {
         let result = tool_ids_to_summarize(&conversation, 2, 7);
         assert_eq!(result.len(), TOOLCALL_SUMMARIZATION_BATCH_SIZE);
         assert_eq!(result[0], "call0");
+    }
+
+    #[tokio::test]
+    async fn self_compact_kind_selects_continuation_and_drops_preserved_prompt() {
+        let provider = MockProvider::new(Message::assistant().with_text("mock summary"), 100_000);
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_text("initial prompt"),
+            Message::assistant().with_text("response"),
+            Message::user().with_text("last prompt that would be preserved in auto"),
+        ]);
+        let model_config = provider.config.clone();
+        let compaction = compact_messages_with_kind(
+            &provider,
+            &model_config,
+            "test-session-id",
+            &conversation,
+            CompactionKind::SelfRequested,
+        )
+        .await
+        .unwrap();
+
+        let agent_visible = compaction.conversation.agent_visible_messages();
+        let continuation = agent_visible
+            .iter()
+            .find(|m| {
+                m.role == Role::Assistant
+                    && m.as_concat_text().contains("compacted your own context")
+            })
+            .expect("should have self-compact continuation text");
+        assert_eq!(
+            continuation.as_concat_text(),
+            SELF_COMPACT_CONTINUATION_TEXT
+        );
+
+        let preserved_user = agent_visible.iter().any(|m| {
+            m.role == Role::User
+                && m.as_concat_text()
+                    .contains("last prompt that would be preserved in auto")
+        });
+        assert!(
+            !preserved_user,
+            "SelfRequested compaction must not preserve user prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_compact_kind_selects_continuation_and_drops_preserved_prompt() {
+        let provider = MockProvider::new(Message::assistant().with_text("mock summary"), 100_000);
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_text("initial prompt"),
+            Message::assistant().with_text("response"),
+            Message::user().with_text("last prompt"),
+        ]);
+        let model_config = provider.config.clone();
+        let compaction = compact_messages_with_kind(
+            &provider,
+            &model_config,
+            "test-session-id",
+            &conversation,
+            CompactionKind::Manual,
+        )
+        .await
+        .unwrap();
+
+        let agent_visible = compaction.conversation.agent_visible_messages();
+        let continuation = agent_visible
+            .iter()
+            .find(|m| m.role == Role::Assistant && m.as_concat_text().contains("user's request"))
+            .expect("should have manual compact continuation text");
+        assert_eq!(
+            continuation.as_concat_text(),
+            MANUAL_COMPACT_CONTINUATION_TEXT
+        );
+
+        let preserved_user = agent_visible
+            .iter()
+            .any(|m| m.role == Role::User && m.as_concat_text().contains("last prompt"));
+        assert!(
+            !preserved_user,
+            "Manual compaction must not preserve user prompt"
+        );
     }
 }
