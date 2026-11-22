@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: compare extension configs to detect mid-turn extension changes while preserving prompt cache.
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -73,6 +74,12 @@ impl ToolSnapshot {
 
     pub fn working_dir(&self) -> Option<&Path> {
         self.mcp.working_dir()
+    }
+
+    pub fn has_same_extensions(&self, other: &Self) -> bool {
+        self.scope_id() == other.scope_id()
+            && self.working_dir() == other.working_dir()
+            && self.configs() == other.configs()
     }
 
     async fn platform_catalog(&self) -> &Vec<PlatformTool> {

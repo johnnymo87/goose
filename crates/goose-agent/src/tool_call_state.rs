@@ -1,5 +1,4 @@
-use std::collections::{HashMap, HashSet};
-
+// Modified by Jonathan Mohrbacher, 2026: track tool calls sequentially so repeated tool call IDs across steps within a turn remain distinct.
 use goose_provider_types::conversation::message::{
     ActionRequiredData, Message, MessageContent, ToolRequest, ToolResponse,
 };
@@ -11,7 +10,7 @@ use crate::operation::ConversationEffect;
 pub const EXECUTABLE_KEY: &str = "goose.executable";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum ToolCallState<'a> {
+pub enum ToolCallState<'a> {
     Responded(&'a ToolResponse),
     Unchecked,
     Executable,
@@ -21,33 +20,60 @@ pub(crate) enum ToolCallState<'a> {
 }
 
 impl ToolCallState<'_> {
-    pub(crate) fn is_open(&self) -> bool {
+    pub fn is_open(&self) -> bool {
         !matches!(self, ToolCallState::Responded(_))
     }
 }
 
-pub(crate) fn tool_calls(messages: &[Message]) -> Vec<(&ToolRequest, ToolCallState<'_>)> {
-    let mut request_ids = HashSet::new();
-    let mut requests = Vec::new();
-    let mut tool_responses_by_id = HashMap::new();
-    let mut confirmation_requests = HashSet::new();
-    let mut confirmations = HashMap::new();
+pub fn tool_calls(messages: &[Message]) -> Vec<(&ToolRequest, ToolCallState<'_>)> {
+    struct Tracked<'a> {
+        request: &'a ToolRequest,
+        response: Option<&'a ToolResponse>,
+        confirmation_requested: bool,
+        confirmation: Option<&'a Permission>,
+    }
+
+    let mut tracked: Vec<Tracked<'_>> = Vec::new();
+
     for content in messages.iter().flat_map(|message| &message.content) {
         match content {
             MessageContent::ToolRequest(request) => {
-                if request_ids.insert(request.id.as_str()) {
-                    requests.push(request);
+                if !tracked
+                    .iter()
+                    .any(|t| t.response.is_none() && t.request.id == request.id)
+                {
+                    tracked.push(Tracked {
+                        request,
+                        response: None,
+                        confirmation_requested: false,
+                        confirmation: None,
+                    });
                 }
             }
             MessageContent::ToolResponse(response) => {
-                tool_responses_by_id.insert(response.id.as_str(), response);
+                if let Some(target) = tracked
+                    .iter_mut()
+                    .find(|t| t.response.is_none() && t.request.id == response.id)
+                {
+                    target.response = Some(response);
+                }
             }
             MessageContent::ActionRequired(action) => match &action.data {
                 ActionRequiredData::ToolConfirmation { id, .. } => {
-                    confirmation_requests.insert(id.as_str());
+                    if let Some(target) = tracked
+                        .iter_mut()
+                        .rfind(|t| t.response.is_none() && t.request.id == *id)
+                    {
+                        target.confirmation_requested = true;
+                    }
                 }
                 ActionRequiredData::ToolConfirmationResponse { id, permission } => {
-                    confirmations.insert(id.as_str(), permission);
+                    if let Some(target) = tracked
+                        .iter_mut()
+                        .rfind(|t| t.response.is_none() && t.request.id == *id)
+                    {
+                        target.confirmation = Some(permission);
+                    }
                 }
                 _ => {}
             },
@@ -55,23 +81,20 @@ pub(crate) fn tool_calls(messages: &[Message]) -> Vec<(&ToolRequest, ToolCallSta
         }
     }
 
-    requests
+    tracked
         .into_iter()
-        .map(|request| {
-            let id = request.id.as_str();
-            let state = match (tool_responses_by_id.get(id), request_executable(request)) {
+        .map(|item| {
+            let state = match (item.response, request_executable(item.request)) {
                 (Some(response), _) => ToolCallState::Responded(response),
                 (None, Some(true)) => ToolCallState::Executable,
                 (None, None) => ToolCallState::Unchecked,
-                (None, Some(false)) if !confirmation_requests.contains(id) => {
-                    ToolCallState::Blocked
-                }
-                (None, Some(false)) => match confirmations.get(id) {
+                (None, Some(false)) if !item.confirmation_requested => ToolCallState::Blocked,
+                (None, Some(false)) => match item.confirmation {
                     Some(permission) => ToolCallState::UserAnswered(permission),
                     None => ToolCallState::AwaitingUser,
                 },
             };
-            (request, state)
+            (item.request, state)
         })
         .collect()
 }

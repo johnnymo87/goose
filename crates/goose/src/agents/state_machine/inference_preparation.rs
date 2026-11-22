@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: refresh tool set on mid-turn extension change while preserving prompt cache.
 //! Goose-specific inference request preparation.
 
 use crate::agents::tool_snapshot::ToolSnapshot;
@@ -25,10 +26,17 @@ pub struct GooseInferenceRequestPreparer<'a> {
 impl InferenceRequestPreparer<Session> for GooseInferenceRequestPreparer<'_> {
     async fn prepare_session(&self, session: &Session) -> Result<Option<Session>> {
         let (session, lease) = self.services.current_session_snapshot(session).await?;
-        *self
+        let mut snapshot_lock = self
             .tool_snapshot
             .lock()
-            .expect("tool snapshot unavailable") = Some(Arc::new(lease));
+            .expect("tool snapshot unavailable");
+        let changed = match &*snapshot_lock {
+            Some(current) => !current.has_same_extensions(&lease),
+            None => true,
+        };
+        if changed {
+            *snapshot_lock = Some(Arc::new(lease));
+        }
         Ok(Some(session))
     }
 

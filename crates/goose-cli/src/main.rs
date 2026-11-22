@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: set tokio worker thread stack size to 8MB.
 #![recursion_limit = "256"]
 
 use anyhow::Result;
@@ -43,6 +44,7 @@ fn main() -> Result<()> {
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .expect("Failed to build Tokio runtime");

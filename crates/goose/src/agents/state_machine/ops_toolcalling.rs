@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: subdirectory hints are delivered in tool responses, not the system prompt.
+// Modified by Jonathan Mohrbacher, 2026: subdirectory hints are delivered in tool responses, not the system prompt; track tool calls in sequence across steps.
 //! Exposes extension capabilities and executes requests that belong to them.
 
 use std::collections::{HashMap, HashSet};
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
-use goose_agent::tool_call_state::request_executable;
+use goose_agent::tool_call_state::{tool_calls, ToolCallState};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Role, Tool, ToolAnnotations,
 };
@@ -487,29 +487,17 @@ impl ToolExecutionOperation {
 }
 
 pub(super) fn pending_tool_requests(messages: &[Message]) -> Vec<(ToolRequest, ToolDisposition)> {
-    let answered: HashSet<&str> = messages
-        .iter()
-        .flat_map(Message::get_tool_response_ids)
-        .collect();
-
-    messages
-        .iter()
-        .filter(|message| message.role == Role::Assistant)
-        .flat_map(|message| {
-            message.content.iter().filter_map(|c| match c {
-                MessageContent::ToolRequest(req) if req.was_executed_externally() => None,
-                MessageContent::ToolRequest(req) if !answered.contains(req.id.as_str()) => {
-                    if let Err(parse_error) = &req.tool_call {
-                        return Some((
-                            req.clone(),
-                            ToolDisposition::ParseError(parse_error.to_string()),
-                        ));
-                    }
-                    (request_executable(req) == Some(true))
-                        .then(|| (req.clone(), ToolDisposition::Execute))
-                }
-                _ => None,
-            })
+    tool_calls(messages)
+        .into_iter()
+        .filter(|(req, state)| state.is_open() && !req.was_executed_externally())
+        .filter_map(|(req, state)| {
+            if let Err(parse_error) = &req.tool_call {
+                return Some((
+                    req.clone(),
+                    ToolDisposition::ParseError(parse_error.to_string()),
+                ));
+            }
+            (state == ToolCallState::Executable).then(|| (req.clone(), ToolDisposition::Execute))
         })
         .collect()
 }
@@ -527,12 +515,12 @@ pub(super) fn request_was_advertised(messages: &[Message], request: &ToolRequest
     let Some(tool_call) = request.tool_call.as_ref().ok() else {
         return true;
     };
-    let Some(message) = messages.iter().find(|message| {
+    let Some(message) = messages.iter().rev().find(|message| {
         message.role == Role::Assistant
             && message.content.iter().any(|content| {
-                content
-                    .as_tool_request()
-                    .is_some_and(|item| item.id == request.id)
+                content.as_tool_request().is_some_and(|item| {
+                    item.id == request.id && item.tool_call == request.tool_call
+                })
             })
     }) else {
         return false;
@@ -564,19 +552,27 @@ pub(super) fn requests_can_resolve_tools<'a>(
 }
 
 fn request_was_generated_by_operation(messages: &[Message], request: &ToolRequest) -> bool {
-    messages.iter().any(|message| {
+    messages.iter().rev().any(|message| {
         message.role == Role::Assistant
             && message.metadata.inference.is_none()
             && message.content.iter().any(|content| {
-                content
-                    .as_tool_request()
-                    .is_some_and(|item| item.id == request.id)
+                content.as_tool_request().is_some_and(|item| {
+                    item.id == request.id && item.tool_call == request.tool_call
+                })
             })
     })
 }
 
 fn request_has_approval_history(messages: &[Message], request: &ToolRequest) -> bool {
-    messages.iter().any(|message| {
+    let req_pos = messages.iter().rposition(|message| {
+        message.content.iter().any(|content| {
+            content
+                .as_tool_request()
+                .is_some_and(|item| item.id == request.id && item.tool_call == request.tool_call)
+        })
+    });
+    let Some(req_pos) = req_pos else { return false };
+    messages[req_pos..].iter().any(|message| {
         message.content.iter().any(|content| match content {
             MessageContent::ActionRequired(action) => matches!(
                 &action.data,

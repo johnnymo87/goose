@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: tests for repeated tool call IDs across steps and mid-turn extension addition.
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -784,5 +785,39 @@ async fn platform_call_keeps_its_advertised_instance_across_approval() -> Result
     pipeline.confirm(&request_id, Permission::AllowOnce).await?;
     let result = pipeline.resume().await?;
     result.assert_message(-1, Agent, "remembered");
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_tool_call_ids_across_steps_within_a_turn_are_both_executed() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
+    api.on("step one").calls([("same_call_id", ADD, value(2))]);
+    api.on("result: 2").calls([("same_call_id", ADD, value(3))]);
+    api.on("result: 5").reply("done");
+
+    let result = pipeline.run(["step one"]).await?;
+    result.assert_message(-1, Agent, "done");
+    assert_eq!(pipeline.calculator_total(), 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mid_turn_extension_addition_refreshes_tools_for_next_step() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
+    let pipeline = pipeline.with_goose_mode(GooseMode::Approve).await;
+    pipeline.set_permission(ADD, PermissionLevel::AlwaysAllow);
+    api.on("start and pause")
+        .calls([("c1", ADD, value(1)), ("gated", DIVIDE, value(1))]);
+    let awaiting = pipeline.run(["start and pause"]).await?;
+    awaiting.assert_message(-1, ToolResponse, "result: 1");
+
+    // Remove calculator mid-turn while turn is paused awaiting confirmation
+    pipeline.remove_extension("calculator").await?;
+
+    pipeline.confirm("gated", Permission::AllowOnce).await?;
+    api.on("result: 1").reply("all finished");
+    let result = pipeline.resume().await?;
+    result.assert_message(-1, Agent, "all finished");
+    assert!(!api.calls().last().unwrap().advertises_tool(ADD));
     Ok(())
 }
