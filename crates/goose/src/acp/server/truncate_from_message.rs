@@ -47,9 +47,10 @@ impl AcpConnection {
             );
         }
         // A running turn (or a live voice interaction, which writes messages) would write
-        // its tail after the cut. The check is not atomic with a prompt arriving next;
+        // its tail after the cut. Gateway and scheduler turns hold only the turn lock, so
+        // runs alone would miss them. The check is not atomic with a prompt arriving next;
         // callers that need that (honkd) serialize prompts and truncation themselves.
-        if self.runs().is_active(session_id) {
+        if self.services.runtime.is_busy(session_id) {
             return Err(agent_client_protocol::Error::invalid_request().data(format!(
                 "session {session_id} has an active run or live voice interaction; truncate after it ends"
             )));
