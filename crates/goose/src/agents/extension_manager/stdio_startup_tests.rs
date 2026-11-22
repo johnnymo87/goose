@@ -39,3 +39,31 @@ async fn test_mcp_client_startup_timeout_stdio_kills_process_group() {
     );
     assert_dies(read_pid(&grandchild_pid_path).await).await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_mcp_client_startup_timeout_stdio_abandoned_start_kills_process_group() {
+    use crate::agents::mcp_startup_timeout::tests::{assert_dies, hung_server_ctx, read_pid};
+    use std::time::Duration;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let grandchild_pid_path = temp_dir.path().join("grandchild.pid");
+    let mut command = tokio::process::Command::new("sh");
+    command.args([
+        "-c",
+        &format!(
+            "sleep 600 & echo $! > \"{}\"; exec sleep 600",
+            grandchild_pid_path.display()
+        ),
+    ]);
+    let mut ctx = hung_server_ctx(temp_dir.path(), None);
+    ctx.startup_timeout = Some(Duration::from_secs(60));
+
+    let abandoned =
+        tokio::time::timeout(Duration::from_millis(500), super::spawn(command, ctx)).await;
+    assert!(
+        abandoned.is_err(),
+        "start should still be pending when abandoned"
+    );
+    assert_dies(read_pid(&grandchild_pid_path).await).await;
+}
