@@ -1176,14 +1176,67 @@ async fn test_tools_not_advertised_when_session_has_zero_extensions() -> Result<
 
     let calls = recorded.lock().await.clone();
     assert_eq!(calls.len(), 1);
-    assert!(
-        calls[0].tools.is_empty(),
-        "no tools must be offered when session has zero extensions: {:?}",
-        calls[0].tools
+    assert_eq!(
+        calls[0].tools.len(),
+        1,
+        "self_compact_and_resume is offered even when session has zero extensions"
     );
+    assert_eq!(calls[0].tools[0].name, SELF_COMPACT_TOOL_NAME);
     assert!(
         !calls[0].system_prompt.contains("# Skills"),
         "skills prompt must not be included when session has zero extensions"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_tools_self_compact_and_recipe_rules() -> Result<()> {
+    let ctx = TestContext::new().await?;
+
+    let provider = Arc::new(ScriptedSelfCompactProvider::new(vec![]));
+    ctx.services
+        .update_provider(provider, ModelConfig::new("mock-model"), &ctx.session.id)
+        .await?;
+
+    let tools = ctx.services.list_tools(&ctx.session.id, None).await?;
+    assert!(
+        tools.iter().any(|t| t.name == SELF_COMPACT_TOOL_NAME),
+        "list_tools must include self_compact_and_resume for a default session"
+    );
+
+    // Extension-scoped list_tools must not include self_compact_and_resume
+    let ext_tools = ctx
+        .services
+        .list_tools(&ctx.session.id, Some("developer".to_string()))
+        .await?;
+    assert!(
+        !ext_tools.iter().any(|t| t.name == SELF_COMPACT_TOOL_NAME),
+        "extension-scoped list_tools must not include self_compact_and_resume"
+    );
+
+    // Recipe with response schema: recipe__final_output offered, self_compact_and_resume suppressed
+    let recipe = Recipe::from_content(
+        "title: t\ndescription: d\nprompt: p\nresponse:\n  json_schema:\n    type: object\n",
+    )?;
+    ctx.services
+        .session_manager
+        .update(&ctx.session.id)
+        .recipe(Some(recipe))
+        .apply()
+        .await?;
+
+    let recipe_tools = ctx.services.list_tools(&ctx.session.id, None).await?;
+    assert!(
+        recipe_tools
+            .iter()
+            .any(|t| t.name == "recipe__final_output"),
+        "recipe__final_output must be listed when recipe has response schema"
+    );
+    assert!(
+        !recipe_tools
+            .iter()
+            .any(|t| t.name == SELF_COMPACT_TOOL_NAME),
+        "self_compact_and_resume must be suppressed when recipe has response schema"
     );
     Ok(())
 }

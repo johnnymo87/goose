@@ -235,7 +235,8 @@ jobs:
             "test_sibling_tool_call_compaction_waits_for_siblings" \
             "test_rebuilt_machine_mid_turn_at_most_once_per_turn" \
             "test_recheck_availability_when_about_to_compact_self_compact" \
-            "test_tools_not_advertised_when_session_has_zero_extensions"
+            "test_tools_not_advertised_when_session_has_zero_extensions" \
+            "test_list_tools_self_compact_and_recipe_rules"
 
           run_exact_tests --release -p goose --features "$F" --test acp_server_test -- \
             "test_prompt_reports_context_error_when_compaction_limit_is_exhausted" \

@@ -201,9 +201,6 @@ pub fn self_compact_available(session: &Session, provider: &dyn Provider) -> boo
     {
         return false;
     }
-    if crate::session::session_has_zero_extensions(session) {
-        return false;
-    }
     let enabled = Config::global()
         .get_param::<bool>("GOOSE_SELF_COMPACT")
         .unwrap_or(true);
@@ -352,8 +349,9 @@ impl Operation<Session, GooseEffect> for SelfCompactOperation {
                             .max()
                             .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-                        let note = self_compacted_note_message(max_created);
-                        let resume = self_compact_resume_message(&prompt, note.created, turns);
+                        let note = emit.message(self_compacted_note_message(max_created));
+                        let resume =
+                            emit.message(self_compact_resume_message(&prompt, note.created, turns));
 
                         let mut new_messages = compaction.conversation.messages().clone();
                         new_messages.push(note);
