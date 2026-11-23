@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: include recipe__final_output and self_compact_and_resume in list_tools.
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -777,10 +778,56 @@ impl StateMachineServices {
         extension_name: Option<String>,
     ) -> Result<Vec<Tool>> {
         let lease = self.current_tools(session_id).await?;
-        Ok(match extension_name {
-            Some(name) => lease.tools_for(&name).await,
+        let mut tools = match extension_name.as_deref() {
+            Some(name) => lease.tools_for(name).await,
             None => lease.tools().await,
-        })
+        };
+
+        if extension_name.is_none() {
+            if let Ok(session) = self.session_manager.get_session(session_id, false).await {
+                let final_output = session
+                    .recipe
+                    .as_ref()
+                    .and_then(|r| r.response.clone())
+                    .map(crate::agents::final_output_tool::FinalOutputTool::try_new)
+                    .transpose();
+                let has_final_output = match final_output {
+                    Ok(Some(fot)) => {
+                        let tool = fot.tool();
+                        if !tools.iter().any(|t| t.name == tool.name) {
+                            tools.push(tool);
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+
+                if !has_final_output {
+                    if let Ok(provider) = self.provider(session_id).await {
+                        if crate::agents::state_machine::ops_self_compact::self_compact_available(
+                            &session,
+                            provider.as_ref(),
+                        ) {
+                            if !tools.iter().any(|t| {
+                                t.name
+                                    == crate::agents::state_machine::ops_self_compact::SELF_COMPACT_TOOL_NAME
+                            }) {
+                                tools.push(
+                                    crate::agents::state_machine::ops_self_compact::self_compact_tool(),
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "Extension already registered tool '{}'; skipping built-in self_compact_and_resume",
+                                    crate::agents::state_machine::ops_self_compact::SELF_COMPACT_TOOL_NAME
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(tools)
     }
 
     pub async fn submit_tool_confirmation(
