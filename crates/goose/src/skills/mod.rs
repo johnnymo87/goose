@@ -1,4 +1,4 @@
-// Modified by Jonathan Mohrbacher, 2026: GOOSE_GLOBAL_SKILLS=false drops the home and config skill roots from discovery and path resolution.
+// Modified by Jonathan Mohrbacher, 2026: GOOSE_GLOBAL_SKILLS=false drops the home and config skill roots from discovery and path resolution, and goose's built-in skills.
 //! Everything specific to skills: filesystem discovery (`SKILL.md` walking +
 //! built-ins) and reading supporting files. User-facing CRUD lives in
 //! `crate::sources`, which generalizes across source types.
@@ -169,7 +169,8 @@ fn is_lexical_project_plugin_path(path: &Path) -> bool {
 
 /// `GOOSE_GLOBAL_SKILLS` (local patch). Unset or `true`: upstream behaviour. `false`: only
 /// project-scoped skill directories are used; the roots under `$HOME` and the config dir, and
-/// user-scope plugin skill dirs, are neither scanned nor resolvable by path. For a process that
+/// user-scope plugin skill dirs, are neither scanned nor resolvable by path, and goose's built-in
+/// skills (web-search, goose-doc-guide) are not offered either. For a process that
 /// must see only its own project's skills, such as an unattended recipe run from a dedicated
 /// directory on a host whose interactive sessions keep a large global library.
 ///
@@ -507,6 +508,9 @@ fn discover_skills_with_config(working_dir: Option<&Path>, config: &Config) -> V
             preserve_path: dir.preserve_path,
         });
     let mut sources = goose_agent::skills::discover_skills(roots);
+    if !global_skills_enabled() {
+        return sources;
+    }
     let mut seen: HashSet<_> = sources.iter().map(|source| source.name.clone()).collect();
 
     for content in builtin::get_all() {
@@ -1125,6 +1129,40 @@ mod tests {
         // Anyone setting the variable is asking for isolation; a typo must not silently undo it.
         assert_eq!(discovered_names(Some("flase")), vec!["project-skill"]);
         assert_eq!(discovered_names(Some("")), vec!["project-skill"]);
+    }
+
+    fn discovered_builtin_names(knob: Option<&str>) -> Vec<String> {
+        let (home, path_root, project) = global_skills_fixture();
+        let config = Config::new(path_root.path().join("test-config.yaml"), "skills-test").unwrap();
+        let _guard = env_lock::lock_env([
+            ("HOME", home.path().to_str()),
+            ("GOOSE_PATH_ROOT", path_root.path().to_str()),
+            ("PLUGINS", None),
+            ("GOOSE_GLOBAL_SKILLS", knob),
+        ]);
+        let mut names: Vec<String> = discover_skills_with_config(Some(project.path()), &config)
+            .into_iter()
+            .filter(|s| s.source_type == SourceType::BuiltinSkill)
+            .map(|s| s.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn global_skills_false_drops_builtin_skills() {
+        // web-search tells the model to download and run a tool: an isolated process must not be
+        // offered it just because it has an extension on.
+        assert!(discovered_builtin_names(None).contains(&"web-search".to_string()));
+        assert!(discovered_builtin_names(Some("true")).contains(&"web-search".to_string()));
+        assert_eq!(
+            discovered_builtin_names(Some("false")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            discovered_builtin_names(Some("flase")),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
