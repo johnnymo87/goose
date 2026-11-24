@@ -1,3 +1,4 @@
+// Modified by Jonathan Mohrbacher, 2026: tests that assert on built-in skills lock GOOSE_GLOBAL_SKILLS unset.
 //! Filesystem-backed CRUD for [`SourceEntry`] values exchanged over ACP custom
 //! methods. Skills live in `~/.agents/skills/` (or per-project under
 //! `<project>/.agents/skills/`). Projects live in `<dataDir>/projects/<slug>.md`.
@@ -1815,6 +1816,7 @@ mod tests {
 
     #[test]
     fn list_sources_lists_builtin_skills() {
+        let _guard = env_lock::lock_env([("GOOSE_GLOBAL_SKILLS", None::<&str>)]);
         let listed = list_sources(Some(SourceType::BuiltinSkill), None, false).unwrap();
         let builtin = listed
             .iter()
@@ -1931,7 +1933,10 @@ mod tests {
         let err = delete_source(SourceType::Subrecipe, "x").unwrap_err();
         assert!(format!("{:?}", err).contains("not supported"));
 
-        let listed = list_sources(Some(SourceType::BuiltinSkill), Some(project), false).unwrap();
+        let listed = {
+            let _guard = env_lock::lock_env([("GOOSE_GLOBAL_SKILLS", None::<&str>)]);
+            list_sources(Some(SourceType::BuiltinSkill), Some(project), false).unwrap()
+        };
         assert!(listed
             .iter()
             .any(|source| source.source_type == SourceType::BuiltinSkill));
